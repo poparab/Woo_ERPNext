@@ -5,6 +5,10 @@ app_description = "Integration to import WooCommerce orders as Sales Invoices"
 app_email = "ar.abuelwafa@orderjarz.com"
 app_license = "mit"
 
+# Ensure Module Def exists on install
+after_install = "jarz_woocommerce_integration.install.after_install"
+after_migrate = "jarz_woocommerce_integration.install.after_migrate"
+
 # Apps
 # ------------------
 
@@ -148,23 +152,47 @@ app_license = "mit"
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
-# 	"all": [
-# 		"jarz_woocommerce_integration.tasks.all"
-# 	],
-# 	"daily": [
-# 		"jarz_woocommerce_integration.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"jarz_woocommerce_integration.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"jarz_woocommerce_integration.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"jarz_woocommerce_integration.tasks.monthly"
-# 	],
-# }
+# Customer incremental sync every 15 minutes
+scheduler_events = {
+	"cron": {
+		"*/15 * * * *": [
+			"jarz_woocommerce_integration.services.customer_sync.sync_customers_cron"
+		],
+		# Territory sync every 6 hours (at minute 0)
+		"0 */6 * * *": [
+			"jarz_woocommerce_integration.services.territory_sync.sync_territories_cron"
+		],
+		# Phase1 order sync every 5 minutes (draft invoices with dummy item)
+		"*/5 * * * *": [
+			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
+		]
+	}
+}
+
+# Fixtures (exported Custom Fields)
+# Fixtures (exported Custom Fields)
+# We include all integration-related custom fields so another site installs with identical schema.
+# Adjust filters as you add new doctypes/fields.
+fixtures = [
+	{
+		"dt": "Custom Field",
+		"filters": [
+			[
+				"dt",
+				"in",
+				[
+					"Territory",
+					"Sales Invoice",
+					"WooCommerce Settings",
+					"Customer",
+					"Address",
+					"Item",
+					"Jarz Bundle",
+				],
+			]
+		],
+	}
+]
 
 # Testing
 # -------

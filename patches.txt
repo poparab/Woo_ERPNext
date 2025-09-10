@@ -1,0 +1,3 @@
+jarz_woocommerce_integration.patches.add_woo_code_field
+jarz_woocommerce_integration.patches.populate_woo_code
+jarz_woocommerce_integration.patches.ensure_woo_code_field

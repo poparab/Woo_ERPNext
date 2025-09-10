@@ -1,0 +1,49 @@
+{
+  "doctype": "DocType",
+  "name": "WooCommerce Order Map",
+  "module": "Jarz WooCommerce Integration",
+  "custom": 0,
+  "istable": 0,
+  "editable_grid": 0,
+  "engine": "InnoDB",
+  "quick_entry": 0,
+  "is_tree": 0,
+  "show_preview_popup": 0,
+  "issingle": 0,
+  "is_submittable": 0,
+  "index_web_pages_for_search": 0,
+  "actions": [],
+  "links": [],
+  "field_order": [
+    "woo_order_id",
+    "woo_order_number",
+    "erpnext_sales_invoice",
+    "status",
+    "currency",
+    "total",
+    "payment_method",
+    "synced_on",
+    "hash"
+  ],
+  "fields": [
+  {"fieldname": "woo_order_id", "fieldtype": "Int", "label": "Woo Order ID", "reqd": 1, "unique": 1},
+  {"fieldname": "woo_order_number", "fieldtype": "Data", "label": "Woo Order Number"},
+  {"fieldname": "erpnext_sales_invoice", "fieldtype": "Link", "label": "ERPNext Sales Invoice", "options": "Sales Invoice"},
+    {"fieldname": "status", "fieldtype": "Data", "label": "Woo Status"},
+    {"fieldname": "currency", "fieldtype": "Data", "label": "Currency"},
+    {"fieldname": "total", "fieldtype": "Currency", "label": "Order Total"},
+    {"fieldname": "payment_method", "fieldtype": "Data", "label": "Payment Method"},
+    {"fieldname": "synced_on", "fieldtype": "Datetime", "label": "Synced On", "read_only": 1},
+    {"fieldname": "hash", "fieldtype": "Data", "label": "Hash"}
+  ],
+  "permissions": [
+    {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "export": 1, "report": 1, "print": 1, "email": 1, "share": 1},
+    {"role": "Administrator", "read": 1, "write": 1, "create": 1, "delete": 1}
+  ],
+  "allow_import": 0,
+  "allow_rename": 0,
+  "autoname": "WOOMAP-.#####",
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "search_fields": "woo_order_id,woo_order_number,sales_invoice,status"
+}
