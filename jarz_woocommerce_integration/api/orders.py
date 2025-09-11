@@ -5,11 +5,9 @@ import json
 from typing import Any
 
 import frappe
-from frappe.utils.password import get_decrypted_password
 from jarz_woocommerce_integration.services.order_sync import (
     pull_recent_orders_phase1,
     pull_single_order_phase1,
-    process_order_phase1,
 )  # single-level package path (standard frappe app layout)
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
@@ -93,8 +91,17 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
         pass
 
     settings = WooCommerceSettings.get_settings()
+    # Retrieve secret similarly to customer webhook: try decrypted password field, then fallback to raw attribute
     try:
-        secret = get_decrypted_password("WooCommerce Settings", settings.name, "webhook_secret") or ""
+        try:
+            # Import lazily to avoid static import resolution issues
+            from frappe.utils.password import get_decrypted_password  # type: ignore
+        except Exception:  # noqa: BLE001
+            get_decrypted_password = None  # type: ignore
+        if get_decrypted_password:
+            secret = get_decrypted_password("WooCommerce Settings", settings.name, "webhook_secret") or ""
+        else:
+            secret = ""
     except Exception:  # noqa: BLE001
         secret = ""
     if not secret:

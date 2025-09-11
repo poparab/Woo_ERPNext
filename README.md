@@ -11,10 +11,10 @@ Configure in WooCommerce (WP Admin > WooCommerce > Settings > Advanced > Webhook
 1. Create (or edit) a webhook:
 	- Status: Active
 	- Topic: Order created (repeat separately for Order updated) OR use Order updated only (covers creation + changes depending on store setup)
-	- Delivery URL: `https://YOUR-ERP-HOST/api/method/jarz_woocommerce_integration.api.orders.woo_order_webhook`
+		- Delivery URL: `https://YOUR-ERP-HOST/api/method/jarz_woocommerce_integration.jarz_woocommerce_integration.api.orders.woo_order_webhook`
 	- Secret: (paste the same secret you store in WooCommerce Settings inside ERPNext)
 2. Repeat for Customer created / updated using endpoint:
-	- `https://YOUR-ERP-HOST/api/method/jarz_woocommerce_integration.api.webhooks.woo_customer_webhook`
+		- `https://YOUR-ERP-HOST/api/method/jarz_woocommerce_integration.jarz_woocommerce_integration.api.webhooks.woo_customer_webhook`
 3. Save.
 
 ERPNext Setup:
@@ -35,8 +35,8 @@ Processing Model:
 
 Fallback / Manual Pull:
 - Continue to use manual pull endpoints if needed:
-  - `/api/method/jarz_woocommerce_integration.api.orders.pull_recent_phase1`
-  - `/api/method/jarz_woocommerce_integration.api.orders.pull_order_phase1?order_id=123`
+	- `/api/method/jarz_woocommerce_integration.jarz_woocommerce_integration.api.orders.pull_recent_phase1`
+	- `/api/method/jarz_woocommerce_integration.jarz_woocommerce_integration.api.orders.pull_order_phase1?order_id=123`
 
 Troubleshooting:
 - Signature mismatch (403): ensure secret identical, no whitespace, and that your site is reachable via HTTPS.
