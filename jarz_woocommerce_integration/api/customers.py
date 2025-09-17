@@ -1,3 +1,17 @@
+from __future__ import annotations
+
+import frappe
+from jarz_woocommerce_integration.services.customer_bulk_sync import sync_all_customers
+
+
+@frappe.whitelist(allow_guest=False)
+def sync_all(per_page: int = 100, max_pages: int | None = None) -> dict:
+    """Bulk pull all WooCommerce customers and upsert them.
+
+    Example REST call:
+    /api/method/jarz_woocommerce_integration.jarz_woocommerce_integration.api.customers.sync_all?per_page=100
+    """
+    return {"success": True, "data": sync_all_customers(per_page=per_page, max_pages=max_pages)}
 import frappe
 from jarz_woocommerce_integration.services.customer_sync import sync_customers
 from jarz_woocommerce_integration.jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (  # standardized nested path

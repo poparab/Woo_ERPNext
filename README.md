@@ -48,6 +48,35 @@ Limitations (current phase):
 - Inventory push-back not yet enabled.
 - Partial update of already submitted invoices limited to selected fields (status, custom state, POS profile, delivery fields).
 
+### Bulk Customer Sync
+
+Use the new endpoint to import or refresh all WooCommerce customers:
+
+`/api/method/jarz_woocommerce_integration.jarz_woocommerce_integration.api.customers.sync_all?per_page=100`
+
+Parameters:
+- `per_page` (default 100, Woo max usually 100)
+- `max_pages` (optional safety cap)
+
+Response sample:
+```json
+{
+	"success": true,
+	"data": {
+		"processed": 245,
+		"approx_created_or_updated": 245,
+		"sample": [ {"customer": "Cust 1", "billing": "ADDR-..." } ]
+	}
+}
+```
+
+Behavior:
+- Idempotent: existing customers matched by email or display name.
+- Adds Billing / Shipping addresses if a matching line1 not already linked.
+- Does not delete stale customers.
+
+Run again any time to backfill new Woo signups.
+
 
 ### Installation
 
