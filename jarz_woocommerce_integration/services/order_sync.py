@@ -108,24 +108,57 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 bundle_lines = bp.get_invoice_items()
                 # Keep only fields ERPNext Sales Invoice Item supports
                 allowed = {"item_code", "item_name", "description", "qty", "rate", "price_list_rate", "discount_percentage"}
-                # Convert child discounts to discount_amount to avoid ERPNext reprocessing
+                processed_lines = []
                 for bl in bundle_lines:
                     filtered = {k: v for k, v in bl.items() if k in allowed or k in {"is_bundle_child", "is_bundle_parent"}}
                     if filtered.get("is_bundle_child") and filtered.get("discount_percentage") is not None:
                         try:
-                            qty = float(filtered.get("qty") or 0) or 0
+                            ch_qty = float(filtered.get("qty") or 0) or 0
                             plr = float(filtered.get("price_list_rate") or filtered.get("rate") or 0)
                             pct = float(filtered.get("discount_percentage") or 0)
-                            disc_amt = round(plr * qty * (pct / 100.0), 2)
-                            # Set discount_amount and clear discount_percentage; keep original rate/plr
+                            disc_amt = round(plr * ch_qty * (pct / 100.0), 2)
                             filtered["discount_amount"] = disc_amt
                             filtered.pop("discount_percentage", None)
-                            # Ensure rate reflects original to let discount_amount apply
                             filtered["rate"] = plr
                             filtered["price_list_rate"] = plr
                         except Exception:
                             pass
-                    items.append(filtered)
+                    processed_lines.append(filtered)
+
+                # Residual adjustment: ensure sum(child net) == bundle_price * qty
+                try:
+                    # Parent line has is_bundle_parent flag; children flagged is_bundle_child
+                    child_lines = [cl for cl in processed_lines if cl.get("is_bundle_child")]
+                    if child_lines:
+                        # Retrieve target from bundle doc (already loaded in processor after get_invoice_items())
+                        target_total = float(getattr(bp.bundle_doc, "bundle_price", 0) or 0) * int(qty)
+                        # Compute current net of children
+                        child_net = 0.0
+                        for cl in child_lines:
+                            gross = float(cl.get("price_list_rate") or cl.get("rate") or 0) * float(cl.get("qty") or 0)
+                            disc = float(cl.get("discount_amount") or 0)
+                            child_net += round(gross - disc, 2)
+                        residual = round(target_total - child_net, 2)
+                        if abs(residual) >= 0.01:  # adjust last child
+                            last = child_lines[-1]
+                            gross_last = float(last.get("price_list_rate") or last.get("rate") or 0) * float(last.get("qty") or 0)
+                            current_disc = float(last.get("discount_amount") or 0)
+                            current_net = round(gross_last - current_disc, 2)
+                            desired_net = current_net + residual
+                            # Clamp desired_net to [0, gross_last]
+                            if desired_net < 0:
+                                desired_net = 0.0
+                            elif desired_net > gross_last:
+                                desired_net = gross_last
+                            new_disc = round(gross_last - desired_net, 2)
+                            last["discount_amount"] = new_disc
+                    # Append processed lines after adjustment
+                except Exception:
+                    # Fail silent – better partial discount than abort order
+                    pass
+
+                for _pl in processed_lines:
+                    items.append(_pl)
                 handled_parents.add(str(product_id))
                 continue  # done with this Woo line
             except Exception:
