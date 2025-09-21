@@ -106,55 +106,65 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 from jarz_pos.jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
                 bp = BundleProcessor(bundle_code, int(qty))
                 bundle_lines = bp.get_invoice_items()
-                # Keep only fields ERPNext Sales Invoice Item supports
-                allowed = {"item_code", "item_name", "description", "qty", "rate", "price_list_rate", "discount_percentage"}
-                processed_lines = []
+                # Keep only fields ERPNext Sales Invoice Item supports; we will materialize discount into the rate
+                allowed = {"item_code", "item_name", "description", "qty", "rate", "price_list_rate", "discount_percentage", "discount_amount"}
+                processed_lines: list[dict] = []
                 for bl in bundle_lines:
                     filtered = {k: v for k, v in bl.items() if k in allowed or k in {"is_bundle_child", "is_bundle_parent"}}
-                    if filtered.get("is_bundle_child") and filtered.get("discount_percentage") is not None:
+                    # For child lines: convert any discount (percentage or amount) into a net rate so ERPNext doesn't recalc it away.
+                    if filtered.get("is_bundle_child"):
                         try:
                             ch_qty = float(filtered.get("qty") or 0) or 0
+                            if ch_qty <= 0:
+                                processed_lines.append(filtered)
+                                continue
+                            # Determine original list price per unit (prefer explicit price_list_rate, else rate)
                             plr = float(filtered.get("price_list_rate") or filtered.get("rate") or 0)
-                            pct = float(filtered.get("discount_percentage") or 0)
-                            disc_amt = round(plr * ch_qty * (pct / 100.0), 2)
-                            filtered["discount_amount"] = disc_amt
+                            # Derive discount amount total for the row
+                            disc_total = 0.0
+                            if filtered.get("discount_percentage") is not None:
+                                pct = float(filtered.get("discount_percentage") or 0)
+                                disc_total = round(plr * ch_qty * (pct / 100.0), 2)
+                            elif filtered.get("discount_amount") is not None:
+                                # Assume existing discount_amount is the total discount for the row (not per unit)
+                                disc_total = float(filtered.get("discount_amount") or 0)
+                            gross_total = round(plr * ch_qty, 2)
+                            net_total = max(0.0, round(gross_total - disc_total, 2))
+                            # Compute per-unit net rate (2 decimals)
+                            new_rate = round(net_total / ch_qty, 2)
+                            filtered["price_list_rate"] = plr  # preserve original list price for reference
+                            filtered["rate"] = new_rate
+                            # Remove discount fields so ERPNext uses the provided net rate directly
                             filtered.pop("discount_percentage", None)
-                            filtered["rate"] = plr
-                            filtered["price_list_rate"] = plr
+                            filtered.pop("discount_amount", None)
                         except Exception:
+                            # If anything fails, fall back to original values (still may be adjusted by residual pass)
                             pass
                     processed_lines.append(filtered)
 
-                # Residual adjustment: ensure sum(child net) == bundle_price * qty
+                # Residual adjustment: ensure sum(child (rate*qty)) == bundle_price * qty
                 try:
-                    # Parent line has is_bundle_parent flag; children flagged is_bundle_child
                     child_lines = [cl for cl in processed_lines if cl.get("is_bundle_child")]
                     if child_lines:
-                        # Retrieve target from bundle doc (already loaded in processor after get_invoice_items())
                         target_total = float(getattr(bp.bundle_doc, "bundle_price", 0) or 0) * int(qty)
-                        # Compute current net of children
-                        child_net = 0.0
+                        current_total = 0.0
                         for cl in child_lines:
-                            gross = float(cl.get("price_list_rate") or cl.get("rate") or 0) * float(cl.get("qty") or 0)
-                            disc = float(cl.get("discount_amount") or 0)
-                            child_net += round(gross - disc, 2)
-                        residual = round(target_total - child_net, 2)
-                        if abs(residual) >= 0.01:  # adjust last child
+                            current_total += round(float(cl.get("rate") or 0) * float(cl.get("qty") or 0), 2)
+                        residual = round(target_total - current_total, 2)
+                        if abs(residual) >= 0.01:
                             last = child_lines[-1]
-                            gross_last = float(last.get("price_list_rate") or last.get("rate") or 0) * float(last.get("qty") or 0)
-                            current_disc = float(last.get("discount_amount") or 0)
-                            current_net = round(gross_last - current_disc, 2)
-                            desired_net = current_net + residual
-                            # Clamp desired_net to [0, gross_last]
-                            if desired_net < 0:
-                                desired_net = 0.0
-                            elif desired_net > gross_last:
-                                desired_net = gross_last
-                            new_disc = round(gross_last - desired_net, 2)
-                            last["discount_amount"] = new_disc
-                    # Append processed lines after adjustment
+                            ql = float(last.get("qty") or 0) or 0
+                            if ql > 0:
+                                gross_candidate = round(float(last.get("price_list_rate") or last.get("rate") or 0) * ql, 2)
+                                new_line_total = round(float(last.get("rate") or 0) * ql + residual, 2)
+                                # Clamp between 0 and original gross
+                                if new_line_total < 0:
+                                    new_line_total = 0.0
+                                elif new_line_total > gross_candidate:
+                                    new_line_total = gross_candidate
+                                new_rate = round(new_line_total / ql, 2)
+                                last["rate"] = new_rate
                 except Exception:
-                    # Fail silent – better partial discount than abort order
                     pass
 
                 for _pl in processed_lines:
@@ -659,3 +669,24 @@ def run_pos_profile_update_cli():  # pragma: no cover
             bench --site <site> execute jarz_woocommerce_integration.jarz_woocommerce_integration.services.order_sync.run_pos_profile_update_cli
         """
         return pull_recent_orders_phase1(limit=10, dry_run=False, force=True, allow_update=True)
+
+
+def debug_dump_invoice_items(inv_name: str):  # pragma: no cover - temporary debug helper
+    """Return a simplified list of items (item_code, qty, rate, price_list_rate, amount) for manual verification.
+
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.services.order_sync.debug_dump_invoice_items --kwargs '{"inv_name":"ACC-SINV-2025-00621"}'
+    """
+    inv = frappe.get_doc("Sales Invoice", inv_name)
+    out = []
+    for it in inv.items:
+        out.append({
+            "item_code": it.item_code,
+            "qty": float(it.qty),
+            "rate": float(it.rate),
+            "price_list_rate": float(it.price_list_rate) if getattr(it, "price_list_rate", None) else None,
+            "amount": float(it.amount),
+            "discount_percentage": getattr(it, "discount_percentage", None),
+            "discount_amount": getattr(it, "discount_amount", None),
+        })
+    return out
