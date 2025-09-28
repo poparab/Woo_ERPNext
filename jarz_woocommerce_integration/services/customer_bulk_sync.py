@@ -27,10 +27,12 @@ def _init_client(settings: WooCommerceSettings) -> WooClient:
 
 def _sync_single_customer(cust: Dict[str, Any]) -> dict:
     email = cust.get("email")
+    username = cust.get("username") if isinstance(cust.get("username"), str) else None
     first_name = cust.get("first_name") or ""
     last_name = cust.get("last_name") or ""
+    phone = (cust.get("billing") or {}).get("phone") or (cust.get("shipping") or {}).get("phone")
     # Ensure customer
-    customer_name = _ensure_customer(email, first_name, last_name, cust.get("id"))  # type: ignore[arg-type]
+    customer_name = _ensure_customer(email, first_name, last_name, cust.get("id"), username=username, phone=phone)  # type: ignore[arg-type]
 
     # Addresses from Woo: billing + shipping aggregated under 'billing' & 'shipping'
     # Woo customer object: may include 'billing' and 'shipping' with address fields

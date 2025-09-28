@@ -78,7 +78,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 bundle_code = frappe.db.get_value("Jarz Bundle", {"woo_bundle_id": str(pid)}, "name")
                 if not bundle_code:
                     continue
-                from jarz_pos.jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
+                from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
                 bp_tmp = BundleProcessor(bundle_code, 1)
                 bp_tmp.load_bundle()
                 uniform_pct, _total_child, _bundle_price = bp_tmp.calculate_child_discount_percentage()
@@ -103,7 +103,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         if bundle_code and (str(product_id) in child_parent_ids or not has_woosb_children):
             try:
                 # Import locally to avoid hard dependency at module import time
-                from jarz_pos.jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
+                from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
                 bp = BundleProcessor(bundle_code, int(qty))
                 bundle_lines = bp.get_invoice_items()
                 # Keep only fields ERPNext Sales Invoice Item supports; we will materialize discount into the rate

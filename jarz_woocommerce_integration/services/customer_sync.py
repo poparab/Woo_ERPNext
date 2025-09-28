@@ -16,23 +16,119 @@ def _normalize_name(first: str | None, last: str | None, email: Optional[str] = 
     return "Woo Guest"
 
 
-def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int]) -> str:
-    # Prefer match by email when provided
+def _field_exists(doctype: str, fieldname: str) -> bool:
+    try:
+        meta = frappe.get_meta(doctype)
+        return bool(meta and meta.get_field(fieldname))
+    except Exception:
+        return False
+
+
+def _normalize_phone(p: Optional[str]) -> Optional[str]:
+    if not p:
+        return None
+    s = ''.join(ch for ch in str(p) if ch.isdigit() or ch == '+').strip()
+    return s or None
+
+
+def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None) -> str:
+    """Find or create a Customer, preferring uniqueness by username, then phone, then email.
+
+    Priority:
+    1) Customer.woo_username (custom field) == username
+    2) Customer.mobile_no or Customer.phone == normalized(phone)
+    3) Customer.email_id == email
+    4) Customer.customer_name == normalized name
+    On create, set woo_username (if field exists), mobile_no, email_id.
+    """
+    phone_norm = _normalize_phone(phone)
+
+    # 1) username-based
+    if username and _field_exists("Customer", "woo_username"):
+        name = frappe.db.get_value("Customer", {"woo_username": username}, "name")
+        if name:
+            # ensure phone/email filled if missing
+            try:
+                cust = frappe.get_doc("Customer", name)
+                changed = False
+                if phone_norm and not getattr(cust, "mobile_no", None):
+                    cust.mobile_no = phone_norm
+                    changed = True
+                if email and not getattr(cust, "email_id", None):
+                    cust.email_id = email
+                    changed = True
+                if changed:
+                    cust.save(ignore_permissions=True)
+            except Exception:
+                pass
+            return name
+
+    # 2) phone-based
+    if phone_norm:
+        name = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name") or frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+        if name:
+            # backfill username if field exists and not set
+            if username and _field_exists("Customer", "woo_username"):
+                try:
+                    cur = frappe.get_doc("Customer", name)
+                    if not getattr(cur, "woo_username", None):
+                        cur.db_set("woo_username", username, commit=False)
+                except Exception:
+                    pass
+            # backfill email if missing
+            try:
+                cur = frappe.get_doc("Customer", name)
+                if email and not getattr(cur, "email_id", None):
+                    cur.db_set("email_id", email, commit=False)
+            except Exception:
+                pass
+            return name
+
+    # 3) email-based
     if email:
         name = frappe.db.get_value("Customer", {"email_id": email}, "name")
         if name:
+            # backfill username/phone if missing
+            try:
+                cur = frappe.get_doc("Customer", name)
+                if username and _field_exists("Customer", "woo_username") and not getattr(cur, "woo_username", None):
+                    cur.db_set("woo_username", username, commit=False)
+                if phone_norm and not getattr(cur, "mobile_no", None):
+                    cur.db_set("mobile_no", phone_norm, commit=False)
+            except Exception:
+                pass
             return name
-    # Else try by normalized display name to reduce duplicates
+
+    # 4) display name fallback
     display_name = _normalize_name(first_name, last_name, email, order_id)
     existing_by_name = frappe.db.get_value("Customer", {"customer_name": display_name}, "name")
     if existing_by_name:
+        # backfill username/phone/email if missing
+        try:
+            cur = frappe.get_doc("Customer", existing_by_name)
+            if username and _field_exists("Customer", "woo_username") and not getattr(cur, "woo_username", None):
+                cur.db_set("woo_username", username, commit=False)
+            if phone_norm and not getattr(cur, "mobile_no", None):
+                cur.db_set("mobile_no", phone_norm, commit=False)
+            if email and not getattr(cur, "email_id", None):
+                cur.db_set("email_id", email, commit=False)
+        except Exception:
+            pass
         return existing_by_name
-    doc = frappe.get_doc({
+
+    # Create new
+    fields = {
         "doctype": "Customer",
-        "customer_name": display_name,
+        "customer_name": display_name if display_name else (username or "Woo Customer"),
         "customer_type": "Individual",
-        **({"email_id": email} if email else {}),
-    })
+    }
+    if email:
+        fields["email_id"] = email
+    if phone_norm:
+        fields["mobile_no"] = phone_norm
+    if username and _field_exists("Customer", "woo_username"):
+        fields["woo_username"] = username
+    doc = frappe.get_doc(fields)
     doc.insert(ignore_permissions=True)
     return doc.name
 
@@ -141,6 +237,10 @@ def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | No
     billing = order.get("billing") or {}
     shipping = order.get("shipping") or {}
     email = billing.get("email") or (order.get("customer_email") if isinstance(order.get("customer_email"), str) else None)
+    # Try username from order if present (rare). Most often not present on order payload.
+    username = order.get("username") if isinstance(order.get("username"), str) else None
+    # Prefer billing phone; else shipping
+    phone = billing.get("phone") or shipping.get("phone")
 
     billing_line1 = (billing.get("address_1") or "").strip()
     shipping_line1 = (shipping.get("address_1") or "").strip()
@@ -148,7 +248,7 @@ def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | No
         # Explicitly enforce address presence
         raise ValueError("no_address")
 
-    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"))
+    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone)
 
     billing_addr_name = None
     shipping_addr_name = None
