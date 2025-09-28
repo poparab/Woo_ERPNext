@@ -65,7 +65,9 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
 
     # 2) phone-based
     if phone_norm:
-        name = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name") or frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+        name = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
+        if not name and _field_exists("Customer", "phone"):
+            name = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
         if name:
             # backfill username if field exists and not set
             if username and _field_exists("Customer", "woo_username"):
