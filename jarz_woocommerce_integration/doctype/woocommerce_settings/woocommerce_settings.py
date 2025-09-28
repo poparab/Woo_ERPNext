@@ -1,21 +1,10 @@
-"""Compatibility stub forwarding to nested DocType controller.
-
-Frappe resolves controller imports at this top-level path. The real implementation
-now lives in the nested package to avoid duplication. Keep this thin stub so any
-framework dynamic imports continue to succeed.
-"""
-
-from jarz_woocommerce_integration.jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (  # noqa: F401,E501
-    WooCommerceSettings,
-)
-"""Controller for the single DocType WooCommerce Settings.
-
-Provides a convenience accessor `WooCommerceSettings.get_settings()` used
-throughout the integration services layer. Also exposes a helper to obtain
-the decrypted consumer secret without duplicating password logic everywhere.
-"""
-
 from __future__ import annotations
+
+"""Compatibility wrapper for WooCommerce Settings DocType controller.
+
+This module defines the controller so Frappe can import it at the standard path.
+The actual implementation is equivalent to the nested module version.
+"""
 
 import frappe
 from frappe.model.document import Document
