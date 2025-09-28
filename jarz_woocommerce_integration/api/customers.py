@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import frappe
 from jarz_woocommerce_integration.services.customer_bulk_sync import sync_all_customers
+from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
+    WooCommerceSettings,
+)
+from jarz_woocommerce_integration.utils.http_client import WooClient
 
 
 @frappe.whitelist(allow_guest=False)
@@ -9,55 +13,9 @@ def sync_all(per_page: int = 100, max_pages: int | None = None) -> dict:
     """Bulk pull all WooCommerce customers and upsert them.
 
     Example REST call:
-    /api/method/jarz_woocommerce_integration.jarz_woocommerce_integration.api.customers.sync_all?per_page=100
+    /api/method/jarz_woocommerce_integration.api.customers.sync_all?per_page=100
     """
     return {"success": True, "data": sync_all_customers(per_page=per_page, max_pages=max_pages)}
-import frappe
-from jarz_woocommerce_integration.services.customer_sync import sync_customers
-from jarz_woocommerce_integration.jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (  # standardized nested path
-    WooCommerceSettings,
-)
-from jarz_woocommerce_integration.utils.http_client import WooClient
-
-
-@frappe.whitelist(allow_guest=False)
-def pull_customers(batch_size: int = 100, full_refresh: int | bool = 0):
-    """Pull WooCommerce customers.
-
-    Incremental by default (creation date after last_synced_customer_created). Use
-    full_refresh=1 to ignore high-water mark and reprocess existing customers (e.g. to backfill addresses).
-
-    Args:
-        batch_size: per_page size when calling Woo API (max 100 recommended)
-        full_refresh: 1/true to rescan all pages from start
-    """
-    batch_size = min(int(batch_size), 100)
-    return {"success": True, "data": sync_customers(batch_size=batch_size, full_refresh=full_refresh)}
-
-
-@frappe.whitelist(allow_guest=False)
-def pull_customers_full(batch_size: int = 100):
-    """Convenience endpoint to run a full refresh (ignores high-water mark)."""
-    batch_size = min(int(batch_size), 100)
-    return {"success": True, "data": sync_customers(batch_size=batch_size, full_refresh=1)}
-
-
-@frappe.whitelist(allow_guest=False)
-def pull_customers_full_debug(batch_size: int = 50):
-    """Full refresh with debug samples (first 5 customers address decisions)."""
-    batch_size = min(int(batch_size), 100)
-    return {"success": True, "data": sync_customers(batch_size=batch_size, full_refresh=1, debug=1)}
-
-
-@frappe.whitelist(allow_guest=False)
-def backfill_customer_ids(batch_size: int = 100):
-    """Full refresh specifically for backfilling custom_woo_customer_id.
-
-    Same as pull_customers_full but explicitly named for clarity during rollout.
-    Returns the standard sync metrics.
-    """
-    batch_size = min(int(batch_size), 100)
-    return {"success": True, "data": sync_customers(batch_size=batch_size, full_refresh=1)}
 
 
 @frappe.whitelist(allow_guest=False)
