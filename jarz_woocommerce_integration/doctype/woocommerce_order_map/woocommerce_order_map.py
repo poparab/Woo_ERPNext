@@ -1,10 +1,9 @@
-"""Compatibility stub forwarding to nested DocType controller."""
+from __future__ import annotations
 
-from jarz_woocommerce_integration.jarz_woocommerce_integration.doctype.woocommerce_order_map.woocommerce_order_map import (  # noqa: F401,E501
-    WooCommerceOrderMap,
-)
-import frappe
-from frappe.model.document import Document
+from frappe.model.document import Document  # type: ignore[import]
+
 
 class WooCommerceOrderMap(Document):
+    """ERPNext record linking a WooCommerce order to its Sales Invoice."""
+
     pass

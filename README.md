@@ -78,6 +78,58 @@ Behavior:
 Run again any time to backfill new Woo signups.
 
 
+## Manual Backfill – Quick Commands (inside container)
+
+Assumptions:
+- You are already inside the Frappe container shell (bash)
+- For local development, site name is `development.localhost`
+
+Tip: The `--kwargs` is evaluated as a Python expression by bench; using `dict(...)` avoids quoting issues.
+
+First, switch to the bench folder:
+
+```bash
+cd /workspace/development/frappe-bench
+```
+
+Customers (one page example):
+
+```bash
+bench --site development.localhost execute jarz_woocommerce_integration.api.customers.sync_all --kwargs "dict(per_page=100,max_pages=1)"
+```
+
+Territories (full sync):
+
+```bash
+bench --site development.localhost execute jarz_woocommerce_integration.api.territories.sync_all
+```
+
+Orders – recent (Phase 1, 100 orders):
+
+```bash
+bench --site development.localhost execute jarz_woocommerce_integration.services.order_sync.pull_recent_orders_phase1 --kwargs "dict(limit=100,allow_update=True,force=True)"
+```
+
+Single Order (replace 12345):
+
+```bash
+bench --site development.localhost execute jarz_woocommerce_integration.services.order_sync.pull_single_order_phase1 --kwargs "dict(order_id=12345,allow_update=True)"
+```
+
+### Territory Sync details
+
+Endpoint: `/api/method/jarz_woocommerce_integration.api.territories.sync_all`
+
+Behavior:
+- Pulls Woo delivery areas/zones (per your store configuration) into ERPNext `Territory` records.
+- Updates `Territory.pos_profile` and `custom_woo_code` when provided.
+- Idempotent; safe to re-run.
+
+Troubleshooting:
+- Ensure `WooCommerce Settings` has correct Base URL and credentials.
+- Run `bench restart` if you deploy new code and don’t see endpoints.
+
+
 ### Installation
 
 You can install this app using the [bench](https://github.com/frappe/bench) CLI:
