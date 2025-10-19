@@ -1,7 +1,15 @@
 from __future__ import annotations
 
-from typing import Tuple, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
+
 import frappe
+from frappe.utils import get_datetime  # type: ignore[import]
+
+from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
+    WooCommerceSettings,
+)
+from jarz_woocommerce_integration.utils.http_client import WooClient
 
 
 def _normalize_name(first: str | None, last: str | None, email: Optional[str] = None, order_id: Optional[int] = None) -> str:
@@ -266,4 +274,183 @@ def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | No
         shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email)
 
     return customer, billing_addr_name, shipping_addr_name
+
+
+def _format_datetime_for_woo(dt: datetime) -> str:
+    dt_utc = dt.astimezone(timezone.utc)
+    iso = dt_utc.replace(microsecond=0).isoformat()
+    return iso.replace("+00:00", "Z")
+
+
+def _extract_customer_created_ts(cust: Dict[str, Any]) -> datetime | None:
+    for key in ("date_created_gmt", "date_created"):
+        raw = cust.get(key)
+        if not raw:
+            continue
+        try:
+            dt_val = get_datetime(raw)
+            if dt_val is None:
+                continue
+            if dt_val.tzinfo is None:
+                dt_val = dt_val.replace(tzinfo=timezone.utc)
+            return dt_val.astimezone(timezone.utc)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
+    billing = cust.get("billing") or {}
+    shipping = cust.get("shipping") or {}
+    email = (
+        billing.get("email")
+        or shipping.get("email")
+        or (cust.get("email") if isinstance(cust.get("email"), str) else None)
+    )
+    username = cust.get("username") if isinstance(cust.get("username"), str) else None
+    first_name = billing.get("first_name") or shipping.get("first_name")
+    last_name = billing.get("last_name") or shipping.get("last_name")
+    phone = billing.get("phone") or shipping.get("phone")
+
+    customer_name = _ensure_customer(
+        email,
+        first_name,
+        last_name,
+        cust.get("id"),
+        username=username,
+        phone=phone,
+    )
+
+    def _upsert_address(kind: str, data: dict) -> Optional[str]:
+        line1 = (data.get("address_1") or "").strip()
+        if not line1:
+            return None
+        existing = _find_existing_address_for_customer(customer_name, kind, line1)
+        if existing:
+            return existing
+        return _create_address(customer_name, kind, data, data.get("phone"), email)
+
+    billing_name = _upsert_address("Billing", billing)
+    shipping_name = _upsert_address("Shipping", shipping)
+
+    return {
+        "customer": customer_name,
+        "billing": billing_name,
+        "shipping": shipping_name,
+    }
+
+
+def sync_recent_customers(per_page: int = 50, max_pages: int | None = 5) -> Dict[str, Any]:
+    settings = WooCommerceSettings.get_settings()
+    auto_enabled = bool(getattr(settings, "auto_create_customers", 0))
+    if not auto_enabled:
+        return {"skipped": True, "reason": "auto_create_customers_disabled"}
+
+    base_url_raw = (getattr(settings, "base_url", "") or "").strip()
+    consumer_key = (getattr(settings, "consumer_key", "") or "").strip()
+    try:
+        consumer_secret = settings.get_password("consumer_secret")
+    except Exception:  # noqa: BLE001
+        consumer_secret = None
+
+    if not base_url_raw or not consumer_key or not consumer_secret:
+        return {"skipped": True, "reason": "missing_credentials"}
+
+    client = WooClient(
+        base_url=base_url_raw.rstrip("/"),
+        consumer_key=consumer_key,
+        consumer_secret=consumer_secret,
+        api_version=settings.api_version or "v3",
+    )
+
+    since_raw = getattr(settings, "last_synced_customer_created", None)
+    since_dt = get_datetime(since_raw) if since_raw else None
+    if since_dt and since_dt.tzinfo is None:
+        since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+    page = 1
+    processed = 0
+    successes = 0
+    failures = 0
+    latest_seen = since_dt
+    results_sample: list[Dict[str, Any]] = []
+
+    while True:
+        params = {
+            "per_page": per_page,
+            "page": page,
+            "orderby": "date",
+            "order": "asc",
+        }
+        if since_dt:
+            params["after"] = _format_datetime_for_woo(since_dt)
+
+        data = client.list_customers(params=params)
+        if not data:
+            break
+
+        for cust in data:
+            processed += 1
+            try:
+                summary = _sync_customer_payload(cust)
+                successes += 1
+                if len(results_sample) < 5:
+                    results_sample.append(summary)
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                frappe.logger().error({
+                    "event": "woo_customer_sync_error",
+                    "customer_id": cust.get("id"),
+                    "error": str(exc),
+                    "traceback": frappe.get_traceback(),
+                })
+                frappe.db.rollback()
+                continue
+
+            created_ts = _extract_customer_created_ts(cust)
+            if created_ts and (latest_seen is None or created_ts > latest_seen):
+                latest_seen = created_ts
+
+        if len(data) < per_page:
+            break
+        page += 1
+        if max_pages and page > max_pages:
+            break
+
+    if latest_seen and (since_dt is None or latest_seen > since_dt):
+        try:
+            settings.db_set("last_synced_customer_created", latest_seen)
+        except Exception:  # noqa: BLE001
+            frappe.logger().warning({
+                "event": "woo_customer_sync_timestamp_update_failed",
+                "timestamp": latest_seen.isoformat(),
+            })
+
+    try:
+        frappe.db.commit()
+    except Exception:  # noqa: BLE001
+        frappe.logger().warning({"event": "woo_customer_sync_commit_failed"})
+
+    return {
+        "processed": processed,
+        "successes": successes,
+        "failures": failures,
+        "latest_created": latest_seen.isoformat() if latest_seen else None,
+        "since": since_dt.isoformat() if since_dt else None,
+        "sample": results_sample,
+    }
+
+
+def sync_customers_cron():  # pragma: no cover
+    try:
+        result = sync_recent_customers()
+        frappe.logger().info({
+            "event": "woo_customer_sync",
+            "result": result,
+        })
+    except Exception:  # noqa: BLE001
+        frappe.logger().error({
+            "event": "woo_customer_sync_cron_error",
+            "traceback": frappe.get_traceback(),
+        })
 

@@ -153,22 +153,21 @@ after_migrate = "jarz_woocommerce_integration.install.after_migrate"
 # ---------------
 
 # Customer incremental sync every 15 minutes
-# Note: Scheduler functions not yet implemented - commented out to allow installation
-# scheduler_events = {
-# 	"cron": {
-# 		"*/15 * * * *": [
-# 			"jarz_woocommerce_integration.services.customer_sync.sync_customers_cron"
-# 		],
-# 		# Territory sync every 6 hours (at minute 0)
-# 		"0 */6 * * *": [
-# 			"jarz_woocommerce_integration.services.territory_sync.sync_territories_cron"
-# 		],
-# 		# Phase1 order sync every 5 minutes (draft invoices with dummy item)
-# 		"*/5 * * * *": [
-# 			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
-# 		]
-# 	}
-# }
+scheduler_events = {
+	"cron": {
+		"*/15 * * * *": [
+			"jarz_woocommerce_integration.services.customer_sync.sync_customers_cron"
+		],
+		# Territory sync every 6 hours (at minute 0)
+		"0 */6 * * *": [
+			"jarz_woocommerce_integration.services.territory_sync.sync_territories_cron"
+		],
+		# Phase1 order sync every 5 minutes (draft invoices with dummy item)
+		"*/5 * * * *": [
+			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
+		]
+	}
+}
 
 # Fixtures (exported Custom Fields)
 # Fixtures (exported Custom Fields)
