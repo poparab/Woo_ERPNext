@@ -1,13 +1,9 @@
 """Jarz WooCommerce Integration top-level package.
 
-We recently flattened the app structure to remove the third level package that
-used to live at ``jarz_woocommerce_integration.jarz_woocommerce_integration``.
-Some legacy workers and integrations still import modules via that dotted
-path, so we register a lightweight alias that forwards lookups to the new
-canonical modules (``jarz_woocommerce_integration.api``, ``.doctype`` …).
-
-This mirrors the approach used in ``jarz_pos`` and keeps the public contract
-stable while we tidy up the repository layout.
+We flattened the on-disk layout to remove the redundant third directory level
+but keep the historical import path ``jarz_woocommerce_integration.
+jarz_woocommerce_integration`` alive by directly re-exporting the inner module.
+This mirrors how ``jarz_pos`` maintains compatibility.
 """
 
 from __future__ import annotations
@@ -25,4 +21,14 @@ try:
 except ModuleNotFoundError:
 	_inner_pkg = None
 else:
-	_sys.modules.setdefault(_LEGACY_ROOT, _inner_pkg)
+	_sys.modules[_LEGACY_ROOT] = _inner_pkg
+
+	# Keep both lowercase and capitalised patches imports working (bench sometimes
+	# references either style in migration logs).
+	try:
+		_patches_mod = _importlib.import_module(__name__ + ".patches")
+	except ModuleNotFoundError:
+		_patches_mod = None
+	if _patches_mod is not None:
+		_sys.modules.setdefault(__name__ + ".patches", _patches_mod)
+		_sys.modules.setdefault(__name__ + ".Patches", _patches_mod)
