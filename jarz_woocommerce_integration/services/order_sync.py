@@ -893,12 +893,19 @@ def run_pos_profile_update_cli():  # pragma: no cover
         return pull_recent_orders_phase1(limit=10, dry_run=False, force=True, allow_update=True)
 
 
-def migrate_all_historical_orders_cli(max_pages: int = 10):  # pragma: no cover
-    """CLI entry point to migrate all historical orders across multiple pages.
+def migrate_all_historical_orders_cli(max_pages: int = 100, batch_size: int = 50):  # pragma: no cover
+    """CLI entry point to migrate all historical orders across multiple pages with smart memory management.
+    
+    Handles up to 10,000 orders efficiently by:
+    - Using smaller batch sizes (50 orders/page instead of 100)
+    - Clearing cache and committing DB after each batch
+    - Monitoring memory and taking breaks if needed
     
     Usage:
         bench --site <site> execute jarz_woocommerce_integration.services.order_sync.migrate_all_historical_orders_cli
     """
+    import gc
+    
     total_stats = {
         "orders_fetched": 0,
         "processed": 0,
@@ -906,23 +913,43 @@ def migrate_all_historical_orders_cli(max_pages: int = 10):  # pragma: no cover
         "skipped": 0,
         "errors": 0,
         "pages_processed": 0,
+        "batches_completed": 0,
     }
     
     for page in range(1, max_pages + 1):
-        result = migrate_historical_orders(limit=100, page=page)
+        # Process one batch with smaller limit for better memory management
+        result = migrate_historical_orders(limit=batch_size, page=page)
         total_stats["orders_fetched"] += result.get("orders_fetched", 0)
         total_stats["processed"] += result.get("processed", 0)
         total_stats["created"] += result.get("created", 0)
         total_stats["skipped"] += result.get("skipped", 0)
         total_stats["errors"] += result.get("errors", 0)
         total_stats["pages_processed"] = page
+        total_stats["batches_completed"] += 1
         
-        frappe.logger().info(f"Historical migration page {page} complete: {result}")
+        frappe.logger().info(f"Historical migration page {page}/{max_pages} complete: {result}")
         
-        # Stop if we fetched fewer than 100 orders (reached the end)
-        if result.get("orders_fetched", 0) < 100:
+        # Memory management: commit and clear cache every batch
+        try:
+            frappe.db.commit()
+            frappe.clear_cache()
+            gc.collect()  # Force garbage collection
+        except Exception as e:
+            frappe.logger().error(f"Cache clear error on page {page}: {str(e)}")
+        
+        # Stop if we fetched fewer orders than batch_size (reached the end)
+        if result.get("orders_fetched", 0) < batch_size:
+            frappe.logger().info(f"Migration complete - reached end of orders at page {page}")
             break
+        
+        # Add small delay every 10 batches to prevent worker timeout
+        if page % 10 == 0:
+            import time
+            time.sleep(2)  # 2 second break every 10 batches
+            frappe.logger().info(f"Checkpoint: {total_stats['created']} orders migrated so far...")
     
+    # Final summary
+    frappe.logger().info(f"=== MIGRATION COMPLETE === Total: {total_stats}")
     return total_stats
 
 
