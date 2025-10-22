@@ -34,23 +34,23 @@ def _map_payment_method(woo_payment_method: str | None) -> str | None:
     """Map WooCommerce payment method to ERPNext custom_payment_method.
     
     WooCommerce -> ERPNext mapping:
-    - instapay -> instapay
-    - cod -> cash
-    - kashier_card -> kashier_card
-    - kashier_wallet -> kashier_wallet
+    - instapay -> Instapay
+    - cod -> Cash
+    - kashier_card -> Kashier Card
+    - kashier_wallet -> Kashier Wallet
     """
     if not woo_payment_method:
         return None
     
     pm = woo_payment_method.lower().strip()
     if pm == "instapay":
-        return "instapay"
+        return "Instapay"
     elif pm == "cod":
-        return "cash"
+        return "Cash"
     elif pm == "kashier_card":
-        return "kashier_card"
+        return "Kashier Card"
     elif pm == "kashier_wallet":
-        return "kashier_wallet"
+        return "Kashier Wallet"
     else:
         return None
 
@@ -656,7 +656,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     pass
                 
                 # Create payment entry for Kashier methods
-                if custom_payment_method in ["kashier_card", "kashier_wallet"]:
+                if custom_payment_method in ["Kashier Card", "Kashier Wallet"]:
                     try:
                         payment_entry = _create_kashier_payment_entry(
                             inv.name,
