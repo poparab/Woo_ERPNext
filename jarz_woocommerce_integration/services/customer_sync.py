@@ -463,7 +463,7 @@ def resync_all_customers_cli():  # pragma: no cover
         bench --site <site> execute jarz_woocommerce_integration.services.customer_sync.resync_all_customers_cli
     """
     frappe.logger().info("Starting full customer resync...")
-    result = sync_recent_customers(limit=500, modified_after=None)
+    result = sync_recent_customers(per_page=50, max_pages=10)
     frappe.logger().info(f"Customer resync complete: {result}")
     print(f"\n✅ Customer Resync Complete:")
     print(f"  Processed: {result.get('processed', 0)}")
