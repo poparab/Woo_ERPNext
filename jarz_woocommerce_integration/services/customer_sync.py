@@ -448,7 +448,26 @@ def sync_customers_cron():  # pragma: no cover
         })
     except Exception:  # noqa: BLE001
         frappe.logger().error({
-            "event": "woo_customer_sync_cron_error",
+            "event": "woo_customer_sync_error",
             "traceback": frappe.get_traceback(),
         })
+
+
+def resync_all_customers_cli():  # pragma: no cover
+    """CLI command to resync all WooCommerce customers (updates territories).
+    
+    This will fetch all customers from WooCommerce (up to 500) and update
+    their territories based on their latest address information.
+    
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.services.customer_sync.resync_all_customers_cli
+    """
+    frappe.logger().info("Starting full customer resync...")
+    result = sync_recent_customers(limit=500, modified_after=None)
+    frappe.logger().info(f"Customer resync complete: {result}")
+    print(f"\n✅ Customer Resync Complete:")
+    print(f"  Processed: {result.get('processed', 0)}")
+    print(f"  Created: {result.get('successes', 0)}")
+    print(f"  Errors: {result.get('failures', 0)}")
+    return result
 
