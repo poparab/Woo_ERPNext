@@ -52,10 +52,19 @@ CODE_TO_DISPLAY = {
 
 def build_client() -> WooClient:
     settings = WooCommerceSettings.get_settings()
+    consumer_secret = None
+    try:
+        consumer_secret = settings.get_consumer_secret()
+    except AttributeError:
+        # older controller variants exposed decrypted_consumer_secret attribute
+        consumer_secret = getattr(settings, "decrypted_consumer_secret", None)
+
+    if not consumer_secret:
+        consumer_secret = settings.get_password("consumer_secret")
     return WooClient(
         base_url=settings.base_url,
         consumer_key=settings.consumer_key,
-        consumer_secret=settings.decrypted_consumer_secret,
+        consumer_secret=consumer_secret,
         api_version=settings.api_version or "v3",
     )
 

@@ -379,8 +379,6 @@ def sync_recent_customers(per_page: int = 50, max_pages: int | None = 5) -> Dict
         params = {
             "per_page": per_page,
             "page": page,
-            "orderby": "date",
-            "order": "asc",
         }
         if since_dt:
             params["after"] = _format_datetime_for_woo(since_dt)
