@@ -162,8 +162,8 @@ scheduler_events = {
 		"0 */6 * * *": [
 			"jarz_woocommerce_integration.services.territory_sync.sync_territories_cron"
 		],
-		# Phase1 order sync every 5 minutes (draft invoices with dummy item)
-		"*/5 * * * *": [
+		# Live order sync every 2 minutes (creates unpaid submitted invoices, skips pending payment)
+		"*/2 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
 		]
 	}

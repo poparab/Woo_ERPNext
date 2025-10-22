@@ -9,14 +9,50 @@ from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_field
 from jarz_woocommerce_integration.services.customer_sync import ensure_customer_with_addresses
 
 
-def _map_status(woo_status: str | None) -> dict[str, Any]:
-    """Map Woo status to ERPNext docstatus and custom state."""
+def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str, Any]:
+    """Map Woo status to ERPNext docstatus and custom state.
+    
+    Args:
+        woo_status: WooCommerce order status
+        is_historical: If True, creates paid invoices for completed orders (historical migration)
+                      If False, creates unpaid submitted invoices (live orders)
+    """
     s = (woo_status or "").lower()
     if s in {"completed", "processing"}:
-        return {"docstatus": 1, "custom_state": "Completed"}
+        if is_historical:
+            # Historical: mark as paid (submitted + paid status)
+            return {"docstatus": 1, "custom_state": "Completed", "is_paid": True}
+        else:
+            # Live: mark as submitted but unpaid
+            return {"docstatus": 1, "custom_state": "Completed", "is_paid": False}
     if s in {"cancelled", "refunded"}:
-        return {"docstatus": 2, "custom_state": "Cancelled"}
-    return {"docstatus": 0, "custom_state": "Draft"}
+        return {"docstatus": 2, "custom_state": "Cancelled", "is_paid": False}
+    return {"docstatus": 0, "custom_state": "Draft", "is_paid": False}
+
+
+def _map_payment_method(woo_payment_method: str | None) -> str | None:
+    """Map WooCommerce payment method to ERPNext custom_payment_method.
+    
+    WooCommerce -> ERPNext mapping:
+    - instapay -> instapay
+    - cod -> cash
+    - kashier_card -> kashier_card
+    - kashier_wallet -> kashier_wallet
+    """
+    if not woo_payment_method:
+        return None
+    
+    pm = woo_payment_method.lower().strip()
+    if pm == "instapay":
+        return "instapay"
+    elif pm == "cod":
+        return "cash"
+    elif pm == "kashier_card":
+        return "kashier_card"
+    elif pm == "kashier_wallet":
+        return "kashier_wallet"
+    else:
+        return None
 
 
 def _compute_order_hash(order: dict) -> str:
@@ -311,8 +347,71 @@ def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str 
     inv.append("taxes", row)
 
 
-def process_order_phase1(order: dict, settings, allow_update: bool = True) -> dict:
-    """Process a single Woo order into a Sales Invoice (Phase 1 mapping)."""
+def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_method: str) -> str | None:
+    """Create Payment Entry for Kashier payments (kashier_card or kashier_wallet).
+    
+    Args:
+        invoice_name: Sales Invoice name
+        amount: Payment amount
+        payment_method: Either 'kashier_card' or 'kashier_wallet'
+    
+    Returns:
+        Payment Entry name if created, None otherwise
+    """
+    try:
+        inv = frappe.get_doc("Sales Invoice", invoice_name)
+        
+        # Get Kashier account from company
+        company = inv.company
+        kashier_account = frappe.db.get_value("Company", company, "custom_kashier_account")
+        
+        if not kashier_account:
+            frappe.log_error(
+                f"Kashier account not configured for company {company}",
+                "Kashier Payment Entry Creation Failed"
+            )
+            return None
+        
+        # Create Payment Entry
+        pe = frappe.get_doc({
+            "doctype": "Payment Entry",
+            "payment_type": "Receive",
+            "posting_date": frappe.utils.today(),
+            "company": company,
+            "party_type": "Customer",
+            "party": inv.customer,
+            "paid_to": kashier_account,
+            "paid_amount": amount,
+            "received_amount": amount,
+            "reference_no": f"Kashier-{invoice_name}",
+            "reference_date": frappe.utils.today(),
+            "references": [{
+                "reference_doctype": "Sales Invoice",
+                "reference_name": invoice_name,
+                "allocated_amount": amount
+            }]
+        })
+        pe.insert(ignore_permissions=True)
+        pe.submit()
+        
+        return pe.name
+    except Exception as e:
+        frappe.log_error(
+            f"Failed to create Kashier payment entry for {invoice_name}: {str(e)}",
+            "Kashier Payment Entry Error"
+        )
+        return None
+
+
+def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False) -> dict:
+    """Process a single Woo order into a Sales Invoice.
+    
+    Args:
+        order: WooCommerce order dict
+        settings: WooCommerce Settings singleton
+        allow_update: Whether to update existing invoices
+        is_historical: True for historical migration (paid invoices), False for live orders (unpaid)
+    """
     woo_id = order.get("id")
 
     # Determine mapping link field name based on actual DB schema
@@ -412,7 +511,18 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True) -> di
     if not lines:
         return {"status": "skipped", "reason": "no_lines", "woo_order_id": woo_id}
 
-    status_map = _map_status(order.get("status"))
+    # Check payment status for live orders
+    woo_status = (order.get("status") or "").lower()
+    if not is_historical:
+        # For live orders, skip if pending payment
+        if woo_status in {"pending", "on-hold"}:
+            return {"status": "skipped", "reason": "pending_payment", "woo_order_id": woo_id, "woo_status": woo_status}
+    
+    # Map payment method
+    woo_payment_method = order.get("payment_method")
+    custom_payment_method = _map_payment_method(woo_payment_method)
+    
+    status_map = _map_status(woo_status, is_historical=is_historical)
 
     try:
         delivery_date_val, time_from_val, duration_val = _parse_delivery_parts(order)
@@ -489,7 +599,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True) -> di
             if default_warehouse:
                 for it in lines:
                     it["warehouse"] = default_warehouse
-            inv = frappe.get_doc({
+            inv_data = {
                 "doctype": "Sales Invoice",
                 "customer": customer,
                 "currency": order.get("currency") or getattr(settings, "default_currency", None) or "USD",
@@ -499,12 +609,22 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True) -> di
                 "woo_order_number": order.get("number"),
                 "customer_address": billing_addr or shipping_addr,
                 "shipping_address_name": shipping_addr or billing_addr,
-                **({"custom_delivery_date": delivery_date_val} if delivery_date_val else {}),
-                **({"custom_delivery_time_from": time_from_val} if time_from_val else {}),
-                **({"custom_delivery_duration": int(duration_val) * 60} if duration_val is not None else {}),
                 "items": lines,
-                **({"selling_price_list": price_list} if price_list else {}),
-            })
+            }
+            
+            # Add optional fields
+            if delivery_date_val:
+                inv_data["custom_delivery_date"] = delivery_date_val
+            if time_from_val:
+                inv_data["custom_delivery_time_from"] = time_from_val
+            if duration_val is not None:
+                inv_data["custom_delivery_duration"] = int(duration_val) * 60
+            if price_list:
+                inv_data["selling_price_list"] = price_list
+            if custom_payment_method:
+                inv_data["custom_payment_method"] = custom_payment_method
+            
+            inv = frappe.get_doc(inv_data)
             # Set POS Profile from Territory if available
             try:
                 if pos_profile:
@@ -534,6 +654,30 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True) -> di
                         inv.db_set("is_pos", 1, commit=False)
                 except Exception:
                     pass
+                
+                # Create payment entry for Kashier methods
+                if custom_payment_method in ["kashier_card", "kashier_wallet"]:
+                    try:
+                        payment_entry = _create_kashier_payment_entry(
+                            inv.name,
+                            float(order.get("total") or 0),
+                            custom_payment_method
+                        )
+                        if payment_entry:
+                            frappe.logger().info(f"Created Kashier payment entry {payment_entry} for invoice {inv.name}")
+                    except Exception as pe_error:
+                        frappe.log_error(
+                            f"Failed to create Kashier payment for {inv.name}: {str(pe_error)}",
+                            "Kashier Payment Creation Error"
+                        )
+                
+                # Mark as paid for historical orders
+                if status_map.get("is_paid"):
+                    try:
+                        inv.db_set("status", "Paid", commit=False)
+                    except Exception:
+                        pass
+                        
             elif status_map["docstatus"] == 2:
                 inv.cancel()
             try:
@@ -578,7 +722,17 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True) -> di
         return {"status": "error", "reason": str(e), "woo_order_id": woo_id}
 
 
-def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: bool = False, allow_update: bool = True) -> dict[str, Any]:
+def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: bool = False, allow_update: bool = True, is_historical: bool = False) -> dict[str, Any]:
+    """Pull recent orders from WooCommerce.
+    
+    Args:
+        limit: Number of orders to fetch
+        dry_run: If True, don't create invoices
+        force: Force recreation (delete existing mappings)
+        allow_update: Allow updating existing invoices
+        is_historical: True for historical migration (completed/cancelled only, marked as paid)
+                      False for live orders (all statuses, marked as unpaid)
+    """
     settings = frappe.get_single("WooCommerce Settings")
     ensure_custom_fields()
 
@@ -588,7 +742,13 @@ def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: boo
         consumer_secret=settings.get_password("consumer_secret"),
     )
 
-    orders = client.list_orders(params={"per_page": limit})
+    # Build params based on mode
+    params = {"per_page": limit}
+    if is_historical:
+        # Historical: only fetch completed and cancelled orders
+        params["status"] = "completed,cancelled,refunded"
+    
+    orders = client.list_orders(params=params)
     metrics: dict[str, Any] = {
         "orders_fetched": len(orders),
         "processed": 0,
@@ -599,11 +759,12 @@ def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: boo
         "dry_run": dry_run,
         "force": force,
         "allow_update": allow_update,
+        "is_historical": is_historical,
     }
 
     for o in orders:
         result = (
-            process_order_phase1(o, settings, allow_update=allow_update)
+            process_order_phase1(o, settings, allow_update=allow_update, is_historical=is_historical)
             if not dry_run else {"status": "dry_run", "woo_order_id": o.get("id")}
         )
         metrics["processed"] += 1
@@ -654,12 +815,70 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
     return result
 
 
-def sync_orders_cron_phase1():  # pragma: no cover - scheduler entry
+def migrate_historical_orders(limit: int = 100, page: int = 1) -> dict[str, Any]:
+    """One-time migration of historical orders (completed/cancelled only).
+    
+    Creates paid Sales Invoices without accounting/inventory effects for reporting.
+    
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.services.order_sync.migrate_historical_orders --kwargs '{"limit": 100, "page": 1}'
+    """
+    settings = frappe.get_single("WooCommerce Settings")
+    ensure_custom_fields()
+
+    client = WooClient(
+        base_url=settings.base_url,
+        consumer_key=settings.consumer_key,
+        consumer_secret=settings.get_password("consumer_secret"),
+    )
+
+    # Fetch only completed and cancelled orders
+    params = {
+        "per_page": limit,
+        "page": page,
+        "status": "completed,cancelled,refunded",
+        "orderby": "date",
+        "order": "desc"
+    }
+    
+    orders = client.list_orders(params=params)
+    metrics: dict[str, Any] = {
+        "orders_fetched": len(orders),
+        "processed": 0,
+        "created": 0,
+        "skipped": 0,
+        "errors": 0,
+        "results_sample": [],
+        "is_historical": True,
+        "page": page,
+    }
+
+    for o in orders:
+        result = process_order_phase1(o, settings, allow_update=False, is_historical=True)
+        metrics["processed"] += 1
+        if result["status"] in ("created", "updated"):
+            metrics["created"] += 1
+        elif result["status"] == "error":
+            metrics["errors"] += 1
+        elif result["status"] == "skipped":
+            metrics["skipped"] += 1
+        if len(metrics["results_sample"]) < 10:
+            metrics["results_sample"].append(result)
+
+    frappe.logger().info({"event": "woo_historical_migration", "result": metrics})
+    return metrics
+
+
+def sync_orders_cron_phase1():  # pragma: no cover - scheduler entry for live orders
+    """Cron job for live order sync (every 2 minutes).
+    
+    Fetches recent orders, skips pending payment, creates unpaid submitted invoices.
+    """
     try:
-        res = pull_recent_orders_phase1(limit=20)
-        frappe.logger().info({"event": "woo_order_sync_phase1", "result": res})
+        res = pull_recent_orders_phase1(limit=20, is_historical=False)
+        frappe.logger().info({"event": "woo_order_sync_live", "result": res})
     except Exception:  # noqa: BLE001
-        frappe.logger().error({"event": "woo_order_sync_phase1_error", "traceback": frappe.get_traceback()})
+        frappe.logger().error({"event": "woo_order_sync_live_error", "traceback": frappe.get_traceback()})
 
 
 def run_pos_profile_update_cli():  # pragma: no cover
