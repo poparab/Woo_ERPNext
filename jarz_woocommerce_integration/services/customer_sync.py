@@ -211,14 +211,14 @@ def _resolve_country(raw: str | None) -> Optional[str]:
 def _resolve_territory_from_state(state_value: str | None) -> str | None:
     """Extract territory from WooCommerce state field (which contains delivery zone).
     
-    WooCommerce stores the delivery zone in the 'state' field like "Imbaba - امبابه".
-    We need to match this against Territory.territory_name.
+    WooCommerce stores the delivery zone in the 'state' field like "Dokki - الدقي" or "Nasr City - مدينه نصر".
+    We need to match this against Territory codes using the territory_sync CODE_TO_DISPLAY mapping.
     
     Args:
-        state_value: The state field from WooCommerce address (e.g., "Imbaba - امبابه")
+        state_value: The state field from WooCommerce address (e.g., "Dokki - الدقي")
         
     Returns:
-        Territory name if found, None otherwise
+        Territory name (code) if found, None otherwise
     """
     if not state_value:
         return None
@@ -227,16 +227,33 @@ def _resolve_territory_from_state(state_value: str | None) -> str | None:
     if not state_value:
         return None
     
-    # Try exact match first
-    if frappe.db.exists("Territory", {"territory_name": state_value, "is_group": 0}):
-        return state_value
+    # Import the mapping from territory_sync
+    from jarz_woocommerce_integration.services.territory_sync import CODE_TO_DISPLAY
+    
+    # Create reverse mapping (display -> code)
+    DISPLAY_TO_CODE = {v: k for k, v in CODE_TO_DISPLAY.items()}
+    
+    # Try exact match in reverse mapping
+    if state_value in DISPLAY_TO_CODE:
+        territory_code = DISPLAY_TO_CODE[state_value]
+        if frappe.db.exists("Territory", territory_code):
+            return territory_code
     
     # Try matching just the English part (before the hyphen)
     english_part = state_value.split(" - ")[0].strip() if " - " in state_value else state_value
-    if english_part and frappe.db.exists("Territory", {"territory_name": english_part, "is_group": 0}):
-        return english_part
     
-    # Try case-insensitive search
+    # Try finding by English part in the display values
+    for code, display in CODE_TO_DISPLAY.items():
+        display_english = display.split(" - ")[0].strip() if " - " in display else display
+        if english_part.lower() == display_english.lower():
+            if frappe.db.exists("Territory", code):
+                return code
+    
+    # Try exact match against territory name directly (for territories not in CODE_TO_DISPLAY)
+    if frappe.db.exists("Territory", {"territory_name": state_value, "is_group": 0}):
+        return frappe.db.get_value("Territory", {"territory_name": state_value, "is_group": 0}, "name")
+    
+    # Try case-insensitive search on all territories
     territories = frappe.get_all(
         "Territory",
         filters={"is_group": 0},
@@ -246,11 +263,6 @@ def _resolve_territory_from_state(state_value: str | None) -> str | None:
     state_lower = state_value.lower()
     for terr in territories:
         if terr.territory_name and terr.territory_name.lower() == state_lower:
-            return terr.name
-    
-    # Try partial match (if state contains territory name)
-    for terr in territories:
-        if terr.territory_name and terr.territory_name.lower() in state_lower:
             return terr.name
     
     return None
