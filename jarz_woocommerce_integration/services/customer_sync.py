@@ -208,6 +208,54 @@ def _resolve_country(raw: str | None) -> Optional[str]:
     return None
 
 
+def _resolve_territory_from_state(state_value: str | None) -> str | None:
+    """Extract territory from WooCommerce state field (which contains delivery zone).
+    
+    WooCommerce stores the delivery zone in the 'state' field like "Imbaba - امبابه".
+    We need to match this against Territory.territory_name.
+    
+    Args:
+        state_value: The state field from WooCommerce address (e.g., "Imbaba - امبابه")
+        
+    Returns:
+        Territory name if found, None otherwise
+    """
+    if not state_value:
+        return None
+    
+    state_value = state_value.strip()
+    if not state_value:
+        return None
+    
+    # Try exact match first
+    if frappe.db.exists("Territory", {"territory_name": state_value, "is_group": 0}):
+        return state_value
+    
+    # Try matching just the English part (before the hyphen)
+    english_part = state_value.split(" - ")[0].strip() if " - " in state_value else state_value
+    if english_part and frappe.db.exists("Territory", {"territory_name": english_part, "is_group": 0}):
+        return english_part
+    
+    # Try case-insensitive search
+    territories = frappe.get_all(
+        "Territory",
+        filters={"is_group": 0},
+        fields=["name", "territory_name"]
+    )
+    
+    state_lower = state_value.lower()
+    for terr in territories:
+        if terr.territory_name and terr.territory_name.lower() == state_lower:
+            return terr.name
+    
+    # Try partial match (if state contains territory name)
+    for terr in territories:
+        if terr.territory_name and terr.territory_name.lower() in state_lower:
+            return terr.name
+    
+    return None
+
+
 def _create_address(customer: str, address_type: str, data: dict, phone: str | None, email: str | None) -> str:
     country_val = _resolve_country(data.get("country"))
     city_val = (data.get("city") or "").strip() or (data.get("state") or "").strip() or "Unknown"
@@ -273,6 +321,20 @@ def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | No
         existing = _find_existing_address_for_customer(customer, "Shipping", shipping_line1)
         shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email)
 
+    # Assign territory from shipping state (delivery zone)
+    # Prefer shipping address, fallback to billing
+    state_value = (shipping.get("state") or billing.get("state") or "").strip()
+    if state_value:
+        territory = _resolve_territory_from_state(state_value)
+        if territory:
+            try:
+                # Update customer territory if not already set or different
+                current_territory = frappe.db.get_value("Customer", customer, "territory")
+                if current_territory != territory:
+                    frappe.db.set_value("Customer", customer, "territory", territory, update_modified=False)
+            except Exception as e:
+                frappe.logger().warning(f"Could not set territory {territory} for customer {customer}: {e}")
+
     return customer, billing_addr_name, shipping_addr_name
 
 
@@ -332,6 +394,20 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
 
     billing_name = _upsert_address("Billing", billing)
     shipping_name = _upsert_address("Shipping", shipping)
+
+    # Assign territory from shipping state (delivery zone)
+    # Prefer shipping address, fallback to billing
+    state_value = (shipping.get("state") or billing.get("state") or "").strip()
+    if state_value:
+        territory = _resolve_territory_from_state(state_value)
+        if territory:
+            try:
+                # Update customer territory if not already set or different
+                current_territory = frappe.db.get_value("Customer", customer_name, "territory")
+                if current_territory != territory:
+                    frappe.db.set_value("Customer", customer_name, "territory", territory, update_modified=False)
+            except Exception as e:
+                frappe.logger().warning(f"Could not set territory {territory} for customer {customer_name}: {e}")
 
     return {
         "customer": customer_name,
