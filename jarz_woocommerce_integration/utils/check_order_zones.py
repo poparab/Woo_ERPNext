@@ -16,7 +16,7 @@ def check_order_zones_cli():
     )
     
     # Fetch a recent order
-    orders = client.list("/orders", params={"per_page": 1, "page": 1})
+    orders = client.list_orders(per_page=1, params={"per_page": 1, "page": 1})
     if not orders:
         print("No orders found")
         return
