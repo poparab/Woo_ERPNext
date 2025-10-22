@@ -180,7 +180,7 @@ def check_progress_cli():
     
     # Get recent syncs
     recent = frappe.db.sql("""
-        SELECT woo_order_id, woo_status, creation
+        SELECT woo_order_id, creation
         FROM `tabWooCommerce Order Map`
         ORDER BY creation DESC
         LIMIT 10
@@ -214,7 +214,7 @@ def check_progress_cli():
     if recent:
         print(f"\n📝 Recent Syncs:")
         for r in recent[:5]:
-            print(f"  Order #{r.woo_order_id}: {r.woo_status} @ {r.creation}")
+            print(f"  Order #{r.woo_order_id} @ {r.creation}")
     
     print("="*60 + "\n")
     
