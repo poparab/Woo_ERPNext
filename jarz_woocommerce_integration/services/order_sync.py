@@ -679,6 +679,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         pass
                         
             elif status_map["docstatus"] == 2:
+                # Submit first if draft, then cancel
+                if inv.docstatus == 0:
+                    inv.submit()
                 inv.cancel()
             try:
                 if status_map.get("custom_state"):
