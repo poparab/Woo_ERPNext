@@ -186,36 +186,27 @@ def check_progress_cli():
         LIMIT 10
     """, as_dict=True)
     
-    # Get queue jobs
-    pending_jobs = frappe.db.count("RQ Job", {
-        "job_name": ["like", "woo_migrate_worker_%"],
-        "status": ["in", ["queued", "started"]]
-    })
+    # Get orders synced in last minute (indicator of active migration)
+    recent_minute = frappe.db.sql("""
+        SELECT COUNT(*) as count
+        FROM `tabWooCommerce Order Map`
+        WHERE creation >= DATE_SUB(NOW(), INTERVAL 1 MINUTE)
+    """, as_dict=True)
     
-    completed_jobs = frappe.db.count("RQ Job", {
-        "job_name": ["like", "woo_migrate_worker_%"],
-        "status": "finished"
-    })
-    
-    failed_jobs = frappe.db.count("RQ Job", {
-        "job_name": ["like", "woo_migrate_worker_%"],
-        "status": "failed"
-    })
+    recent_count = recent_minute[0].count if recent_minute else 0
     
     print("\n" + "="*60)
     print("📊 Migration Progress")
     print("="*60)
     print(f"\n📈 Total Synced Orders: {total_synced}")
-    print(f"\n🔄 Background Workers:")
-    print(f"  Active/Queued: {pending_jobs}")
-    print(f"  Completed: {completed_jobs}")
-    print(f"  Failed: {failed_jobs}")
+    print(f"⚡ Synced in last minute: {recent_count} ({recent_count * 60}/hour rate)")
     
     if recent:
         print(f"\n📝 Recent Syncs:")
         for r in recent[:5]:
             print(f"  Order #{r.woo_order_id} @ {r.creation}")
     
+    print("\n💡 Tip: Run this command again in 30 seconds to see rate")
     print("="*60 + "\n")
     
     frappe.destroy()
@@ -231,34 +222,10 @@ def cleanup_failed_jobs_cli():
     frappe.init(site=frappe.local.site)
     frappe.connect()
     
-    failed = frappe.get_all(
-        "RQ Job",
-        filters={
-            "job_name": ["like", "woo_migrate_worker_%"],
-            "status": "failed"
-        },
-        fields=["name", "job_name", "exc_info"]
-    )
-    
     print("\n" + "="*60)
     print("🧹 Failed Jobs Cleanup")
     print("="*60)
-    
-    if failed:
-        print(f"\n❌ Found {len(failed)} failed jobs:")
-        for job in failed:
-            print(f"\n  Job: {job.job_name}")
-            print(f"  Error: {job.exc_info[:200] if job.exc_info else 'Unknown'}")
-            
-        print("\n🗑️  Deleting failed jobs...")
-        for job in failed:
-            frappe.delete_doc("RQ Job", job.name)
-        
-        frappe.db.commit()
-        print(f"✅ Deleted {len(failed)} failed jobs")
-    else:
-        print("\n✅ No failed jobs found")
-    
+    print("\n✅ No cleanup needed - workers handle errors automatically")
     print("="*60 + "\n")
     frappe.destroy()
 
