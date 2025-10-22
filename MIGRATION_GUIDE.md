@@ -1,4 +1,4 @@
-# WooCommerce Historical Order Migration Guide
+caceled invoices # WooCommerce Historical Order Migration Guide
 
 ## Quick Start
 
@@ -49,6 +49,18 @@ docker-compose exec -T backend bench --site frontend execute \
 docker-compose exec -T backend bench --site frontend execute \
   jarz_woocommerce_integration.services.customer_sync.update_all_customer_territories_cli
 ```
+
+### 3. Update Historical Invoice Status (IMPORTANT - Run After Migration)
+```bash
+# After completing historical migration, run this to set custom status fields
+docker-compose exec -T backend bench --site frontend execute \
+  jarz_woocommerce_integration.utils.update_historical_invoice_status.update_historical_invoice_status_cli
+```
+
+**What this does:**
+- Sets `custom_acceptance_status` to "Accepted" for all completed/cancelled orders
+- Sets `custom_sales_invoice_state` to "Delivered" for completed orders
+- Sets `custom_sales_invoice_state` to "Cancelled" for cancelled/refunded orders
 
 ---
 

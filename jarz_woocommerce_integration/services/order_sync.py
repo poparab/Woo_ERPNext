@@ -572,6 +572,18 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     inv.db_set("sales_invoice_state", status_map["custom_state"], commit=False)
             except Exception:
                 pass
+            
+            # Update custom acceptance status and sales invoice state based on WooCommerce status
+            woo_status = (order.get("status") or "").lower()
+            try:
+                if woo_status == "completed":
+                    inv.db_set("custom_acceptance_status", "Accepted", commit=False)
+                    inv.db_set("custom_sales_invoice_state", "Delivered", commit=False)
+                elif woo_status in ("cancelled", "refunded"):
+                    inv.db_set("custom_acceptance_status", "Accepted", commit=False)
+                    inv.db_set("custom_sales_invoice_state", "Cancelled", commit=False)
+            except Exception:
+                pass
             # Optional: territory-based delivery income row
             try:
                 if territory_name and frappe.db.exists("Territory", territory_name):
@@ -623,6 +635,15 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 inv_data["selling_price_list"] = price_list
             if custom_payment_method:
                 inv_data["custom_payment_method"] = custom_payment_method
+            
+            # Set custom acceptance status and sales invoice state based on WooCommerce status
+            woo_status = (order.get("status") or "").lower()
+            if woo_status == "completed":
+                inv_data["custom_acceptance_status"] = "Accepted"
+                inv_data["custom_sales_invoice_state"] = "Delivered"
+            elif woo_status in ("cancelled", "refunded"):
+                inv_data["custom_acceptance_status"] = "Accepted"
+                inv_data["custom_sales_invoice_state"] = "Cancelled"
             
             inv = frappe.get_doc(inv_data)
             # Set POS Profile from Territory if available
