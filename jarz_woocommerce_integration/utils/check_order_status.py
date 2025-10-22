@@ -11,23 +11,26 @@ def check_order_sync_status_cli():
     
     print("\n📊 Order Sync Status Check\n")
     
-    # Count synced orders
-    synced_count = frappe.db.count("Sales Invoice", {"custom_woo_order_id": ["!=", ""]})
+    # Count synced orders via WooCommerce Order Map
+    synced_count = frappe.db.count("WooCommerce Order Map")
     print(f"✅ Orders already synced: {synced_count}")
     
-    # Count by status
-    statuses = frappe.db.sql("""
-        SELECT status, COUNT(*) as cnt 
-        FROM `tabSales Invoice` 
-        WHERE custom_woo_order_id IS NOT NULL AND custom_woo_order_id != ''
-        GROUP BY status
-        ORDER BY cnt DESC
-    """, as_dict=1)
+    # Get linked sales invoices
+    order_maps = frappe.get_all(
+        "WooCommerce Order Map",
+        fields=["woo_order_id", "sales_invoice", "hash"],
+        limit=5,
+        order_by="modified desc"
+    )
     
-    if statuses:
-        print(f"\n📋 Synced Orders by Status:")
-        for s in statuses:
-            print(f"  {s.status}: {s.cnt}")
+    if order_maps:
+        print(f"\n� Sample Recent Synced Orders:")
+        for om in order_maps:
+            if om.sales_invoice:
+                inv = frappe.get_doc("Sales Invoice", om.sales_invoice)
+                print(f"  WooOrder #{om.woo_order_id} → Invoice {inv.name}: {inv.customer} - {inv.grand_total} EGP ({inv.posting_date})")
+            else:
+                print(f"  WooOrder #{om.woo_order_id}: (mapped but no invoice yet)")
     
     # Count customers with territories
     total_customers = frappe.db.count("Customer")
@@ -37,19 +40,6 @@ def check_order_sync_status_cli():
     print(f"  Total Customers: {total_customers}")
     print(f"  With Territory: {customers_with_territory} ({100*customers_with_territory/total_customers:.1f}%)")
     print(f"  Without Territory: {total_customers - customers_with_territory} ({100*(total_customers - customers_with_territory)/total_customers:.1f}%)")
-    
-    # Sample orders without invoices
-    sample_woo_orders = frappe.db.sql("""
-        SELECT custom_woo_order_id, posting_date, customer, grand_total
-        FROM `tabSales Invoice`
-        WHERE custom_woo_order_id IS NOT NULL AND custom_woo_order_id != ''
-        ORDER BY posting_date DESC
-        LIMIT 5
-    """, as_dict=1)
-    
-    print(f"\n📦 Sample Recent Synced Orders:")
-    for order in sample_woo_orders:
-        print(f"  Order #{order.custom_woo_order_id}: {order.customer} - {order.grand_total} EGP ({order.posting_date})")
     
     # Check for errors in last sync
     sync_logs = frappe.get_all(
@@ -80,5 +70,4 @@ def check_order_sync_status_cli():
         "synced_orders": synced_count,
         "total_customers": total_customers,
         "customers_with_territory": customers_with_territory,
-        "statuses": statuses,
     }
