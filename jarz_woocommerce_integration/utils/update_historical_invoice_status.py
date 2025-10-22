@@ -24,15 +24,19 @@ def update_historical_invoice_status_cli():
     print("="*70)
     print("\nFetching all WooCommerce Order Maps...")
     
+    # Determine the correct field name (erpnext_sales_invoice or sales_invoice)
+    cols = frappe.db.get_table_columns("WooCommerce Order Map")
+    invoice_field = "erpnext_sales_invoice" if "erpnext_sales_invoice" in cols else "sales_invoice"
+    
     # Get all order maps with their WooCommerce status
-    order_maps = frappe.db.sql("""
+    order_maps = frappe.db.sql(f"""
         SELECT 
             name,
             woo_order_id,
-            sales_invoice,
+            {invoice_field} as sales_invoice,
             woo_status
         FROM `tabWooCommerce Order Map`
-        WHERE sales_invoice IS NOT NULL
+        WHERE {invoice_field} IS NOT NULL
         ORDER BY creation
     """, as_dict=True)
     
