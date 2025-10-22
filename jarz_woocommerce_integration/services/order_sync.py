@@ -888,9 +888,42 @@ def run_pos_profile_update_cli():  # pragma: no cover
         """Convenience entry point to update latest 10 orders with POS profile mapping.
 
         Usage (inside container):
-            bench --site <site> execute jarz_woocommerce_integration.jarz_woocommerce_integration.services.order_sync.run_pos_profile_update_cli
+            bench --site <site> execute jarz_woocommerce_integration.services.order_sync.run_pos_profile_update_cli
         """
         return pull_recent_orders_phase1(limit=10, dry_run=False, force=True, allow_update=True)
+
+
+def migrate_all_historical_orders_cli(max_pages: int = 10):  # pragma: no cover
+    """CLI entry point to migrate all historical orders across multiple pages.
+    
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.services.order_sync.migrate_all_historical_orders_cli
+    """
+    total_stats = {
+        "orders_fetched": 0,
+        "processed": 0,
+        "created": 0,
+        "skipped": 0,
+        "errors": 0,
+        "pages_processed": 0,
+    }
+    
+    for page in range(1, max_pages + 1):
+        result = migrate_historical_orders(limit=100, page=page)
+        total_stats["orders_fetched"] += result.get("orders_fetched", 0)
+        total_stats["processed"] += result.get("processed", 0)
+        total_stats["created"] += result.get("created", 0)
+        total_stats["skipped"] += result.get("skipped", 0)
+        total_stats["errors"] += result.get("errors", 0)
+        total_stats["pages_processed"] = page
+        
+        frappe.logger().info(f"Historical migration page {page} complete: {result}")
+        
+        # Stop if we fetched fewer than 100 orders (reached the end)
+        if result.get("orders_fetched", 0) < 100:
+            break
+    
+    return total_stats
 
 
 def debug_dump_invoice_items(inv_name: str):  # pragma: no cover - temporary debug helper
