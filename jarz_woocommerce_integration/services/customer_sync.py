@@ -39,7 +39,7 @@ def _normalize_phone(p: Optional[str]) -> Optional[str]:
     return s or None
 
 
-def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None) -> str:
+def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None, custom_woo_customer_id: Optional[int] = None) -> str:
     """Find or create a Customer, preferring uniqueness by username, then phone, then email.
 
     Priority:
@@ -138,6 +138,8 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         fields["mobile_no"] = phone_norm
     if username and _field_exists("Customer", "woo_username"):
         fields["woo_username"] = username
+    if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
+        fields["custom_woo_customer_id"] = custom_woo_customer_id
     doc = frappe.get_doc(fields)
     doc.insert(ignore_permissions=True)
     return doc.name
@@ -145,19 +147,34 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
 
 def _find_existing_address_for_customer(customer: str, address_type: str, address_line1: str) -> Optional[str]:
     # Try to find an Address linked to the customer with same type and line1
-    addresses = frappe.get_all(
-        "Address",
+    # Normalize address_line1 for better matching (trim, lowercase for comparison)
+    normalized_search = address_line1.strip().lower()
+    
+    # Get all addresses for this customer with this type
+    address_links = frappe.get_all(
+        "Dynamic Link",
         filters={
-            "address_type": address_type,
-            "address_line1": address_line1,
-            "disabled": 0,
+            "link_doctype": "Customer",
+            "link_name": customer,
+            "parenttype": "Address"
         },
-        fields=["name"],
+        fields=["parent"]
     )
-    for a in addresses:
-        links = frappe.get_all("Dynamic Link", filters={"parenttype": "Address", "parent": a.name, "link_doctype": "Customer", "link_name": customer}, fields=["name"])
-        if links:
-            return a.name
+    
+    for link in address_links:
+        try:
+            addr = frappe.get_doc("Address", link.parent)
+            if addr.disabled:
+                continue
+            if addr.address_type != address_type:
+                continue
+            # Normalize existing address for comparison
+            existing_line1 = (addr.address_line1 or "").strip().lower()
+            if existing_line1 == normalized_search:
+                return addr.name
+        except Exception:
+            continue
+    
     return None
 
 
@@ -318,7 +335,10 @@ def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | No
         # Explicitly enforce address presence
         raise ValueError("no_address")
 
-    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone)
+    # Extract WooCommerce customer ID from order for idempotent lookups
+    woo_customer_id = order.get("customer_id") if isinstance(order.get("customer_id"), int) and order.get("customer_id") > 0 else None
+    
+    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone, custom_woo_customer_id=woo_customer_id)
 
     billing_addr_name = None
     shipping_addr_name = None
@@ -386,13 +406,17 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
     last_name = billing.get("last_name") or shipping.get("last_name")
     phone = billing.get("phone") or shipping.get("phone")
 
+    # Use WooCommerce customer ID for idempotent customer lookup
+    woo_cust_id = cust.get("id") if isinstance(cust.get("id"), int) else None
+    
     customer_name = _ensure_customer(
         email,
         first_name,
         last_name,
-        cust.get("id"),
+        None,  # order_id not applicable for direct customer sync
         username=username,
         phone=phone,
+        custom_woo_customer_id=woo_cust_id,
     )
 
     def _upsert_address(kind: str, data: dict) -> Optional[str]:
@@ -426,6 +450,16 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
         "billing": billing_name,
         "shipping": shipping_name,
     }
+
+
+
+def process_customer_record(payload: dict, settings, debug: bool = False, debug_samples=None) -> dict:
+    try:
+        result = _sync_customer_payload(payload)
+        frappe.db.commit()
+        return {'status': 'success', 'customer': result.get('customer'), 'billing_address': result.get('billing'), 'shipping_address': result.get('shipping')}
+    except Exception as e:
+        return {'status': 'error', 'error': str(e), 'customer_id': payload.get('id')}
 
 
 def sync_recent_customers(per_page: int = 50, max_pages: int | None = 5) -> Dict[str, Any]:
