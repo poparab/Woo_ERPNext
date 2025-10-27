@@ -178,6 +178,80 @@ def _find_existing_address_for_customer(customer: str, address_type: str, addres
     return None
 
 
+def _set_address_as_default(address_name: str, customer: str, address_type: str) -> None:
+    """Set an address as the preferred/default address for a customer.
+    
+    This function:
+    1. Marks the specified address as is_primary_address and/or is_shipping_address
+    2. Unmarks other addresses of the same type for this customer
+    
+    Args:
+        address_name: Name of the address to set as default
+        customer: Customer name
+        address_type: "Billing" or "Shipping"
+    """
+    try:
+        # Get the address to set as default
+        target_addr = frappe.get_doc("Address", address_name)
+        
+        # Determine which field to set based on address type
+        if address_type == "Billing":
+            primary_field = "is_primary_address"
+        elif address_type == "Shipping":
+            primary_field = "is_shipping_address"
+        else:
+            # For other types, set both flags
+            primary_field = "is_primary_address"
+        
+        # Get all addresses for this customer
+        address_links = frappe.get_all(
+            "Dynamic Link",
+            filters={
+                "link_doctype": "Customer",
+                "link_name": customer,
+                "parenttype": "Address"
+            },
+            fields=["parent"]
+        )
+        
+        # Unmark all other addresses of the same type
+        for link in address_links:
+            if link.parent == address_name:
+                continue
+            try:
+                addr = frappe.get_doc("Address", link.parent)
+                if addr.disabled:
+                    continue
+                if addr.address_type != address_type:
+                    continue
+                    
+                # Unmark this address
+                if address_type == "Billing" and getattr(addr, "is_primary_address", 0):
+                    addr.db_set("is_primary_address", 0, commit=False)
+                elif address_type == "Shipping" and getattr(addr, "is_shipping_address", 0):
+                    addr.db_set("is_shipping_address", 0, commit=False)
+            except Exception:
+                continue
+        
+        # Mark the target address as default
+        if address_type == "Billing":
+            if not getattr(target_addr, "is_primary_address", 0):
+                target_addr.db_set("is_primary_address", 1, commit=False)
+        elif address_type == "Shipping":
+            if not getattr(target_addr, "is_shipping_address", 0):
+                target_addr.db_set("is_shipping_address", 1, commit=False)
+        else:
+            # For other types, set both
+            if not getattr(target_addr, "is_primary_address", 0):
+                target_addr.db_set("is_primary_address", 1, commit=False)
+            if not getattr(target_addr, "is_shipping_address", 0):
+                target_addr.db_set("is_shipping_address", 1, commit=False)
+        
+        frappe.logger().info(f"Set address {address_name} as default {address_type} for customer {customer}")
+    except Exception as e:
+        frappe.logger().warning(f"Failed to set address {address_name} as default: {e}")
+
+
 def _resolve_country(raw: str | None) -> Optional[str]:
     if not raw:
         return None
@@ -347,11 +421,17 @@ def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | No
     if billing_line1:
         existing = _find_existing_address_for_customer(customer, "Billing", billing_line1)
         billing_addr_name = existing or _create_address(customer, "Billing", billing, billing.get("phone"), email)
+        # Set as default billing address for this customer
+        if billing_addr_name:
+            _set_address_as_default(billing_addr_name, customer, "Billing")
 
     # Ensure shipping address if present
     if shipping_line1:
         existing = _find_existing_address_for_customer(customer, "Shipping", shipping_line1)
         shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email)
+        # Set as default shipping address for this customer
+        if shipping_addr_name:
+            _set_address_as_default(shipping_addr_name, customer, "Shipping")
 
     # Assign territory from shipping state (delivery zone)
     # Prefer shipping address, fallback to billing
@@ -425,8 +505,15 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
             return None
         existing = _find_existing_address_for_customer(customer_name, kind, line1)
         if existing:
+            # Set existing address as default
+            _set_address_as_default(existing, customer_name, kind)
             return existing
-        return _create_address(customer_name, kind, data, data.get("phone"), email)
+        # Create new address
+        new_addr = _create_address(customer_name, kind, data, data.get("phone"), email)
+        if new_addr:
+            # Set newly created address as default
+            _set_address_as_default(new_addr, customer_name, kind)
+        return new_addr
 
     billing_name = _upsert_address("Billing", billing)
     shipping_name = _upsert_address("Shipping", shipping)
