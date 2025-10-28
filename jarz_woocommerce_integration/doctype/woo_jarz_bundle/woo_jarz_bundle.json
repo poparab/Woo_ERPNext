@@ -1,0 +1,77 @@
+{
+ "doctype": "DocType",
+ "name": "woo_jarz_bundle",
+ "module": "Jarz WooCommerce Integration",
+ "custom": 0,
+ "istable": 0,
+ "allow_rename": 1,
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "bundle_name",
+  "bundle_price",
+  "free_shipping",
+  "items",
+  "erpnext_item"
+ ],
+ "fields": [
+  {
+   "fieldname": "bundle_name",
+   "fieldtype": "Data",
+   "label": "Bundle Name",
+   "reqd": 1,
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "bundle_price",
+   "fieldtype": "Currency",
+   "label": "Bundle Price",
+   "reqd": 1,
+   "in_list_view": 1,
+   "non_negative": 1
+  },
+  {
+   "fieldname": "free_shipping",
+   "fieldtype": "Check",
+   "label": "Free Shipping",
+   "default": "0",
+   "description": "If enabled, orders including this bundle will have delivery charge waived.",
+   "in_list_view": 1
+  },
+  {
+   "fieldname": "items",
+   "fieldtype": "Table",
+   "label": "Items",
+   "options": "woo_jarz_bundle_item_group",
+   "reqd": 1
+  },
+  {
+   "fieldname": "erpnext_item",
+   "fieldtype": "Link",
+   "label": "ERPNext Item",
+   "options": "Item",
+   "reqd": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "permissions": [
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1,
+   "create": 1,
+   "delete": 1,
+   "submit": 0,
+   "cancel": 0,
+   "amend": 0,
+   "print": 1,
+   "email": 1,
+   "export": 1,
+   "share": 1,
+   "report": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC"
+}

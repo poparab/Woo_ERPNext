@@ -1,0 +1,40 @@
+{
+ "doctype": "DocType",
+ "name": "woo_jarz_bundle_item_group",
+ "module": "Jarz WooCommerce Integration",
+ "custom": 0,
+ "istable": 1,
+ "allow_rename": 1,
+ "editable_grid": 1,
+ "autoname": "hash",
+ "engine": "InnoDB",
+ "field_order": [
+  "item_group",
+  "quantity"
+ ],
+ "fields": [
+  {
+   "fieldname": "item_group",
+   "fieldtype": "Link",
+   "label": "Item Group",
+   "options": "Item Group",
+   "reqd": 1,
+   "in_list_view": 1,
+   "columns": 2,
+   "bold": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "quantity",
+   "fieldtype": "Int",
+   "label": "Quantity",
+   "reqd": 1,
+   "in_list_view": 1,
+   "columns": 2,
+   "bold": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "links": [],
+ "permissions": []
+}

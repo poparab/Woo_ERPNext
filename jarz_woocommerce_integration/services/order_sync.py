@@ -77,7 +77,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         Pricing policy:
         - Ignore WooCommerce prices/totals completely.
         - Use ERPNext Price List rates for normal items (Item Price by price_list).
-        - Prefer Jarz Bundle expansion for bundles (uses internal pricing from Jarz Bundle),
+        - Prefer woo_jarz_bundle expansion for bundles (uses internal pricing from woo_jarz_bundle),
             even when Woo sends woosb parent/child lines; expand once from the parent and skip
             the related children to avoid duplication.
 
@@ -106,22 +106,6 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
     has_woosb_children = len(child_parent_ids) > 0
     handled_parents: set[str] = set()
 
-    # Pre-compute uniform discount percentage per woosb parent from Jarz Bundle config
-    parent_uniform_discount: dict[str, float] = {}
-    if child_parent_ids:
-        for pid in child_parent_ids:
-            try:
-                bundle_code = frappe.db.get_value("Jarz Bundle", {"woo_bundle_id": str(pid)}, "name")
-                if not bundle_code:
-                    continue
-                from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
-                bp_tmp = BundleProcessor(bundle_code, 1)
-                bp_tmp.load_bundle()
-                uniform_pct, _total_child, _bundle_price = bp_tmp.calculate_child_discount_percentage()
-                parent_uniform_discount[str(pid)] = float(uniform_pct)
-            except Exception:
-                continue
-
     for li in line_items:
         sku = (li.get("sku") or "").strip()
         product_id = li.get("product_id")
@@ -129,17 +113,17 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         if qty <= 0:
             continue
 
-        # 1) Prefer Jarz Bundle expansion for bundle parents (even if woosb children exist)
+    # 1) Prefer woo_jarz_bundle expansion for bundle parents (even if woosb children exist)
         bundle_code = None
         if product_id:
             try:
-                bundle_code = frappe.db.get_value("Jarz Bundle", {"woo_bundle_id": str(product_id)}, "name")
+                bundle_code = frappe.db.get_value("woo_jarz_bundle", {"woo_bundle_id": str(product_id)}, "name")
             except Exception:
                 bundle_code = None
         if bundle_code and (str(product_id) in child_parent_ids or not has_woosb_children):
             try:
                 # Import locally to avoid hard dependency at module import time
-                from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
+                from jarz_woocommerce_integration.services.bundle_processing import BundleProcessor  # type: ignore
                 bp = BundleProcessor(bundle_code, int(qty))
                 bp.load_bundle()  # Ensure bundle is loaded before getting items
                 bundle_lines = bp.get_invoice_items()
@@ -175,7 +159,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 frappe.logger().info(f"Bundle {bundle_code} expanded into {len(bundle_lines)} line items for qty {qty}")
                 
                 # CRITICAL: Use BundleProcessor items AS-IS with price_list_rate and discount_percentage
-                # BundleProcessor follows the Jarz POS logic:
+                # BundleProcessor follows the integration's bundle logic:
                 # - Parent: 100% discount (rate becomes 0)
                 # - Children: uniform discount_percentage so their total equals bundle_price
                 # ERPNext will calculate the final rate from price_list_rate and discount_percentage
@@ -195,7 +179,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id, "reason": "bundle_error"})
                 continue
 
-        # 2) If this is a woosb child for a parent we've already handled via Jarz Bundle, skip it
+    # 2) If this is a woosb child for a parent we've already handled via woo_jarz_bundle, skip it
         parent_id_in_meta = _get_parent_id_from_meta(li.get("meta_data"))
         if parent_id_in_meta and str(parent_id_in_meta) in handled_parents:
             continue

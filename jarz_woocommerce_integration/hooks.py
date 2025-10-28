@@ -187,7 +187,7 @@ fixtures = [
 					"Customer",
 					"Address",
 					"Item",
-					"Jarz Bundle",
+					"woo_jarz_bundle",
 				],
 			]
 		],
