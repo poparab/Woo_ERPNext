@@ -106,9 +106,8 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
     has_woosb_children = len(child_parent_ids) > 0
     handled_parents: set[str] = set()
 
-    # Pre-compute bundle info per woosb parent from Jarz Bundle config
-    # This contains pricing/discount info we need, but NOT the actual items
-    parent_bundle_info: dict[str, dict] = {}
+    # Pre-compute uniform discount percentage per woosb parent from Jarz Bundle config
+    parent_uniform_discount: dict[str, float] = {}
     if child_parent_ids:
         for pid in child_parent_ids:
             try:
@@ -116,28 +115,11 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 if not bundle_code:
                     continue
                 from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
-                
-                # Get bundle quantity from parent line item
-                parent_qty = 1
-                for _li in line_items:
-                    if str(_li.get("product_id")) == str(pid):
-                        parent_qty = int(_li.get("quantity") or 1)
-                        break
-                
-                bp = BundleProcessor(bundle_code, parent_qty)
-                bp.load_bundle()
-                uniform_pct, _total_child, _bundle_price = bp.calculate_child_discount_percentage()
-                
-                parent_bundle_info[str(pid)] = {
-                    "bundle_code": bundle_code,
-                    "processor": bp,
-                    "discount_pct": float(uniform_pct),
-                    "bundle_price": float(_bundle_price or 0),
-                    "quantity": parent_qty
-                }
-                frappe.logger().info(f"Bundle parent {pid}: code={bundle_code}, qty={parent_qty}, discount={uniform_pct}%, price={_bundle_price}")
-            except Exception as e:
-                frappe.logger().error(f"Failed to process bundle parent {pid}: {e}")
+                bp_tmp = BundleProcessor(bundle_code, 1)
+                bp_tmp.load_bundle()
+                uniform_pct, _total_child, _bundle_price = bp_tmp.calculate_child_discount_percentage()
+                parent_uniform_discount[str(pid)] = float(uniform_pct)
+            except Exception:
                 continue
 
     for li in line_items:
@@ -147,64 +129,97 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         if qty <= 0:
             continue
 
-        # Check if this is a woosb parent (bundle parent) or child
-        parent_id_in_meta = _get_parent_id_from_meta(li.get("meta_data"))
-        
-        # 1) If this is a bundle parent AND has children in the order, skip the parent
-        #    The parent is just metadata - actual items come from children
-        if product_id and str(product_id) in child_parent_ids:
-            handled_parents.add(str(product_id))
-            frappe.logger().info(f"Skipping bundle parent product_id {product_id}, will process WooCommerce children with Jarz pricing")
-            continue
-        
-        # 2) If this is a woosb child, process it with Jarz Bundle pricing
-        if parent_id_in_meta and str(parent_id_in_meta) in parent_bundle_info:
-            # This is a child item from WooCommerce bundle
-            frappe.logger().info(f"Processing bundle child: {li.get('name')} (SKU: {sku}, qty: {qty}) for parent {parent_id_in_meta}")
-            
-            # Map to ERPNext item
-            item_code = None
-            if sku and frappe.db.exists("Item", sku):
-                item_code = sku
-            elif product_id:
-                item_code = frappe.db.get_value("Item", {"woo_product_id": str(product_id)}, "name")
-            
-            if not item_code:
-                missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id, "reason": "bundle_child_not_mapped"})
-                frappe.logger().warning(f"Bundle child not mapped: SKU={sku}, product_id={product_id}, name={li.get('name')}")
-                continue
-            
-            # Get pricing from ERPNext Price List
-            erp_price = None
+        # 1) Prefer Jarz Bundle expansion for bundle parents (even if woosb children exist)
+        bundle_code = None
+        if product_id:
             try:
-                if price_list:
-                    erp_price = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": price_list}, "price_list_rate")
+                bundle_code = frappe.db.get_value("Jarz Bundle", {"woo_bundle_id": str(product_id)}, "name")
             except Exception:
-                erp_price = None
-            
-            # Build row with pricing
-            row = {
-                "item_code": item_code,
-                "qty": qty,
-                "rate": float(erp_price or 0) if erp_price is not None else 0,
-            }
-            if erp_price is not None:
-                row["price_list_rate"] = float(erp_price)
-            
-            # Apply Jarz Bundle discount from parent
-            bundle_info = parent_bundle_info[str(parent_id_in_meta)]
-            discount_pct = bundle_info.get("discount_pct", 0)
-            if discount_pct > 0:
+                bundle_code = None
+        if bundle_code and (str(product_id) in child_parent_ids or not has_woosb_children):
+            try:
+                # Import locally to avoid hard dependency at module import time
+                from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
+                bp = BundleProcessor(bundle_code, int(qty))
+                bp.load_bundle()  # Ensure bundle is loaded before getting items
+                bundle_lines = bp.get_invoice_items()
+                
+                # Log for debugging
+                frappe.logger().info(f"Bundle {bundle_code} expanded into {len(bundle_lines)} line items for qty {qty}")
+                
+                # Keep only fields ERPNext Sales Invoice Item supports; we will materialize discount into the rate
+                allowed = {"item_code", "item_name", "description", "qty", "rate", "price_list_rate", "discount_percentage", "discount_amount"}
+                processed_lines: list[dict] = []
+                for bl in bundle_lines:
+                    filtered = {k: v for k, v in bl.items() if k in allowed or k in {"is_bundle_child", "is_bundle_parent"}}
+                    # For child lines: convert any discount (percentage or amount) into a net rate so ERPNext doesn't recalc it away.
+                    if filtered.get("is_bundle_child"):
+                        try:
+                            ch_qty = float(filtered.get("qty") or 0) or 0
+                            if ch_qty <= 0:
+                                processed_lines.append(filtered)
+                                continue
+                            # Determine original list price per unit (prefer explicit price_list_rate, else rate)
+                            plr = float(filtered.get("price_list_rate") or filtered.get("rate") or 0)
+                            # Derive discount amount total for the row
+                            disc_total = 0.0
+                            if filtered.get("discount_percentage") is not None:
+                                pct = float(filtered.get("discount_percentage") or 0)
+                                disc_total = round(plr * ch_qty * (pct / 100.0), 2)
+                            elif filtered.get("discount_amount") is not None:
+                                # Assume existing discount_amount is the total discount for the row (not per unit)
+                                disc_total = float(filtered.get("discount_amount") or 0)
+                            gross_total = round(plr * ch_qty, 2)
+                            net_total = max(0.0, round(gross_total - disc_total, 2))
+                            # Compute per-unit net rate (2 decimals)
+                            new_rate = round(net_total / ch_qty, 2)
+                            filtered["price_list_rate"] = plr  # preserve original list price for reference
+                            filtered["rate"] = new_rate
+                            # Remove discount fields so ERPNext uses the provided net rate directly
+                            filtered.pop("discount_percentage", None)
+                            filtered.pop("discount_amount", None)
+                        except Exception:
+                            # If anything fails, fall back to original values (still may be adjusted by residual pass)
+                            pass
+                    processed_lines.append(filtered)
+
+                # Residual adjustment: ensure sum(child (rate*qty)) == bundle_price * qty
                 try:
-                    qtyf = float(row.get("qty") or 0) or 0
-                    plr = float(row.get("price_list_rate") or row.get("rate") or 0)
-                    discount_amt = round(plr * qtyf * (discount_pct / 100.0), 2)
-                    row["discount_amount"] = discount_amt
-                    frappe.logger().info(f"  Applied {discount_pct}% discount = {discount_amt} to {item_code}")
-                except Exception as e:
-                    frappe.logger().error(f"  Failed to apply discount: {e}")
-            
-            items.append(row)
+                    child_lines = [cl for cl in processed_lines if cl.get("is_bundle_child")]
+                    if child_lines:
+                        target_total = float(getattr(bp.bundle_doc, "bundle_price", 0) or 0) * int(qty)
+                        current_total = 0.0
+                        for cl in child_lines:
+                            current_total += round(float(cl.get("rate") or 0) * float(cl.get("qty") or 0), 2)
+                        residual = round(target_total - current_total, 2)
+                        if abs(residual) >= 0.01:
+                            last = child_lines[-1]
+                            ql = float(last.get("qty") or 0) or 0
+                            if ql > 0:
+                                gross_candidate = round(float(last.get("price_list_rate") or last.get("rate") or 0) * ql, 2)
+                                new_line_total = round(float(last.get("rate") or 0) * ql + residual, 2)
+                                # Clamp between 0 and original gross
+                                if new_line_total < 0:
+                                    new_line_total = 0.0
+                                elif new_line_total > gross_candidate:
+                                    new_line_total = gross_candidate
+                                new_rate = round(new_line_total / ql, 2)
+                                last["rate"] = new_rate
+                except Exception:
+                    pass
+
+                for _pl in processed_lines:
+                    items.append(_pl)
+                handled_parents.add(str(product_id))
+                continue  # done with this Woo line
+            except Exception:
+                # If bundle expansion fails, report as missing to skip safely
+                missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id, "reason": "bundle_error"})
+                continue
+
+        # 2) If this is a woosb child for a parent we've already handled via Jarz Bundle, skip it
+        parent_id_in_meta = _get_parent_id_from_meta(li.get("meta_data"))
+        if parent_id_in_meta and str(parent_id_in_meta) in handled_parents:
             continue
 
         # 3) Fall back to direct Item by SKU or woo_product_id (ERPNext pricing only) - for regular items
