@@ -9,6 +9,7 @@
  "engine": "InnoDB",
  "field_order": [
   "bundle_name",
+  "woo_bundle_id",
   "bundle_price",
   "free_shipping",
   "items",
@@ -21,6 +22,15 @@
    "label": "Bundle Name",
    "reqd": 1,
    "in_list_view": 1
+  },
+  {
+   "fieldname": "woo_bundle_id",
+   "fieldtype": "Data",
+   "label": "WooCommerce Bundle ID",
+   "reqd": 0,
+   "in_list_view": 1,
+   "unique": 1,
+   "description": "WooCommerce product ID for this bundle"
   },
   {
    "fieldname": "bundle_price",
