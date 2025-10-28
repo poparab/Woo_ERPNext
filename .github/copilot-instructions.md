@@ -49,7 +49,7 @@ Single ERPNext app located at `apps/jarz_woocommerce_integration`. It ingests Wo
 ## Common Pitfalls
 - Missing Woo credentials raise `WooCommerceError`—re-use helper functions for status handling.
 - Multi-site benches: every bench command **must** include `--site`; default dev site is often `development.localhost`.
-- Bundle mismatch: if items differ from Woo order, confirm `woo_jarz_bundle` content and adjust the bundle-handling helpers—avoid hard-coding flavor substitutions.
+- Bundle mismatch: if items differ from Woo order, confirm `Woo Jarz Bundle` content and adjust the bundle-handling helpers—avoid hard-coding flavor substitutions.
 - Webhook signature failures: ensure `WooCommerce Settings.webhook_secret` matches Woo; handler echoes `{ "ack": true }` on empty payloads during setup.
 
 ## Collaboration Notes

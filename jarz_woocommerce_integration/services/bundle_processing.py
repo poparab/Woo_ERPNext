@@ -13,12 +13,12 @@ from frappe.utils import cint, flt
 
 
 BUNDLE_LOGGER = "jarz_woocommerce.bundle"
-BUNDLE_DOCTYPE = "woo_jarz_bundle"
-BUNDLE_ITEM_GROUP_DOCTYPE = "woo_jarz_bundle_item_group"
+BUNDLE_DOCTYPE = "Woo Jarz Bundle"
+BUNDLE_ITEM_GROUP_DOCTYPE = "Woo Jarz Bundle Item Group"
 
 
 class BundleProcessor:
-    """Expand a woo_jarz_bundle record into ERPNext invoice line items with correct pricing."""
+    """Expand a Woo Jarz Bundle record into ERPNext invoice line items with correct pricing."""
 
     def __init__(self, bundle_code: str, quantity: int = 1, selected_items: dict | None = None):
         self.bundle_code = bundle_code
@@ -33,7 +33,7 @@ class BundleProcessor:
     # Bundle loading helpers
     # ---------------------------------------------------------------------
     def load_bundle(self):
-        """Fetch the woo_jarz_bundle document and prepare child item data."""
+        """Fetch the Woo Jarz Bundle document and prepare child item data."""
         try:
             self.bundle_doc = frappe.get_doc(BUNDLE_DOCTYPE, self.bundle_code)
         except Exception as exc:  # pragma: no cover - frappe throws richly

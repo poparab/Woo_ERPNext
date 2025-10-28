@@ -1,6 +1,6 @@
 {
  "doctype": "DocType",
- "name": "woo_jarz_bundle",
+ "name": "Woo Jarz Bundle",
  "module": "Jarz WooCommerce Integration",
  "custom": 0,
  "istable": 0,
@@ -42,7 +42,7 @@
    "fieldname": "items",
    "fieldtype": "Table",
    "label": "Items",
-   "options": "woo_jarz_bundle_item_group",
+   "options": "Woo Jarz Bundle Item Group",
    "reqd": 1
   },
   {
