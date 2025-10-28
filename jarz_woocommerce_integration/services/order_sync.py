@@ -141,7 +141,25 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 # Import locally to avoid hard dependency at module import time
                 from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
                 bp = BundleProcessor(bundle_code, int(qty))
+                bp.load_bundle()  # Ensure bundle is loaded before getting items
                 bundle_lines = bp.get_invoice_items()
+                
+                # Log for debugging
+                frappe.logger().info(f"Bundle {bundle_code} expanded into {len(bundle_lines)} line items for qty {qty}")
+                
+                # Verify each bundle line has unique item_code
+                seen_items = {}
+                for idx, bl in enumerate(bundle_lines):
+                    item_code = bl.get("item_code")
+                    if item_code in seen_items:
+                        frappe.logger().warning(
+                            f"Duplicate item_code {item_code} found in bundle {bundle_code} "
+                            f"at index {idx} (first seen at {seen_items[item_code]}). "
+                            f"Bundle line: {bl}"
+                        )
+                    else:
+                        seen_items[item_code] = idx
+                
                 # Keep only fields ERPNext Sales Invoice Item supports; we will materialize discount into the rate
                 allowed = {"item_code", "item_name", "description", "qty", "rate", "price_list_rate", "discount_percentage", "discount_amount"}
                 processed_lines: list[dict] = []
