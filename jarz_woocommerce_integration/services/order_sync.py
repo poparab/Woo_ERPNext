@@ -106,8 +106,9 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
     has_woosb_children = len(child_parent_ids) > 0
     handled_parents: set[str] = set()
 
-    # Pre-compute uniform discount percentage per woosb parent from Jarz Bundle config
-    parent_uniform_discount: dict[str, float] = {}
+    # Pre-compute bundle info per woosb parent from Jarz Bundle config
+    # This contains pricing/discount info we need, but NOT the actual items
+    parent_bundle_info: dict[str, dict] = {}
     if child_parent_ids:
         for pid in child_parent_ids:
             try:
@@ -115,11 +116,28 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 if not bundle_code:
                     continue
                 from jarz_pos.services.bundle_processing import BundleProcessor  # type: ignore
-                bp_tmp = BundleProcessor(bundle_code, 1)
-                bp_tmp.load_bundle()
-                uniform_pct, _total_child, _bundle_price = bp_tmp.calculate_child_discount_percentage()
-                parent_uniform_discount[str(pid)] = float(uniform_pct)
-            except Exception:
+                
+                # Get bundle quantity from parent line item
+                parent_qty = 1
+                for _li in line_items:
+                    if str(_li.get("product_id")) == str(pid):
+                        parent_qty = int(_li.get("quantity") or 1)
+                        break
+                
+                bp = BundleProcessor(bundle_code, parent_qty)
+                bp.load_bundle()
+                uniform_pct, _total_child, _bundle_price = bp.calculate_child_discount_percentage()
+                
+                parent_bundle_info[str(pid)] = {
+                    "bundle_code": bundle_code,
+                    "processor": bp,
+                    "discount_pct": float(uniform_pct),
+                    "bundle_price": float(_bundle_price or 0),
+                    "quantity": parent_qty
+                }
+                frappe.logger().info(f"Bundle parent {pid}: code={bundle_code}, qty={parent_qty}, discount={uniform_pct}%, price={_bundle_price}")
+            except Exception as e:
+                frappe.logger().error(f"Failed to process bundle parent {pid}: {e}")
                 continue
 
     for li in line_items:
@@ -129,25 +147,19 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         if qty <= 0:
             continue
 
-        # Check if this is a woosb parent (bundle parent) - if so, skip it and use children
+        # Check if this is a woosb parent (bundle parent) or child
         parent_id_in_meta = _get_parent_id_from_meta(li.get("meta_data"))
         
         # 1) If this is a bundle parent AND has children in the order, skip the parent
-        #    We'll process the actual child items from WooCommerce instead of using Jarz Bundle expansion
+        #    The parent is just metadata - actual items come from children
         if product_id and str(product_id) in child_parent_ids:
-            # Mark this parent as handled so we know to process its children
             handled_parents.add(str(product_id))
-            frappe.logger().info(f"Skipping bundle parent product_id {product_id}, will use WooCommerce child items")
+            frappe.logger().info(f"Skipping bundle parent product_id {product_id}, will process WooCommerce children with Jarz pricing")
             continue
         
-        # 2) If this is a woosb child, process it (these are the actual items from the order)
-        if parent_id_in_meta and str(parent_id_in_meta) in child_parent_ids:
-            # This is a child item from WooCommerce bundle - use it as-is
-            frappe.logger().info(f"Processing bundle child: {li.get('name')} (SKU: {sku}, qty: {qty}) for parent {parent_id_in_meta}")
-
-        # 2) If this is a woosb child, process it (these are the actual items from the order)
-        if parent_id_in_meta and str(parent_id_in_meta) in child_parent_ids:
-            # This is a child item from WooCommerce bundle - use it as-is
+        # 2) If this is a woosb child, process it with Jarz Bundle pricing
+        if parent_id_in_meta and str(parent_id_in_meta) in parent_bundle_info:
+            # This is a child item from WooCommerce bundle
             frappe.logger().info(f"Processing bundle child: {li.get('name')} (SKU: {sku}, qty: {qty}) for parent {parent_id_in_meta}")
             
             # Map to ERPNext item
@@ -159,9 +171,10 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
             
             if not item_code:
                 missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id, "reason": "bundle_child_not_mapped"})
+                frappe.logger().warning(f"Bundle child not mapped: SKU={sku}, product_id={product_id}, name={li.get('name')}")
                 continue
             
-            # Get pricing from ERPNext
+            # Get pricing from ERPNext Price List
             erp_price = None
             try:
                 if price_list:
@@ -169,6 +182,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
             except Exception:
                 erp_price = None
             
+            # Build row with pricing
             row = {
                 "item_code": item_code,
                 "qty": qty,
@@ -177,15 +191,18 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
             if erp_price is not None:
                 row["price_list_rate"] = float(erp_price)
             
-            # Apply bundle discount if available
-            if str(parent_id_in_meta) in parent_uniform_discount:
-                pct = parent_uniform_discount[str(parent_id_in_meta)]
+            # Apply Jarz Bundle discount from parent
+            bundle_info = parent_bundle_info[str(parent_id_in_meta)]
+            discount_pct = bundle_info.get("discount_pct", 0)
+            if discount_pct > 0:
                 try:
                     qtyf = float(row.get("qty") or 0) or 0
                     plr = float(row.get("price_list_rate") or row.get("rate") or 0)
-                    row["discount_amount"] = round(plr * qtyf * (pct / 100.0), 2)
-                except Exception:
-                    pass
+                    discount_amt = round(plr * qtyf * (discount_pct / 100.0), 2)
+                    row["discount_amount"] = discount_amt
+                    frappe.logger().info(f"  Applied {discount_pct}% discount = {discount_amt} to {item_code}")
+                except Exception as e:
+                    frappe.logger().error(f"  Failed to apply discount: {e}")
             
             items.append(row)
             continue
@@ -219,15 +236,6 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         }
         if erp_price is not None:
             row["price_list_rate"] = float(erp_price)
-        # If this is a woosb child and we have a computed parent discount, apply it
-        if parent_id_in_meta and str(parent_id_in_meta) in parent_uniform_discount:
-            pct = parent_uniform_discount[str(parent_id_in_meta)]
-            try:
-                qtyf = float(row.get("qty") or 0) or 0
-                plr = float(row.get("price_list_rate") or row.get("rate") or 0)
-                row["discount_amount"] = round(plr * qtyf * (pct / 100.0), 2)
-            except Exception:
-                pass
         items.append(row)
     return items, missing
 
