@@ -144,6 +144,33 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 bp.load_bundle()  # Ensure bundle is loaded before getting items
                 bundle_lines = bp.get_invoice_items()
                 
+                # Log what BundleProcessor returned
+                frappe.logger().info(f"===== BUNDLE EXPANSION DEBUG =====")
+                frappe.logger().info(f"Bundle Code: {bundle_code}, Product ID: {product_id}, Qty: {qty}")
+                frappe.logger().info(f"BundleProcessor returned {len(bundle_lines)} items:")
+                for idx, bl in enumerate(bundle_lines):
+                    item_code = bl.get("item_code", "UNKNOWN")
+                    item_qty = bl.get("qty", 0)
+                    item_rate = bl.get("rate", 0)
+                    is_parent = bl.get("is_bundle_parent", False)
+                    is_child = bl.get("is_bundle_child", False)
+                    frappe.logger().info(f"  [{idx}] {item_code} x{item_qty} @ {item_rate} (parent={is_parent}, child={is_child})")
+                
+                # Log what WooCommerce sent for this bundle
+                woo_children = [li for li in line_items if li.get("meta_data") and 
+                               any(m.get("key") == "_woosb_parent_id" and m.get("value") == str(product_id) 
+                                   for m in li.get("meta_data", []))]
+                if woo_children:
+                    frappe.logger().info(f"WooCommerce sent {len(woo_children)} child items for this bundle:")
+                    for wc in woo_children:
+                        wc_sku = wc.get("sku", "NO_SKU")
+                        wc_qty = wc.get("quantity", 0)
+                        wc_name = wc.get("name", "NO_NAME")
+                        frappe.logger().info(f"  - {wc_name} ({wc_sku}) x{wc_qty}")
+                else:
+                    frappe.logger().info("WooCommerce sent NO child items for this bundle")
+                frappe.logger().info(f"===================================")
+                
                 # Log for debugging
                 frappe.logger().info(f"Bundle {bundle_code} expanded into {len(bundle_lines)} line items for qty {qty}")
                 
