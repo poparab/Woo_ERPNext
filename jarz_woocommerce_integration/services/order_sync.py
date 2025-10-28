@@ -174,69 +174,20 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                 # Log for debugging
                 frappe.logger().info(f"Bundle {bundle_code} expanded into {len(bundle_lines)} line items for qty {qty}")
                 
-                # Keep only fields ERPNext Sales Invoice Item supports; we will materialize discount into the rate
-                allowed = {"item_code", "item_name", "description", "qty", "rate", "price_list_rate", "discount_percentage", "discount_amount"}
-                processed_lines: list[dict] = []
+                # CRITICAL: Use BundleProcessor items AS-IS with price_list_rate and discount_percentage
+                # BundleProcessor follows the Jarz POS logic:
+                # - Parent: 100% discount (rate becomes 0)
+                # - Children: uniform discount_percentage so their total equals bundle_price
+                # ERPNext will calculate the final rate from price_list_rate and discount_percentage
+                
+                allowed = {"item_code", "item_name", "description", "qty", "rate", "price_list_rate", 
+                          "discount_percentage", "discount_amount", "is_bundle_child", "is_bundle_parent",
+                          "bundle_code", "parent_bundle"}
+                
                 for bl in bundle_lines:
-                    filtered = {k: v for k, v in bl.items() if k in allowed or k in {"is_bundle_child", "is_bundle_parent"}}
-                    # For child lines: convert any discount (percentage or amount) into a net rate so ERPNext doesn't recalc it away.
-                    if filtered.get("is_bundle_child"):
-                        try:
-                            ch_qty = float(filtered.get("qty") or 0) or 0
-                            if ch_qty <= 0:
-                                processed_lines.append(filtered)
-                                continue
-                            # Determine original list price per unit (prefer explicit price_list_rate, else rate)
-                            plr = float(filtered.get("price_list_rate") or filtered.get("rate") or 0)
-                            # Derive discount amount total for the row
-                            disc_total = 0.0
-                            if filtered.get("discount_percentage") is not None:
-                                pct = float(filtered.get("discount_percentage") or 0)
-                                disc_total = round(plr * ch_qty * (pct / 100.0), 2)
-                            elif filtered.get("discount_amount") is not None:
-                                # Assume existing discount_amount is the total discount for the row (not per unit)
-                                disc_total = float(filtered.get("discount_amount") or 0)
-                            gross_total = round(plr * ch_qty, 2)
-                            net_total = max(0.0, round(gross_total - disc_total, 2))
-                            # Compute per-unit net rate (2 decimals)
-                            new_rate = round(net_total / ch_qty, 2)
-                            filtered["price_list_rate"] = plr  # preserve original list price for reference
-                            filtered["rate"] = new_rate
-                            # Remove discount fields so ERPNext uses the provided net rate directly
-                            filtered.pop("discount_percentage", None)
-                            filtered.pop("discount_amount", None)
-                        except Exception:
-                            # If anything fails, fall back to original values (still may be adjusted by residual pass)
-                            pass
-                    processed_lines.append(filtered)
-
-                # Residual adjustment: ensure sum(child (rate*qty)) == bundle_price * qty
-                try:
-                    child_lines = [cl for cl in processed_lines if cl.get("is_bundle_child")]
-                    if child_lines:
-                        target_total = float(getattr(bp.bundle_doc, "bundle_price", 0) or 0) * int(qty)
-                        current_total = 0.0
-                        for cl in child_lines:
-                            current_total += round(float(cl.get("rate") or 0) * float(cl.get("qty") or 0), 2)
-                        residual = round(target_total - current_total, 2)
-                        if abs(residual) >= 0.01:
-                            last = child_lines[-1]
-                            ql = float(last.get("qty") or 0) or 0
-                            if ql > 0:
-                                gross_candidate = round(float(last.get("price_list_rate") or last.get("rate") or 0) * ql, 2)
-                                new_line_total = round(float(last.get("rate") or 0) * ql + residual, 2)
-                                # Clamp between 0 and original gross
-                                if new_line_total < 0:
-                                    new_line_total = 0.0
-                                elif new_line_total > gross_candidate:
-                                    new_line_total = gross_candidate
-                                new_rate = round(new_line_total / ql, 2)
-                                last["rate"] = new_rate
-                except Exception:
-                    pass
-
-                for _pl in processed_lines:
-                    items.append(_pl)
+                    # Keep all fields that BundleProcessor returned - they are already correct
+                    filtered = {k: v for k, v in bl.items() if k in allowed}
+                    items.append(filtered)
                 handled_parents.add(str(product_id))
                 continue  # done with this Woo line
             except Exception:
