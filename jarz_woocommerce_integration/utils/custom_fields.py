@@ -26,6 +26,27 @@ REQUIRED_FIELDS = [
         "label": "Sales Invoice State",
         "insert_after": "status",
     },
+    {
+        "dt": "Sales Invoice",
+        "fieldname": "woo_outbound_status",
+        "fieldtype": "Data",
+        "label": "Woo Outbound Status",
+        "insert_after": "sales_invoice_state",
+    },
+    {
+        "dt": "Sales Invoice",
+        "fieldname": "woo_outbound_error",
+        "fieldtype": "Small Text",
+        "label": "Woo Outbound Error",
+        "insert_after": "woo_outbound_status",
+    },
+    {
+        "dt": "Sales Invoice",
+        "fieldname": "woo_outbound_synced_on",
+        "fieldtype": "Datetime",
+        "label": "Woo Outbound Synced On",
+        "insert_after": "woo_outbound_error",
+    },
     # Item field mapping to Woo product (id or sku mapping reference)
     {
         "dt": "Item",
@@ -33,6 +54,34 @@ REQUIRED_FIELDS = [
         "fieldtype": "Data",
         "label": "Woo Product ID",
         "insert_after": "item_name",
+    },
+    {
+        "dt": "Customer",
+        "fieldname": "woo_customer_id",
+        "fieldtype": "Data",
+        "label": "Woo Customer ID",
+        "insert_after": "customer_group",
+    },
+    {
+        "dt": "Customer",
+        "fieldname": "woo_outbound_status",
+        "fieldtype": "Data",
+        "label": "Woo Outbound Status",
+        "insert_after": "woo_customer_id",
+    },
+    {
+        "dt": "Customer",
+        "fieldname": "woo_outbound_error",
+        "fieldtype": "Small Text",
+        "label": "Woo Outbound Error",
+        "insert_after": "woo_outbound_status",
+    },
+    {
+        "dt": "Customer",
+        "fieldname": "woo_outbound_synced_on",
+        "fieldtype": "Datetime",
+        "label": "Woo Outbound Synced On",
+        "insert_after": "woo_outbound_error",
     },
     # Jarz Bundle mapping to Woo bundle id
     {

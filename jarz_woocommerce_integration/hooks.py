@@ -141,13 +141,17 @@ after_migrate = "jarz_woocommerce_integration.install.after_migrate"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+	"Customer": {
+		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_customer_sync",
+		"on_update": "jarz_woocommerce_integration.services.outbound_sync.enqueue_customer_sync",
+	},
+	"Sales Invoice": {
+		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
+		"on_update_after_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
+		"on_cancel": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
+	},
+}
 
 # Scheduled Tasks
 # ---------------
@@ -165,6 +169,9 @@ scheduler_events = {
 		# Live order sync every 2 minutes (creates unpaid submitted invoices, skips pending payment)
 		"*/2 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
+		],
+		"10 * * * *": [
+			"jarz_woocommerce_integration.services.outbound_sync.reconcile_outbound_state"
 		]
 	}
 }

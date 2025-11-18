@@ -12,7 +12,17 @@
   "column_sync_opts",
   "auto_create_customers",
   "last_synced_customer_created",
-  "webhook_secret"
+  "webhook_secret",
+  "section_outbound",
+  "enable_outbound_customers",
+  "enable_outbound_orders",
+  "outbound_column_break",
+  "payment_method_cod",
+  "payment_method_instapay",
+  "payment_method_wallet",
+  "shipping_section",
+  "default_shipping_method_id",
+  "default_shipping_method_title"
  ],
  "fields": [
   {
@@ -67,8 +77,64 @@
   },
   {
    "fieldname": "webhook_secret",
-    "fieldtype": "Password",
-    "label": "Webhook Secret"
+   "fieldtype": "Password",
+   "label": "Webhook Secret"
+  },
+  {
+   "fieldname": "section_outbound",
+   "fieldtype": "Section Break",
+   "label": "Outbound Sync"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_outbound_customers",
+   "fieldtype": "Check",
+   "label": "Push Customers to Woo"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_outbound_orders",
+   "fieldtype": "Check",
+   "label": "Push Sales Invoices as Orders"
+  },
+  {
+   "fieldname": "outbound_column_break",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "cod",
+   "fieldname": "payment_method_cod",
+   "fieldtype": "Data",
+   "label": "COD Payment Method Code"
+  },
+  {
+   "default": "instapay",
+   "fieldname": "payment_method_instapay",
+   "fieldtype": "Data",
+   "label": "Instapay Payment Method Code"
+  },
+  {
+   "default": "wallet",
+   "fieldname": "payment_method_wallet",
+   "fieldtype": "Data",
+   "label": "Wallet Payment Method Code"
+  },
+  {
+   "fieldname": "shipping_section",
+   "fieldtype": "Section Break",
+   "label": "Shipping Defaults"
+  },
+  {
+   "default": "flat_rate",
+   "fieldname": "default_shipping_method_id",
+   "fieldtype": "Data",
+   "label": "Woo Shipping Method ID"
+  },
+  {
+   "default": "Shipping",
+   "fieldname": "default_shipping_method_title",
+   "fieldtype": "Data",
+   "label": "Woo Shipping Method Title"
   }
  ],
  "issingle": 1,

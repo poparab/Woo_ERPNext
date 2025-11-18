@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import urllib.parse
 from dataclasses import dataclass
 
 import requests  # third-party
+from requests.auth import HTTPBasicAuth
 
 
 class WooAPIError(Exception):
@@ -32,27 +32,34 @@ class WooClient:
             return f"{self.base_url}/{resource}"
         return f"{self.base_url}/wp-json/wc/{self.api_version}/{resource}"
 
-    def _auth_params(self) -> dict:
-        return {
-            "consumer_key": self.consumer_key,
-            "consumer_secret": self.consumer_secret,
-        }
-
-    def get(self, resource: str, params: dict | None = None) -> dict:
+    def _request(self, method: str, resource: str, *, params: dict | None = None, data: dict | None = None) -> dict:
         url = self._build_url(resource)
-        q = params.copy() if params else {}
-        q.update(self._auth_params())
-        response = requests.get(url, params=q, timeout=self.timeout)
+        auth = HTTPBasicAuth(self.consumer_key, self.consumer_secret)
+        response = requests.request(method.upper(), url, params=params, json=data, auth=auth, timeout=self.timeout)
         if response.status_code >= 400:
             try:
-                data = response.json()
+                payload = response.json()
             except Exception:  # noqa: BLE001
-                data = {"message": response.text[:500]}
-            raise WooAPIError(response.status_code, url, data.get("message") or "HTTP error", data)
+                payload = {"message": response.text[:500]}
+            raise WooAPIError(response.status_code, url, payload.get("message") or "HTTP error", payload)
         try:
-            return response.json()
-        except json.JSONDecodeError as e:  # noqa: PERF203
-            raise WooAPIError(response.status_code, url, f"Invalid JSON response: {e}") from e
+            if response.text:
+                return response.json()
+            return {}
+        except json.JSONDecodeError as exc:  # noqa: PERF203
+            raise WooAPIError(response.status_code, url, f"Invalid JSON response: {exc}") from exc
+
+    def get(self, resource: str, params: dict | None = None) -> dict:
+        return self._request("GET", resource, params=params)
+
+    def post(self, resource: str, data: dict) -> dict:
+        return self._request("POST", resource, data=data)
+
+    def put(self, resource: str, data: dict) -> dict:
+        return self._request("PUT", resource, data=data)
+
+    def delete(self, resource: str, params: dict | None = None) -> dict:
+        return self._request("DELETE", resource, params=params)
 
     def list_orders(self, per_page: int | None = None, params: dict | None = None) -> list[dict]:
         """List orders with flexible pagination.
