@@ -148,7 +148,7 @@ def _mark_customer_status(customer_name: str, *, status: str, error: str | None 
     frappe.db.set_value("Customer", customer_name, updates, update_modified=False)
 
 
-def _build_customer_payload(customer: frappe.model.document.Document, *, include_password: bool = False) -> dict:
+def _build_customer_payload(customer: frappe.model.document.Document, *, include_password: bool = False, include_username: bool = True) -> dict:
     # Mobile number is mandatory for WooCommerce
     phone_val = (getattr(customer, "mobile_no", "") or getattr(customer, "phone", "") or "").strip()
     if not phone_val:
@@ -188,9 +188,13 @@ def _build_customer_payload(customer: frappe.model.document.Document, *, include
         "billing": billing,
         "shipping": shipping,
     }
-    username_field = getattr(customer, "woo_username", None) or email
-    if username_field:
-        payload["username"] = username_field
+    
+    # Only include username for NEW customer creation (WooCommerce doesn't allow editing username)
+    if include_username:
+        username_field = getattr(customer, "woo_username", None) or email
+        if username_field:
+            payload["username"] = username_field
+    
     # Always include phone in billing and shipping
     payload.setdefault("billing", {})["phone"] = phone_val
     payload.setdefault("shipping", {})["phone"] = phone_val
@@ -226,7 +230,7 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
     is_new_customer = not woo_id
     
     try:
-        payload = _build_customer_payload(customer, include_password=is_new_customer)
+        payload = _build_customer_payload(customer, include_password=is_new_customer, include_username=is_new_customer)
     except ValueError as exc:
         LOGGER.warning({
             "event": "woo_outbound_customer_skipped",
@@ -250,8 +254,8 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
             response = client.post("customers", payload)
     except WooAPIError as exc:
         if woo_id and exc.status_code == 404:
-            # create anew if stored id is stale - include password for recreation
-            payload_with_password = _build_customer_payload(customer, include_password=True)
+            # create anew if stored id is stale - include password and username for recreation
+            payload_with_password = _build_customer_payload(customer, include_password=True, include_username=True)
             response = client.post("customers", payload_with_password)
         elif not woo_id and exc.status_code == 400 and "already registered" in exc.message.lower():
             # Customer exists in WooCommerce but we don't have the ID - reconcile
@@ -273,11 +277,13 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
                         "woo_id": woo_customer_id,
                         "email": email,
                     })
-                    # Store the ID and retry as UPDATE
+                    # Store the ID and retry as UPDATE (no password, no username)
                     frappe.db.set_value("Customer", customer_name, "woo_customer_id", str(woo_customer_id), update_modified=False)
                     frappe.db.commit()
-                    # Retry with UPDATE (no password)
-                    response = client.put(f"customers/{woo_customer_id}", payload)
+                    # Rebuild payload for UPDATE (no password, no username)
+                    update_payload = _build_customer_payload(customer, include_password=False, include_username=False)
+                    # Retry with UPDATE
+                    response = client.put(f"customers/{woo_customer_id}", update_payload)
                 else:
                     raise ValueError(f"Could not find WooCommerce customer with email {email}")
             except Exception as search_exc:
