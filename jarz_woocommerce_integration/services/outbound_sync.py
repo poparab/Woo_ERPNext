@@ -253,6 +253,41 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
             # create anew if stored id is stale - include password for recreation
             payload_with_password = _build_customer_payload(customer, include_password=True)
             response = client.post("customers", payload_with_password)
+        elif not woo_id and exc.status_code == 400 and "already registered" in exc.message.lower():
+            # Customer exists in WooCommerce but we don't have the ID - reconcile
+            LOGGER.info({
+                "event": "woo_outbound_customer_reconcile",
+                "customer": customer_name,
+                "detail": "Customer exists in WooCommerce, searching by email to reconcile",
+            })
+            try:
+                # Search for customer by email
+                email = payload.get("email", "")
+                search_result = client.get("customers", params={"email": email, "per_page": 1})
+                if search_result and len(search_result) > 0:
+                    existing_woo_customer = search_result[0]
+                    woo_customer_id = existing_woo_customer.get("id")
+                    LOGGER.info({
+                        "event": "woo_outbound_customer_found",
+                        "customer": customer_name,
+                        "woo_id": woo_customer_id,
+                        "email": email,
+                    })
+                    # Store the ID and retry as UPDATE
+                    frappe.db.set_value("Customer", customer_name, "woo_customer_id", str(woo_customer_id), update_modified=False)
+                    frappe.db.commit()
+                    # Retry with UPDATE (no password)
+                    response = client.put(f"customers/{woo_customer_id}", payload)
+                else:
+                    raise ValueError(f"Could not find WooCommerce customer with email {email}")
+            except Exception as search_exc:
+                LOGGER.error({
+                    "event": "woo_outbound_customer_reconcile_failed",
+                    "customer": customer_name,
+                    "error": str(search_exc),
+                })
+                _mark_customer_status(customer_name, status="error", error=f"Reconciliation failed: {str(search_exc)}")
+                return {"status": "error", "detail": f"Reconciliation failed: {str(search_exc)}"}
         else:
             LOGGER.error({
                 "event": "woo_outbound_customer_error",
