@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import re
 from typing import Any, Dict, Optional
 
 import frappe
@@ -20,6 +21,10 @@ from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_setti
 from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient
 
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
+
+
+class MissingWooProductError(Exception):
+    """Raised when invoice items lack WooCommerce product mappings."""
 
 
 @dataclass(slots=True)
@@ -153,7 +158,6 @@ def _build_customer_payload(customer: frappe.model.document.Document) -> dict:
     if not email:
         # Generate a default email for customers without email
         # WooCommerce requires email, so we create a placeholder using customer name
-        import re
         sanitized_name = re.sub(r'[^a-zA-Z0-9]', '', customer.name.lower())
         if not sanitized_name:
             sanitized_name = 'customer'
@@ -163,6 +167,13 @@ def _build_customer_payload(customer: frappe.model.document.Document) -> dict:
             "customer": customer.name,
             "generated_email": email,
         })
+
+    # Derive a deterministic password from the customer's phone number
+    password_seed = re.sub(r"[^0-9A-Za-z]", "", phone_val)
+    if not password_seed:
+        password_seed = "OrderJarz123"
+    if len(password_seed) < 8:
+        password_seed = (password_seed + "12345678")[:12]
 
     first, last = _split_contact_name(customer.customer_name)
     billing = _get_address_payload(
@@ -190,6 +201,7 @@ def _build_customer_payload(customer: frappe.model.document.Document) -> dict:
     # Always include phone in billing and shipping
     payload.setdefault("billing", {})["phone"] = phone_val
     payload.setdefault("shipping", {})["phone"] = phone_val
+    payload["password"] = password_seed
     return payload
 
 
@@ -336,6 +348,9 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
         product_row = frappe.db.get_value("Item", item.item_code, ["woo_product_id", "item_name"], as_dict=True)
         product_identifier = (product_row or {}).get("woo_product_id")
         product_id, variation_id = _parse_product_identifier(product_identifier)
+        if not product_identifier or (product_id is None and variation_id is None):
+            missing_products.append(item.item_code)
+            continue
         subtotal_base = item.price_list_rate or item.rate
         subtotal = subtotal_base * qty if subtotal_base else item.amount
         entry = {
@@ -353,8 +368,6 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
             entry["variation_id"] = variation_id
         if getattr(item, "discount_percentage", None):
             entry["meta_data"].append({"key": "discount_percentage", "value": flt(item.discount_percentage)})
-        if not product_id:
-            missing_products.append(item.item_code)
         line_items.append(entry)
     return line_items, missing_products
 
@@ -404,8 +417,64 @@ def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool =
     return "processing"
 
 
-def _build_order_payload(invoice: frappe.model.document.Document, cfg: OutboundConfig, *, cancel: bool = False) -> dict:
+def _extract_item_code(entry: dict) -> Optional[str]:
+    for meta in entry.get("meta_data", []) or []:
+        if meta.get("key") == "erpnext_item_code":
+            return meta.get("value")
+    return None
+
+
+def _attach_existing_line_ids(line_items: list[dict], existing_line_items: list[dict]) -> tuple[list[dict], list[dict]]:
+    if not existing_line_items:
+        return line_items, []
+
+    by_meta: dict[str, list[dict]] = {}
+    by_product: dict[tuple[Optional[int], Optional[int]], list[dict]] = {}
+    for existing in existing_line_items:
+        code = None
+        for md in existing.get("meta_data", []) or []:
+            if md.get("key") == "erpnext_item_code":
+                code = md.get("value")
+                break
+        if code:
+            by_meta.setdefault(code, []).append(existing)
+        key = (existing.get("product_id"), existing.get("variation_id"))
+        by_product.setdefault(key, []).append(existing)
+
+    mapped: list[dict] = []
+    unmapped: list[dict] = []
+    for entry in line_items:
+        match: Optional[dict] = None
+        code = _extract_item_code(entry)
+        if code and by_meta.get(code):
+            match = by_meta[code].pop(0)
+        else:
+            key = (entry.get("product_id"), entry.get("variation_id"))
+            bucket = by_product.get(key) or []
+            if bucket:
+                match = bucket.pop(0)
+
+        if match and match.get("id"):
+            entry["id"] = match["id"]
+            mapped.append(entry)
+        else:
+            unmapped.append(entry)
+    return mapped, unmapped
+
+
+def _build_order_payload(
+    invoice: frappe.model.document.Document,
+    cfg: OutboundConfig,
+    *,
+    cancel: bool = False,
+    existing_order: Optional[dict] = None,
+) -> dict:
     line_items, missing_products = _collect_line_items(invoice)
+    unmapped_line_items: list[dict] = []
+    if existing_order:
+        matched, unmapped_line_items = _attach_existing_line_ids(line_items, existing_order.get("line_items") or [])
+        line_items = matched
+
     if not line_items:
         raise ValueError("No line items available for Woo order payload")
 
@@ -444,7 +513,17 @@ def _build_order_payload(invoice: frappe.model.document.Document, cfg: OutboundC
         ]
 
     if missing_products:
-        payload.setdefault("meta_data", []).append({"key": "missing_products", "value": ",".join(missing_products)})
+        raise MissingWooProductError(
+            "Missing WooCommerce product mapping for items: " + ", ".join(missing_products)
+        )
+    if existing_order and unmapped_line_items:
+        codes = [(_extract_item_code(entry) or entry.get("name") or "unknown") for entry in unmapped_line_items]
+        payload.setdefault("meta_data", []).append({"key": "unmapped_line_items", "value": ",".join(codes)})
+        LOGGER.warning({
+            "event": "woo_outbound_unmapped_line_items",
+            "invoice": invoice.name,
+            "unmatched": codes,
+        })
     return payload
 
 
@@ -479,9 +558,38 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         sync_customer(customer_doc.name, reason="order_dependency", force=True)
         customer_doc = frappe.get_doc("Customer", invoice.customer)
 
-    payload = _build_order_payload(invoice, cfg, cancel=cancel)
-
     woo_order_id = getattr(invoice, "woo_order_id", None)
+    existing_order: Optional[Dict[str, Any]] = None
+    if woo_order_id:
+        try:
+            existing_order = client.get(f"orders/{woo_order_id}")
+        except WooAPIError as exc:
+            if exc.status_code == 404:
+                existing_order = None
+                woo_order_id = None
+            else:
+                LOGGER.error({
+                    "event": "woo_outbound_invoice_fetch_error",
+                    "invoice": invoice_name,
+                    "status_code": exc.status_code,
+                    "message": exc.message,
+                    "reason": reason,
+                })
+                _mark_invoice_status(invoice_name, status="error", error=exc.message)
+                return {"status": "error", "detail": exc.message}
+
+    try:
+        payload = _build_order_payload(invoice, cfg, cancel=cancel, existing_order=existing_order)
+    except MissingWooProductError as exc:
+        LOGGER.warning({
+            "event": "woo_outbound_missing_product_mapping",
+            "invoice": invoice_name,
+            "detail": str(exc),
+            "reason": reason,
+        })
+        _mark_invoice_status(invoice_name, status="error", error=str(exc))
+        return {"status": "error", "detail": str(exc)}
+
     response: Dict[str, Any]
     try:
         if woo_order_id:

@@ -25,7 +25,7 @@ def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str
         else:
             # Live: mark as submitted but unpaid
             return {"docstatus": 1, "custom_state": "Completed", "is_paid": False}
-    if s in {"cancelled", "refunded"}:
+    if s in {"cancelled", "refunded", "failed"}:
         return {"docstatus": 2, "custom_state": "Cancelled", "is_paid": False}
     return {"docstatus": 0, "custom_state": "Draft", "is_paid": False}
 
@@ -53,6 +53,30 @@ def _map_payment_method(woo_payment_method: str | None) -> str | None:
         return "Kashier Wallet"
     else:
         return None
+
+
+def _add_payment_failure_comment(invoice_name: str, woo_order_id: Any) -> None:
+    message = (
+        f"Order {woo_order_id} cancelled because WooCommerce reported a payment failure."
+    )
+    existing = frappe.get_all(
+        "Comment",
+        filters={
+            "reference_doctype": "Sales Invoice",
+            "reference_name": invoice_name,
+            "comment_type": "Comment",
+            "content": ["like", "%payment failure%"],
+        },
+        limit=1,
+    )
+    if not existing:
+        try:
+            frappe.get_doc("Sales Invoice", invoice_name).add_comment("Comment", message)
+        except Exception:
+            frappe.log_error(
+                frappe.get_traceback(),
+                "Woo Payment Failure Comment Error",
+            )
 
 
 def _compute_order_hash(order: dict) -> str:
@@ -489,72 +513,105 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             time_from_val = None
             duration_val = None
 
-        # Update existing or create new invoice
-        if ((existing_map and existing_map.get(LINK_FIELD)) or linked_invoice_name) and allow_update:
-            inv = frappe.get_doc("Sales Invoice", existing_map.get(LINK_FIELD) or linked_invoice_name)
-            if inv.docstatus == 0:
-                inv.set("items", [])
-                for it in lines:
-                    if default_warehouse:
-                        it["warehouse"] = default_warehouse
-                    inv.append("items", it)
-                if price_list:
-                    inv.selling_price_list = price_list
-            if billing_addr or shipping_addr:
-                inv.customer_address = billing_addr or shipping_addr
-                inv.shipping_address_name = shipping_addr or billing_addr
-            # Set POS Profile from Territory if available
+        candidate_name = None
+        candidate_doc = None
+        if allow_update:
+            candidate_name = (existing_map or {}).get(LINK_FIELD) or linked_invoice_name
+        if candidate_name:
             try:
-                if pos_profile:
-                    if inv.docstatus == 1:
-                        # for submitted invoices, update directly in DB without full save
-                        inv.db_set("pos_profile", pos_profile, commit=False)
-                        # attempt to mark as POS to ensure POS defaults apply
-                        try:
-                            inv.db_set("is_pos", 1, commit=False)
-                        except Exception:
-                            pass
-                    else:
-                        inv.pos_profile = pos_profile
-                        inv.is_pos = 1
+                candidate_doc = frappe.get_doc("Sales Invoice", candidate_name)
+                if candidate_doc.docstatus == 2 and status_map["docstatus"] != 2:
+                    candidate_doc = None
+                    if existing_map:
+                        existing_map[LINK_FIELD] = None
+                    linked_invoice_name = None
+                else:
+                    linked_invoice_name = candidate_doc.name
             except Exception:
-                pass
-            if delivery_date_val:
-                inv.custom_delivery_date = delivery_date_val
-            if time_from_val:
-                inv.custom_delivery_time_from = time_from_val
-            if duration_val is not None:
-                inv.custom_delivery_duration = int(duration_val) * 60  # seconds
+                candidate_doc = None
+
+        inv = None
+        action = "created"
+
+        if candidate_doc:
+            inv = candidate_doc
+            action = "updated"
+            if inv.docstatus != 2:
+                if inv.docstatus == 0:
+                    inv.set("items", [])
+                    for it in lines:
+                        if default_warehouse:
+                            it["warehouse"] = default_warehouse
+                        inv.append("items", it)
+                    if price_list:
+                        inv.selling_price_list = price_list
+                if billing_addr or shipping_addr:
+                    inv.customer_address = billing_addr or shipping_addr
+                    inv.shipping_address_name = shipping_addr or billing_addr
+                # Set POS Profile from Territory if available
+                try:
+                    if pos_profile:
+                        if inv.docstatus == 1:
+                            inv.db_set("pos_profile", pos_profile, commit=False)
+                            try:
+                                inv.db_set("custom_kanban_profile", pos_profile, commit=False)
+                            except Exception:
+                                pass
+                            try:
+                                inv.db_set("is_pos", 1, commit=False)
+                            except Exception:
+                                pass
+                        else:
+                            inv.pos_profile = pos_profile
+                            inv.custom_kanban_profile = pos_profile
+                            inv.is_pos = 1
+                except Exception:
+                    pass
+                if delivery_date_val:
+                    inv.custom_delivery_date = delivery_date_val
+                if time_from_val:
+                    inv.custom_delivery_time_from = time_from_val
+                if duration_val is not None:
+                    inv.custom_delivery_duration = int(duration_val) * 60  # seconds
+                if custom_payment_method:
+                    try:
+                        if inv.docstatus == 1:
+                            inv.db_set("custom_payment_method", custom_payment_method, commit=False)
+                        else:
+                            inv.custom_payment_method = custom_payment_method
+                    except Exception:
+                        pass
+                # Optional: territory-based delivery income row
+                try:
+                    if territory_name and frappe.db.exists("Territory", territory_name):
+                        delivery_income = frappe.db.get_value("Territory", territory_name, "delivery_income") or 0
+                        if delivery_income and float(delivery_income) > 0:
+                            add_delivery_charges_to_taxes(
+                                inv,
+                                delivery_income,
+                                delivery_description=f"Shipping Income ({territory_name})",
+                            )
+                except Exception:
+                    pass
+                inv.save(ignore_permissions=True, ignore_version=True)
+
             try:
                 if status_map.get("custom_state"):
                     inv.db_set("sales_invoice_state", status_map["custom_state"], commit=False)
             except Exception:
                 pass
-            
+
             # Update custom acceptance status and sales invoice state based on WooCommerce status
-            woo_status = (order.get("status") or "").lower()
             try:
                 if woo_status == "completed":
                     inv.db_set("custom_acceptance_status", "Accepted", commit=False)
                     inv.db_set("custom_sales_invoice_state", "Delivered", commit=False)
-                elif woo_status in ("cancelled", "refunded"):
+                elif woo_status in ("cancelled", "refunded", "failed"):
                     inv.db_set("custom_acceptance_status", "Accepted", commit=False)
                     inv.db_set("custom_sales_invoice_state", "Cancelled", commit=False)
             except Exception:
                 pass
-            # Optional: territory-based delivery income row
-            try:
-                if territory_name and frappe.db.exists("Territory", territory_name):
-                    delivery_income = frappe.db.get_value("Territory", territory_name, "delivery_income") or 0
-                    if delivery_income and float(delivery_income) > 0:
-                        add_delivery_charges_to_taxes(
-                            inv,
-                            delivery_income,
-                            delivery_description=f"Shipping Income ({territory_name})",
-                        )
-            except Exception:
-                pass
-            inv.save(ignore_permissions=True, ignore_version=True)
+
             try:
                 if status_map["docstatus"] == 1 and inv.docstatus == 0:
                     inv.submit()
@@ -565,7 +622,6 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             except Exception:
                 pass
         else:
-            # attach warehouse to items on create if available
             if default_warehouse:
                 for it in lines:
                     it["warehouse"] = default_warehouse
@@ -581,8 +637,6 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "shipping_address_name": shipping_addr or billing_addr,
                 "items": lines,
             }
-            
-            # Add optional fields
             if delivery_date_val:
                 inv_data["custom_delivery_date"] = delivery_date_val
             if time_from_val:
@@ -593,24 +647,24 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 inv_data["selling_price_list"] = price_list
             if custom_payment_method:
                 inv_data["custom_payment_method"] = custom_payment_method
-            
-            # Set custom acceptance status and sales invoice state based on WooCommerce status
-            woo_status = (order.get("status") or "").lower()
+
             if woo_status == "completed":
                 inv_data["custom_acceptance_status"] = "Accepted"
                 inv_data["custom_sales_invoice_state"] = "Delivered"
-            elif woo_status in ("cancelled", "refunded"):
+            elif woo_status in ("cancelled", "refunded", "failed"):
                 inv_data["custom_acceptance_status"] = "Accepted"
                 inv_data["custom_sales_invoice_state"] = "Cancelled"
-            
+
             inv = frappe.get_doc(inv_data)
-            # Set POS Profile from Territory if available
             try:
                 if pos_profile:
                     inv.pos_profile = pos_profile
+                    try:
+                        inv.custom_kanban_profile = pos_profile
+                    except Exception:
+                        pass
             except Exception:
                 pass
-            # Optional: territory-based delivery income row
             try:
                 territory_name = frappe.db.get_value("Customer", customer, "territory")
                 if territory_name and frappe.db.exists("Territory", territory_name):
@@ -626,39 +680,44 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             inv.insert(ignore_permissions=True)
             if status_map["docstatus"] == 1:
                 inv.submit()
-                # post-submit: enable POS to expose POS Profile without triggering MOP validation
                 try:
                     if pos_profile:
                         inv.db_set("pos_profile", pos_profile, commit=False)
+                        try:
+                            inv.db_set("custom_kanban_profile", pos_profile, commit=False)
+                        except Exception:
+                            pass
                         inv.db_set("is_pos", 1, commit=False)
                 except Exception:
                     pass
-                
-                # Create payment entry for Kashier methods
+
                 if custom_payment_method in ["Kashier Card", "Kashier Wallet"]:
                     try:
                         payment_entry = _create_kashier_payment_entry(
                             inv.name,
                             float(order.get("total") or 0),
-                            custom_payment_method
+                            custom_payment_method,
                         )
                         if payment_entry:
-                            frappe.logger().info(f"Created Kashier payment entry {payment_entry} for invoice {inv.name}")
+                            frappe.logger().info(
+                                {
+                                    "event": "kashier_payment_entry_created",
+                                    "invoice": inv.name,
+                                    "payment_entry": payment_entry,
+                                }
+                            )
                     except Exception as pe_error:
                         frappe.log_error(
                             f"Failed to create Kashier payment for {inv.name}: {str(pe_error)}",
-                            "Kashier Payment Creation Error"
+                            "Kashier Payment Creation Error",
                         )
-                
-                # Mark as paid for historical orders
+
                 if status_map.get("is_paid"):
                     try:
                         inv.db_set("status", "Paid", commit=False)
                     except Exception:
                         pass
-                        
             elif status_map["docstatus"] == 2:
-                # Submit first if draft, then cancel
                 if inv.docstatus == 0:
                     inv.submit()
                 inv.cancel()
@@ -668,7 +727,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             except Exception:
                 pass
 
-        # Upsert mapping
+        if woo_status == "failed" and inv:
+            _add_payment_failure_comment(inv.name, woo_id)
+
         map_name = existing_map.get("name") if existing_map else None
         if map_name:
             map_doc = frappe.get_doc("WooCommerce Order Map", map_name)
@@ -697,7 +758,6 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "hash": order_hash,
             }).insert(ignore_permissions=True)
 
-        action = "updated" if ((existing_map and existing_map.get(LINK_FIELD)) or linked_invoice_name) else "created"
         return {"status": action, "invoice": inv.name, "woo_order_id": woo_id}
     except Exception as e:  # noqa: BLE001
         frappe.db.rollback()
