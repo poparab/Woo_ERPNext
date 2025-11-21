@@ -148,7 +148,7 @@ def _mark_customer_status(customer_name: str, *, status: str, error: str | None 
     frappe.db.set_value("Customer", customer_name, updates, update_modified=False)
 
 
-def _build_customer_payload(customer: frappe.model.document.Document) -> dict:
+def _build_customer_payload(customer: frappe.model.document.Document, *, include_password: bool = False) -> dict:
     # Mobile number is mandatory for WooCommerce
     phone_val = (getattr(customer, "mobile_no", "") or getattr(customer, "phone", "") or "").strip()
     if not phone_val:
@@ -167,13 +167,6 @@ def _build_customer_payload(customer: frappe.model.document.Document) -> dict:
             "customer": customer.name,
             "generated_email": email,
         })
-
-    # Derive a deterministic password from the customer's phone number
-    password_seed = re.sub(r"[^0-9A-Za-z]", "", phone_val)
-    if not password_seed:
-        password_seed = "OrderJarz123"
-    if len(password_seed) < 8:
-        password_seed = (password_seed + "12345678")[:12]
 
     first, last = _split_contact_name(customer.customer_name)
     billing = _get_address_payload(
@@ -201,7 +194,17 @@ def _build_customer_payload(customer: frappe.model.document.Document) -> dict:
     # Always include phone in billing and shipping
     payload.setdefault("billing", {})["phone"] = phone_val
     payload.setdefault("shipping", {})["phone"] = phone_val
-    payload["password"] = password_seed
+    
+    # Only include password for NEW customer creation
+    if include_password:
+        # Derive a deterministic password from the customer's phone number
+        password_seed = re.sub(r"[^0-9A-Za-z]", "", phone_val)
+        if not password_seed:
+            password_seed = "OrderJarz123"
+        if len(password_seed) < 8:
+            password_seed = (password_seed + "12345678")[:12]
+        payload["password"] = password_seed
+    
     return payload
 
 
@@ -218,8 +221,12 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
     if getattr(customer.flags, "ignore_woo_outbound", False) or getattr(frappe.flags, "ignore_woo_outbound", False):
         return {"skipped": True, "reason": "inbound"}
 
+    # Check if this is a new customer (no woo_customer_id)
+    woo_id = getattr(customer, "woo_customer_id", None)
+    is_new_customer = not woo_id
+    
     try:
-        payload = _build_customer_payload(customer)
+        payload = _build_customer_payload(customer, include_password=is_new_customer)
     except ValueError as exc:
         LOGGER.warning({
             "event": "woo_outbound_customer_skipped",
@@ -236,7 +243,6 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
         LOGGER.warning({"event": "woo_outbound_customer_skipped", "customer": customer_name, "reason": "missing_credentials"})
         return {"skipped": True, "reason": "missing_credentials"}
 
-    woo_id = getattr(customer, "woo_customer_id", None)
     try:
         if woo_id:
             response = client.put(f"customers/{woo_id}", payload)
@@ -244,8 +250,9 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
             response = client.post("customers", payload)
     except WooAPIError as exc:
         if woo_id and exc.status_code == 404:
-            # create anew if stored id is stale
-            response = client.post("customers", payload)
+            # create anew if stored id is stale - include password for recreation
+            payload_with_password = _build_customer_payload(customer, include_password=True)
+            response = client.post("customers", payload_with_password)
         else:
             LOGGER.error({
                 "event": "woo_outbound_customer_error",
