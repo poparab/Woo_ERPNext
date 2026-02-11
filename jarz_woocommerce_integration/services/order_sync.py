@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Tuple
 
+from frappe.utils.background_jobs import get_redis_conn
+
 import frappe
 
 from jarz_woocommerce_integration.utils.http_client import WooClient
@@ -34,8 +36,10 @@ def _map_payment_method(woo_payment_method: str | None) -> str | None:
     """Map WooCommerce payment method to ERPNext custom_payment_method.
     
     WooCommerce -> ERPNext mapping:
-    - instapay -> Instapay
     - cod -> Cash
+    - instapay -> Instapay
+    - wallet -> Mobile Wallet
+    - card -> Kashier Card
     - kashier_card -> Kashier Card
     - kashier_wallet -> Kashier Wallet
     """
@@ -43,11 +47,13 @@ def _map_payment_method(woo_payment_method: str | None) -> str | None:
         return None
     
     pm = woo_payment_method.lower().strip()
-    if pm == "instapay":
-        return "Instapay"
-    elif pm == "cod":
+    if pm == "cod":
         return "Cash"
-    elif pm == "kashier_card":
+    elif pm == "instapay":
+        return "Instapay"
+    elif pm == "wallet":
+        return "Mobile Wallet"
+    elif pm in ("card", "kashier_card"):
         return "Kashier Card"
     elif pm == "kashier_wallet":
         return "Kashier Wallet"
@@ -59,6 +65,7 @@ def _add_payment_failure_comment(invoice_name: str, woo_order_id: Any) -> None:
     message = (
         f"Order {woo_order_id} cancelled because WooCommerce reported a payment failure."
     )
+
     existing = frappe.get_all(
         "Comment",
         filters={
@@ -79,6 +86,22 @@ def _add_payment_failure_comment(invoice_name: str, woo_order_id: Any) -> None:
             )
 
 
+def _resolve_posting_date(order: dict, is_historical: bool) -> str:
+    """Return the posting_date to use for a Sales Invoice.
+
+    For historical imports, use the original WooCommerce order creation date.
+    For live orders, use today.
+    """
+    if is_historical:
+        raw = order.get("date_created") or order.get("date_completed") or ""
+        if raw:
+            # WooCommerce dates come as "2025-01-15T12:30:00" or "2025-01-15"
+            date_part = str(raw).split("T")[0].strip()
+            if date_part and len(date_part) >= 10:
+                return date_part
+    return frappe.utils.today()
+
+
 def _compute_order_hash(order: dict) -> str:
     import hashlib
     import json as _json
@@ -93,6 +116,101 @@ def _compute_order_hash(order: dict) -> str:
     }
     b = _json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(b).hexdigest()
+
+
+def _build_bundle_selections(
+    line_items: list[dict],
+    parent_product_id: int | str,
+    parent_qty: int,
+) -> dict:
+    """Parse WooCommerce child line items to build *selected_items* for BundleProcessor.
+
+    WooCommerce Smart Bundles (WOOSB) sends a parent line plus individual child
+    lines whose ``meta_data`` contains ``_woosb_parent_id == parent_product_id``.
+    Each child carries the actual item the customer chose (identified by ``sku``
+    or ``product_id``) and the total quantity across all bundle units.
+
+    Returns
+    -------
+    dict
+        ``{item_group_name: [{"item_code": ..., "selected_qty": ...}, ...]}``
+        Empty dict when any child cannot be mapped (caller should fall back to
+        default bundle expansion).
+    """
+    parent_pid_str = str(parent_product_id)
+
+    # Collect Woo child lines belonging to this bundle parent
+    woo_children: list[dict] = []
+    for _li in line_items:
+        for md in (_li.get("meta_data") or []):
+            key = (md.get("key") or md.get("display_key") or "").strip()
+            if key == "_woosb_parent_id":
+                val = str(md.get("value") or md.get("display_value") or "").strip()
+                if val == parent_pid_str:
+                    woo_children.append(_li)
+                break  # only one _woosb_parent_id per line item
+
+    if not woo_children:
+        return {}
+
+    selected_items: dict[str, list[dict]] = {}
+
+    for wc in woo_children:
+        wc_sku = (wc.get("sku") or "").strip()
+        wc_product_id = wc.get("product_id")
+        wc_qty = int(float(wc.get("quantity") or 0))
+        if wc_qty <= 0:
+            continue
+
+        # Resolve to ERPNext Item code
+        wc_item_code = None
+        if wc_sku and frappe.db.exists("Item", wc_sku):
+            wc_item_code = wc_sku
+        elif wc_product_id:
+            wc_item_code = frappe.db.get_value(
+                "Item", {"woo_product_id": str(wc_product_id)}, "name"
+            )
+
+        if not wc_item_code:
+            frappe.logger().warning(
+                f"Bundle selection: cannot map child sku={wc_sku}, "
+                f"product_id={wc_product_id} to ERPNext – falling back to defaults"
+            )
+            return {}  # partial mapping is unreliable → fall back
+
+        # Per-bundle quantity (WOOSB sends total = per_bundle × parent_qty)
+        per_bundle_qty = wc_qty // max(1, parent_qty)
+        if per_bundle_qty <= 0:
+            per_bundle_qty = wc_qty  # assume already per-bundle
+
+        # Determine item group so BundleProcessor can match to the right bundle row
+        wc_item_group = frappe.db.get_value("Item", wc_item_code, "item_group")
+        if not wc_item_group:
+            frappe.logger().warning(
+                f"Bundle selection: item {wc_item_code} has no item_group – falling back"
+            )
+            return {}
+
+        # Aggregate into selected_items (same item may appear from multiple child lines)
+        group_list = selected_items.setdefault(wc_item_group, [])
+        found = False
+        for entry in group_list:
+            if entry["item_code"] == wc_item_code:
+                entry["selected_qty"] += per_bundle_qty
+                found = True
+                break
+        if not found:
+            group_list.append({
+                "item_code": wc_item_code,
+                "selected_qty": per_bundle_qty,
+            })
+
+    if selected_items:
+        frappe.logger().info(
+            f"Bundle selections built from WooCommerce children: "
+            f"{{{', '.join(f'{g}: {len(v)} item(s)' for g, v in selected_items.items())}}}"
+        )
+    return selected_items
 
 
 def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[list[dict], list[dict]]:
@@ -148,13 +266,31 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
             try:
                 # Import locally to avoid hard dependency at module import time
                 from jarz_woocommerce_integration.services.bundle_processing import BundleProcessor  # type: ignore
-                bp = BundleProcessor(bundle_code, int(qty))
-                bp.load_bundle()  # Ensure bundle is loaded before getting items
-                bundle_lines = bp.get_invoice_items()
-                
+
+                # --- Build selected_items from WooCommerce child line items ---
+                selected_items = _build_bundle_selections(line_items, product_id, int(qty))
+
+                try:
+                    bp = BundleProcessor(bundle_code, int(qty), selected_items=selected_items)
+                    bp.load_bundle()
+                    bundle_lines = bp.get_invoice_items()
+                except Exception as sel_err:
+                    # If selection-based expansion fails, retry with defaults
+                    if selected_items:
+                        frappe.logger().warning(
+                            f"Bundle {bundle_code}: selection-based expansion failed "
+                            f"({sel_err}), retrying with default items"
+                        )
+                        bp = BundleProcessor(bundle_code, int(qty))
+                        bp.load_bundle()
+                        bundle_lines = bp.get_invoice_items()
+                    else:
+                        raise
+
                 # Log what BundleProcessor returned
                 frappe.logger().info(f"===== BUNDLE EXPANSION DEBUG =====")
                 frappe.logger().info(f"Bundle Code: {bundle_code}, Product ID: {product_id}, Qty: {qty}")
+                frappe.logger().info(f"Selected items passed: {bool(selected_items)}")
                 frappe.logger().info(f"BundleProcessor returned {len(bundle_lines)} items:")
                 for idx, bl in enumerate(bundle_lines):
                     item_code = bl.get("item_code", "UNKNOWN")
@@ -163,23 +299,8 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
                     is_parent = bl.get("is_bundle_parent", False)
                     is_child = bl.get("is_bundle_child", False)
                     frappe.logger().info(f"  [{idx}] {item_code} x{item_qty} @ {item_rate} (parent={is_parent}, child={is_child})")
-                
-                # Log what WooCommerce sent for this bundle
-                woo_children = [li for li in line_items if li.get("meta_data") and 
-                               any(m.get("key") == "_woosb_parent_id" and m.get("value") == str(product_id) 
-                                   for m in li.get("meta_data", []))]
-                if woo_children:
-                    frappe.logger().info(f"WooCommerce sent {len(woo_children)} child items for this bundle:")
-                    for wc in woo_children:
-                        wc_sku = wc.get("sku", "NO_SKU")
-                        wc_qty = wc.get("quantity", 0)
-                        wc_name = wc.get("name", "NO_NAME")
-                        frappe.logger().info(f"  - {wc_name} ({wc_sku}) x{wc_qty}")
-                else:
-                    frappe.logger().info("WooCommerce sent NO child items for this bundle")
-                frappe.logger().info(f"===================================")
-                
-                # Log for debugging
+                frappe.logger().info(f"====================================")
+
                 frappe.logger().info(f"Bundle {bundle_code} expanded into {len(bundle_lines)} line items for qty {qty}")
                 
                 # CRITICAL: Use BundleProcessor items AS-IS with price_list_rate and discount_percentage
@@ -300,6 +421,27 @@ def _parse_delivery_parts(o: dict) -> tuple[str | None, str | None, int | None]:
     return date_part, time_from, duration_minutes
 
 
+def _get_shipping_income_account(company: str) -> str | None:
+    """Return Freight and Forwarding Charges account for the company if it exists."""
+    abbr = frappe.db.get_value("Company", company, "abbr") or ""
+    # Prefer exact account name with company abbreviation suffix
+    candidate_filters = []
+    if abbr:
+        candidate_filters.append({"name": f"Freight and Forwarding Charges - {abbr}"})
+        candidate_filters.append({"account_name": f"Freight and Forwarding Charges - {abbr}"})
+    candidate_filters.append({"account_name": "Freight and Forwarding Charges"})
+    candidate_filters.append({"name": "Freight and Forwarding Charges"})
+
+    for filters in candidate_filters:
+        try:
+            account = frappe.db.get_value("Account", {"company": company, **filters}, "name")
+            if account:
+                return account
+        except Exception:
+            continue
+    return frappe.db.get_value("Company", company, "default_income_account")
+
+
 def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str | None = None, account_head: str | None = None) -> None:
     """Append an 'Actual' charge row for delivery/shipping income on the invoice taxes table."""
     try:
@@ -310,7 +452,7 @@ def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str 
         return
     desc = delivery_description or "Shipping Income"
     if not account_head:
-        account_head = frappe.db.get_value("Company", inv.company, "default_income_account")
+        account_head = _get_shipping_income_account(inv.company)
     # Try update existing matching row
     for t in inv.get("taxes", []) or []:
         if getattr(t, "charge_type", None) == "Actual" and (t.get("description") or getattr(t, "description", "") or "").startswith(desc):
@@ -329,13 +471,14 @@ def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str 
     inv.append("taxes", row)
 
 
-def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_method: str) -> str | None:
+def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_method: str, posting_date: str | None = None) -> str | None:
     """Create Payment Entry for Kashier payments (kashier_card or kashier_wallet).
     
     Args:
         invoice_name: Sales Invoice name
         amount: Payment amount
         payment_method: Either 'kashier_card' or 'kashier_wallet'
+        posting_date: Optional date string (YYYY-MM-DD). Defaults to today.
     
     Returns:
         Payment Entry name if created, None otherwise
@@ -354,11 +497,12 @@ def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_meth
             )
             return None
         
+        pe_date = posting_date or frappe.utils.today()
         # Create Payment Entry
         pe = frappe.get_doc({
             "doctype": "Payment Entry",
             "payment_type": "Receive",
-            "posting_date": frappe.utils.today(),
+            "posting_date": pe_date,
             "company": company,
             "party_type": "Customer",
             "party": inv.customer,
@@ -366,7 +510,7 @@ def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_meth
             "paid_amount": amount,
             "received_amount": amount,
             "reference_no": f"Kashier-{invoice_name}",
-            "reference_date": frappe.utils.today(),
+            "reference_date": pe_date,
             "references": [{
                 "reference_doctype": "Sales Invoice",
                 "reference_name": invoice_name,
@@ -396,6 +540,26 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     """
     woo_id = order.get("id")
 
+    # Prevent duplicate work when webhook and poller race on the same order
+    lock = None
+    try:
+        lock = get_redis_conn().lock(f"woo-order-lock-{woo_id}", timeout=120, blocking_timeout=1)
+        if not lock.acquire(blocking=False):
+            return {"status": "skipped", "reason": "locked", "woo_order_id": woo_id}
+    except Exception:
+        lock = None
+
+    # DB-level advisory lock as a second guard (handles multi-worker races)
+    db_lock_key = f"woo-order-{woo_id}"
+    db_lock_acquired = False
+    try:
+        res = frappe.db.sql("SELECT GET_LOCK(%s, 2)", (db_lock_key,))
+        db_lock_acquired = bool(res and res[0] and res[0][0] == 1)
+        if not db_lock_acquired:
+            return {"status": "skipped", "reason": "db_locked", "woo_order_id": woo_id}
+    except Exception:
+        db_lock_acquired = False
+
     # Determine mapping link field name based on actual DB schema
     LINK_FIELD = "erpnext_sales_invoice"
     try:
@@ -409,14 +573,17 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     existing_map = None
     try:
         existing_map = frappe.db.get_value(
-            "WooCommerce Order Map", {"woo_order_id": woo_id}, ["name", LINK_FIELD, "hash"], as_dict=True
+            "WooCommerce Order Map",
+            {"woo_order_id": woo_id},
+            ["name", LINK_FIELD, "hash", "status"],
+            as_dict=True,
         )
     except Exception:
         # Final fallback: only fetch name
         try:
             nm = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_id}, "name")
             if nm:
-                existing_map = {"name": nm, LINK_FIELD: None, "hash": None}
+                existing_map = {"name": nm, LINK_FIELD: None, "hash": None, "status": None}
         except Exception:
             existing_map = None
     order_hash = _compute_order_hash(order)
@@ -447,6 +614,36 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             existing_map[LINK_FIELD] = linked_invoice_name
     if existing_map and not allow_update:
         return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+
+    # Concurrency guard: create a processing map to prevent duplicate invoices
+    if not existing_map:
+        try:
+            map_doc = frappe.get_doc({
+                "doctype": "WooCommerce Order Map",
+                "woo_order_id": woo_id,
+                "woo_order_number": order.get("number"),
+                "status": "processing",
+                "synced_on": frappe.utils.now_datetime(),
+            })
+            map_doc.insert(ignore_permissions=True)
+            existing_map = {"name": map_doc.name, LINK_FIELD: None, "hash": None, "status": "processing"}
+        except Exception as map_err:
+            # If a duplicate map already exists, avoid creating another invoice
+            try:
+                existing_map = frappe.db.get_value(
+                    "WooCommerce Order Map",
+                    {"woo_order_id": woo_id},
+                    ["name", LINK_FIELD, "hash", "status"],
+                    as_dict=True,
+                )
+            except Exception:
+                existing_map = None
+            if existing_map and existing_map.get(LINK_FIELD):
+                return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+            if existing_map and (existing_map.get("status") or "").lower() == "processing":
+                return {"status": "skipped", "reason": "processing", "woo_order_id": woo_id}
+            # If we cannot confirm, surface the error for logging
+            raise map_err
 
     # Ensure customer and at least one address before proceeding
     try:
@@ -507,6 +704,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     status_map = _map_status(woo_status, is_historical=is_historical)
 
     try:
+        # ── Prevent outbound sync from firing back to WooCommerce ──
+        # When creating/updating invoices from an inbound WooCommerce order we
+        # must suppress the on_submit / on_update_after_submit hooks that would
+        # push the same data right back.  The outbound_sync.sync_sales_invoice
+        # function already checks this flag and returns early.
+        frappe.flags.ignore_woo_outbound = True
+
         delivery_date_val, time_from_val, duration_val = _parse_delivery_parts(order)
         if not (delivery_date_val and time_from_val and (duration_val is not None)):
             delivery_date_val = None
@@ -629,7 +833,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "doctype": "Sales Invoice",
                 "customer": customer,
                 "currency": order.get("currency") or getattr(settings, "default_currency", None) or "USD",
-                "posting_date": frappe.utils.today(),
+                "posting_date": _resolve_posting_date(order, is_historical),
                 "company": getattr(settings, "default_company", None) or frappe.defaults.get_global_default("company"),
                 "woo_order_id": woo_id,
                 "woo_order_number": order.get("number"),
@@ -693,10 +897,12 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
 
                 if custom_payment_method in ["Kashier Card", "Kashier Wallet"]:
                     try:
+                        pe_posting_date = _resolve_posting_date(order, is_historical)
                         payment_entry = _create_kashier_payment_entry(
                             inv.name,
                             float(order.get("total") or 0),
                             custom_payment_method,
+                            posting_date=pe_posting_date,
                         )
                         if payment_entry:
                             frappe.logger().info(
@@ -762,6 +968,19 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except Exception as e:  # noqa: BLE001
         frappe.db.rollback()
         return {"status": "error", "reason": str(e), "woo_order_id": woo_id}
+    finally:
+        # Always clear the outbound-suppression flag
+        frappe.flags.ignore_woo_outbound = False
+        if lock:
+            try:
+                lock.release()
+            except Exception:
+                pass
+        if db_lock_acquired:
+            try:
+                frappe.db.sql("SELECT RELEASE_LOCK(%s)", (db_lock_key,))
+            except Exception:
+                pass
 
 
 def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: bool = False, allow_update: bool = True, is_historical: bool = False) -> dict[str, Any]:
@@ -990,6 +1209,173 @@ def migrate_all_historical_orders_cli(max_pages: int = 100, batch_size: int = 50
     # Final summary
     frappe.logger().info(f"=== MIGRATION COMPLETE === Total: {total_stats}")
     return total_stats
+
+
+# ---------------------------------------------------------------------------
+# Full Historical Migration (API-triggered, background-job safe)
+# ---------------------------------------------------------------------------
+
+MIGRATION_PROGRESS_KEY = "woo_historical_migration_progress"
+
+
+def _run_full_historical_migration(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    batch_size: int = 50,
+    statuses: str = "any",
+) -> dict:
+    """Paginated migration of ALL WooCommerce orders into ERPNext.
+
+    Designed to run as a long-running background job. Progress is written to
+    Redis so callers can poll ``migration_progress()``.
+
+    Args:
+        date_from: ISO date string (YYYY-MM-DD) – only orders created after this date.
+        date_to:   ISO date string (YYYY-MM-DD) – only orders created before this date.
+        batch_size: Orders per page (max 100 per WooCommerce API).
+        statuses: Comma-separated Woo statuses, or "any" for all.
+    """
+    import gc
+    import time as _time
+
+    settings = frappe.get_single("WooCommerce Settings")
+    ensure_custom_fields()
+
+    client = WooClient(
+        base_url=settings.base_url,
+        consumer_key=settings.consumer_key,
+        consumer_secret=settings.get_password("consumer_secret"),
+    )
+
+    # Build base params
+    base_params: dict = {
+        "per_page": min(int(batch_size), 100),
+        "orderby": "date",
+        "order": "asc",  # oldest first so we fill history chronologically
+    }
+    if statuses and statuses != "any":
+        base_params["status"] = statuses
+    if date_from:
+        base_params["after"] = f"{date_from}T00:00:00"
+    if date_to:
+        base_params["before"] = f"{date_to}T23:59:59"
+
+    # First request to learn total counts
+    base_params["page"] = 1
+    orders, total_count, total_pages = client.list_orders_with_meta(params=base_params)
+
+    stats = {
+        "total_woo_orders": total_count,
+        "total_pages": total_pages,
+        "orders_fetched": 0,
+        "processed": 0,
+        "created": 0,
+        "skipped": 0,
+        "errors": 0,
+        "error_details": [],
+        "pages_processed": 0,
+        "batch_size": int(batch_size),
+        "date_from": date_from,
+        "date_to": date_to,
+        "statuses": statuses,
+        "started_at": frappe.utils.now_datetime().isoformat(),
+        "finished_at": None,
+        "running": True,
+    }
+
+    def _save_progress():
+        try:
+            from frappe.utils.background_jobs import get_redis_conn
+            r = get_redis_conn()
+            import json as _json
+            r.set(MIGRATION_PROGRESS_KEY, _json.dumps(stats, default=str), ex=86400)
+        except Exception:
+            pass
+
+    def _process_page(page_orders: list[dict], page_num: int):
+        stats["orders_fetched"] += len(page_orders)
+        for o in page_orders:
+            try:
+                result = process_order_phase1(o, settings, allow_update=False, is_historical=True)
+                stats["processed"] += 1
+                st = result.get("status", "")
+                if st in ("created", "updated"):
+                    stats["created"] += 1
+                elif st == "error":
+                    stats["errors"] += 1
+                    if len(stats["error_details"]) < 50:
+                        stats["error_details"].append({
+                            "woo_order_id": result.get("woo_order_id"),
+                            "reason": result.get("reason", ""),
+                        })
+                else:
+                    stats["skipped"] += 1
+            except Exception as exc:
+                stats["processed"] += 1
+                stats["errors"] += 1
+                wid = o.get("id")
+                frappe.log_error(f"Migration error order {wid}: {exc}", "Historical Migration")
+                if len(stats["error_details"]) < 50:
+                    stats["error_details"].append({"woo_order_id": wid, "reason": str(exc)[:200]})
+
+        stats["pages_processed"] = page_num
+
+        # Commit + cleanup after every page
+        try:
+            frappe.db.commit()
+        except Exception:
+            pass
+        try:
+            frappe.clear_cache()
+            gc.collect()
+        except Exception:
+            pass
+        _save_progress()
+
+    # Process first page (already fetched)
+    _process_page(orders, 1)
+
+    # Remaining pages
+    for page in range(2, (total_pages or 1) + 1):
+        base_params["page"] = page
+        try:
+            page_orders, _, _ = client.list_orders_with_meta(params=base_params)
+        except Exception as fetch_err:
+            frappe.log_error(f"Migration fetch error page {page}: {fetch_err}", "Historical Migration")
+            stats["errors"] += 1
+            continue
+        if not page_orders:
+            break
+        _process_page(page_orders, page)
+
+        # Brief pause every 10 pages to avoid overwhelming the server
+        if page % 10 == 0:
+            _time.sleep(1)
+            frappe.logger().info(
+                f"Migration checkpoint: page {page}/{total_pages}, "
+                f"created={stats['created']}, skipped={stats['skipped']}, errors={stats['errors']}"
+            )
+
+    stats["finished_at"] = frappe.utils.now_datetime().isoformat()
+    stats["running"] = False
+    _save_progress()
+
+    frappe.logger().info({"event": "woo_full_historical_migration_complete", "stats": stats})
+    return stats
+
+
+def get_migration_progress() -> dict:
+    """Read current migration progress from Redis."""
+    try:
+        from frappe.utils.background_jobs import get_redis_conn
+        import json as _json
+        r = get_redis_conn()
+        raw = r.get(MIGRATION_PROGRESS_KEY)
+        if raw:
+            return _json.loads(raw)
+    except Exception:
+        pass
+    return {"running": False, "message": "No migration in progress or data expired."}
 
 
 def debug_dump_invoice_items(inv_name: str):  # pragma: no cover - temporary debug helper

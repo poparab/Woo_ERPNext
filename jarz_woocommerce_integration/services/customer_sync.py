@@ -355,6 +355,14 @@ def _resolve_territory_from_state(state_value: str | None) -> str | None:
     for terr in territories:
         if terr.territory_name and terr.territory_name.lower() == state_lower:
             return terr.name
+
+    # Final fallback: use global default territory if configured
+    try:
+        default_territory = frappe.defaults.get_global_default("territory")
+        if default_territory and frappe.db.exists("Territory", default_territory):
+            return default_territory
+    except Exception:
+        pass
     
     return None
 
@@ -458,6 +466,23 @@ def _format_datetime_for_woo(dt: datetime) -> str:
 
 def _extract_customer_created_ts(cust: Dict[str, Any]) -> datetime | None:
     for key in ("date_created_gmt", "date_created"):
+        raw = cust.get(key)
+        if not raw:
+            continue
+        try:
+            dt_val = get_datetime(raw)
+            if dt_val is None:
+                continue
+            if dt_val.tzinfo is None:
+                dt_val = dt_val.replace(tzinfo=timezone.utc)
+            return dt_val.astimezone(timezone.utc)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _extract_customer_modified_ts(cust: Dict[str, Any]) -> datetime | None:
+    for key in ("date_modified_gmt", "date_modified", "date_created_gmt", "date_created"):
         raw = cust.get(key)
         if not raw:
             continue
@@ -588,9 +613,17 @@ def sync_recent_customers(per_page: int = 50, max_pages: int | None = 5) -> Dict
         params = {
             "per_page": per_page,
             "page": page,
+            "orderby": "modified",
+            "order": "asc",
         }
         if since_dt:
-            params["after"] = _format_datetime_for_woo(since_dt)
+            from datetime import timedelta
+
+            lookback = since_dt - timedelta(seconds=1)
+            iso_since = _format_datetime_for_woo(lookback)
+            params["after"] = iso_since
+            # modified_after is available on WooCommerce REST customers (v3+)
+            params["modified_after"] = iso_since
 
         data = client.list_customers(params=params)
         if not data:
@@ -614,9 +647,9 @@ def sync_recent_customers(per_page: int = 50, max_pages: int | None = 5) -> Dict
                 frappe.db.rollback()
                 continue
 
-            created_ts = _extract_customer_created_ts(cust)
-            if created_ts and (latest_seen is None or created_ts > latest_seen):
-                latest_seen = created_ts
+            modified_ts = _extract_customer_modified_ts(cust)
+            if modified_ts and (latest_seen is None or modified_ts > latest_seen):
+                latest_seen = modified_ts
 
         if len(data) < per_page:
             break

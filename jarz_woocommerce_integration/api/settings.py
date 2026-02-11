@@ -1,6 +1,11 @@
 import frappe
 from frappe import _
-from jarz_woocommerce_integration.utils.http_client import WooClient, WooAPIError
+from frappe.utils.password import get_decrypted_password
+
+from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
+    WooCommerceSettings,
+)
+from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient
 
 
 @frappe.whitelist(allow_guest=False)
@@ -53,3 +58,20 @@ def test_connection(base_url: str | None = None, consumer_key: str | None = None
             "theme": status.get("active_theme", {}).get("name"),
         },
     }
+
+
+@frappe.whitelist(allow_guest=False)
+def test_saved_connection():
+    """Test WooCommerce connectivity using credentials stored in WooCommerce Settings."""
+
+    settings = WooCommerceSettings.get_settings()
+    secret = get_decrypted_password("WooCommerce Settings", settings.name, "consumer_secret")
+    if not (getattr(settings, "base_url", None) and getattr(settings, "consumer_key", None) and secret):
+        frappe.throw(_("WooCommerce Settings are missing base_url, consumer_key, or consumer_secret"))
+
+    return test_connection(
+        base_url=settings.base_url,
+        consumer_key=settings.consumer_key,
+        consumer_secret=secret,
+        api_version=getattr(settings, "api_version", "v3") or "v3",
+    )

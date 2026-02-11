@@ -24,7 +24,7 @@ class WooClient:
     consumer_key: str
     consumer_secret: str
     api_version: str = "v3"
-    timeout: int = 30
+    timeout: int = 60
 
     def _build_url(self, resource: str) -> str:
         resource = resource.lstrip("/")
@@ -48,6 +48,23 @@ class WooClient:
             return {}
         except json.JSONDecodeError as exc:  # noqa: PERF203
             raise WooAPIError(response.status_code, url, f"Invalid JSON response: {exc}") from exc
+
+    def _request_raw(self, method: str, resource: str, *, params: dict | None = None, data: dict | None = None) -> tuple[dict | list, dict]:
+        """Like _request but returns (parsed_body, response_headers) tuple."""
+        url = self._build_url(resource)
+        auth = HTTPBasicAuth(self.consumer_key, self.consumer_secret)
+        response = requests.request(method.upper(), url, params=params, json=data, auth=auth, timeout=self.timeout)
+        if response.status_code >= 400:
+            try:
+                payload = response.json()
+            except Exception:  # noqa: BLE001
+                payload = {"message": response.text[:500]}
+            raise WooAPIError(response.status_code, url, payload.get("message") or "HTTP error", payload)
+        try:
+            body = response.json() if response.text else {}
+        except json.JSONDecodeError as exc:
+            raise WooAPIError(response.status_code, url, f"Invalid JSON response: {exc}") from exc
+        return body, dict(response.headers)
 
     def get(self, resource: str, params: dict | None = None) -> dict:
         return self._request("GET", resource, params=params)
@@ -78,6 +95,21 @@ class WooClient:
                 query["per_page"] = per_page
         data = self.get("orders", params=query)
         return data if isinstance(data, list) else []
+
+    def list_orders_with_meta(self, params: dict | None = None) -> tuple[list[dict], int, int]:
+        """List orders and return (orders, total_count, total_pages) from WP headers."""
+        query = (params or {}).copy()
+        body, headers = self._request_raw("GET", "orders", params=query)
+        orders = body if isinstance(body, list) else []
+        try:
+            total_count = int(headers.get("X-WP-Total", 0))
+        except (ValueError, TypeError):
+            total_count = 0
+        try:
+            total_pages = int(headers.get("X-WP-TotalPages", 0))
+        except (ValueError, TypeError):
+            total_pages = 0
+        return orders, total_count, total_pages
 
     def get_order(self, order_id: int | str) -> dict | None:
         try:

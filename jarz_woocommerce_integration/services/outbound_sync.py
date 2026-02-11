@@ -23,6 +23,20 @@ from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClien
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
 
 
+def _normalize_outbound_status(status: str | None) -> str:
+    """Normalize outbound status values to the allowed title-case options."""
+    if not status:
+        return ""
+    normalized = str(status).strip().lower()
+    mapping = {
+        "pending": "Pending",
+        "synced": "Synced",
+        "error": "Error",
+        "skipped": "Skipped",
+    }
+    return mapping.get(normalized, status)
+
+
 class MissingWooProductError(Exception):
     """Raised when invoice items lack WooCommerce product mappings."""
 
@@ -113,6 +127,32 @@ def _get_address_payload(address_name: str | None, *, fallback_name: str, phone:
     }
 
 
+def _get_any_address_for_customer(customer_name: str) -> dict:
+    """Fetch first available Address linked to a customer as a generic fallback."""
+    try:
+        link = frappe.get_all(
+            "Dynamic Link",
+            filters={"link_doctype": "Customer", "link_name": customer_name, "parenttype": "Address"},
+            fields=["parent"],
+            limit=1,
+        )
+        if not link:
+            return {}
+        addr = frappe.get_doc("Address", link[0].parent)
+        return {
+            "address_1": addr.address_line1 or "",
+            "address_2": addr.address_line2 or "",
+            "city": addr.city or "",
+            "state": addr.state or "",
+            "postcode": addr.pincode or "",
+            "country": addr.country or "",
+            "phone": addr.phone or "",
+            "email": addr.email_id or "",
+        }
+    except Exception:
+        return {}
+
+
 # ---------------------------------------------------------------------------
 # Customer outbound sync
 # ---------------------------------------------------------------------------
@@ -138,7 +178,7 @@ def enqueue_customer_sync(customer: frappe.model.document.Document | str, method
 
 def _mark_customer_status(customer_name: str, *, status: str, error: str | None = None) -> None:
     updates = {
-        "woo_outbound_status": status,
+        "woo_outbound_status": _normalize_outbound_status(status),
         "woo_outbound_synced_on": now_datetime(),
     }
     if error:
@@ -152,7 +192,25 @@ def _build_customer_payload(customer: frappe.model.document.Document, *, include
     # Mobile number is mandatory for WooCommerce
     phone_val = (getattr(customer, "mobile_no", "") or getattr(customer, "phone", "") or "").strip()
     if not phone_val:
-        raise ValueError("Customer mobile number is required for WooCommerce sync")
+        # Try pulling phone from linked addresses
+        addr_candidates = [getattr(customer, "customer_primary_address", None), getattr(customer, "customer_shipping_address", None)]
+        for addr_name in addr_candidates:
+            if not addr_name:
+                continue
+            addr_phone = frappe.db.get_value("Address", addr_name, "phone")
+            if addr_phone:
+                phone_val = addr_phone.strip()
+                break
+    if not phone_val:
+        fallback_addr = _get_any_address_for_customer(customer.name)
+        phone_val = (fallback_addr.get("phone") or "").strip() if fallback_addr else ""
+    if not phone_val:
+        phone_val = "0000000000"
+        LOGGER.warning({
+            "event": "woo_outbound_customer_missing_phone_placeholder",
+            "customer": customer.name,
+            "message": "No phone found; using placeholder 0000000000",
+        })
     
     email = (getattr(customer, "email_id", "") or "").strip()
     if not email:
@@ -198,6 +256,25 @@ def _build_customer_payload(customer: frappe.model.document.Document, *, include
     # Always include phone in billing and shipping
     payload.setdefault("billing", {})["phone"] = phone_val
     payload.setdefault("shipping", {})["phone"] = phone_val
+
+    # Fallback: if both billing/shipping lack address lines, try any linked address
+    billing_line1 = (payload.get("billing", {}).get("address_1") or "").strip()
+    shipping_line1 = (payload.get("shipping", {}).get("address_1") or "").strip()
+    if not billing_line1 and not shipping_line1:
+        fallback_addr = _get_any_address_for_customer(customer.name)
+        if fallback_addr:
+            payload["billing"] = {**payload.get("billing", {}), **fallback_addr}
+            payload["shipping"] = {**payload.get("shipping", {}), **fallback_addr}
+            billing_line1 = fallback_addr.get("address_1", "").strip()
+            shipping_line1 = fallback_addr.get("address_1", "").strip()
+
+    if not billing_line1 and not shipping_line1:
+        LOGGER.error({
+            "event": "woo_outbound_customer_missing_address",
+            "customer": customer.name,
+            "message": "Customer has no billing or shipping address",
+        })
+        raise ValueError("Customer has no billing or shipping address for WooCommerce")
     
     # Only include password for NEW customer creation
     if include_password:
@@ -230,7 +307,7 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
     is_new_customer = not woo_id
     
     try:
-        payload = _build_customer_payload(customer, include_password=is_new_customer, include_username=is_new_customer)
+        payload = _build_customer_payload(customer, include_password=True, include_username=is_new_customer)
     except ValueError as exc:
         LOGGER.warning({
             "event": "woo_outbound_customer_skipped",
@@ -281,7 +358,7 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
                     frappe.db.set_value("Customer", customer_name, "woo_customer_id", str(woo_customer_id), update_modified=False)
                     frappe.db.commit()
                     # Rebuild payload for UPDATE (no password, no username)
-                    update_payload = _build_customer_payload(customer, include_password=False, include_username=False)
+                    update_payload = _build_customer_payload(customer, include_password=True, include_username=False)
                     # Retry with UPDATE
                     response = client.put(f"customers/{woo_customer_id}", update_payload)
                 else:
@@ -312,14 +389,14 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
             customer_name,
             {
                 "woo_customer_id": str(woo_customer_id),
-                "woo_outbound_status": "synced",
+                "woo_outbound_status": "Synced",
                 "woo_outbound_error": "",
                 "woo_outbound_synced_on": now_datetime(),
             },
             update_modified=False,
         )
     else:
-        _mark_customer_status(customer_name, status="synced")
+        _mark_customer_status(customer_name, status="Synced")
 
     LOGGER.info({"event": "woo_outbound_customer_synced", "customer": customer_name, "woo_id": woo_customer_id, "reason": reason})
     return {"status": "ok", "woo_customer_id": woo_customer_id}
@@ -352,7 +429,7 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
 
 def _mark_invoice_status(invoice_name: str, *, status: str, error: str | None = None) -> None:
     updates = {
-        "woo_outbound_status": status,
+        "woo_outbound_status": _normalize_outbound_status(status),
         "woo_outbound_synced_on": now_datetime(),
     }
     if error:
@@ -457,9 +534,14 @@ def _map_payment_method(invoice: frappe.model.document.Document, cfg: OutboundCo
 
 
 def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool = False) -> str:
-    if cancel or invoice.docstatus == 2:
-        return "cancelled"
     state = (getattr(invoice, "sales_invoice_state", None) or getattr(invoice, "custom_sales_invoice_state", None) or "").strip().lower()
+
+    if cancel:
+        return "cancelled"
+    if state == "cancelled":
+        return "cancelled"
+    if invoice.docstatus == 2:
+        return "cancelled"
     if state == "delivered":
         return "completed"
     return "processing"
@@ -486,7 +568,12 @@ def _attach_existing_line_ids(line_items: list[dict], existing_line_items: list[
                 break
         if code:
             by_meta.setdefault(code, []).append(existing)
-        key = (existing.get("product_id"), existing.get("variation_id"))
+        
+        pid = existing.get("product_id")
+        vid = existing.get("variation_id")
+        if vid == 0:
+            vid = None
+        key = (pid, vid)
         by_product.setdefault(key, []).append(existing)
 
     mapped: list[dict] = []
@@ -497,7 +584,11 @@ def _attach_existing_line_ids(line_items: list[dict], existing_line_items: list[
         if code and by_meta.get(code):
             match = by_meta[code].pop(0)
         else:
-            key = (entry.get("product_id"), entry.get("variation_id"))
+            pid = entry.get("product_id")
+            vid = entry.get("variation_id")
+            if vid == 0:
+                vid = None
+            key = (pid, vid)
             bucket = by_product.get(key) or []
             if bucket:
                 match = bucket.pop(0)
@@ -534,6 +625,67 @@ def _build_order_payload(
     set_paid = flt(getattr(invoice, "outstanding_amount", 0)) <= 0.01
     woo_status = _determine_status(invoice, cancel=cancel)
 
+    # Prefer invoice addresses for both billing and shipping (order address must populate both)
+    default_email = (
+        (customer_payload.get("billing") or {}).get("email")
+        or (customer_payload.get("shipping") or {}).get("email")
+        or (getattr(customer_doc, "email_id", "") or "").strip()
+    )
+    default_phone = (
+        (customer_payload.get("billing") or {}).get("phone")
+        or (customer_payload.get("shipping") or {}).get("phone")
+        or (getattr(customer_doc, "mobile_no", "") or getattr(customer_doc, "phone", "") or "").strip()
+    )
+
+    billing_address = {}
+    shipping_address = {}
+    invoice_billing_address = getattr(invoice, "customer_address", None)
+    invoice_shipping_address = getattr(invoice, "shipping_address_name", None)
+
+    if invoice_billing_address:
+        billing_address = _get_address_payload(
+            invoice_billing_address,
+            fallback_name=customer_doc.customer_name,
+            phone=default_phone,
+            email=default_email,
+        )
+    if invoice_shipping_address:
+        shipping_address = _get_address_payload(
+            invoice_shipping_address,
+            fallback_name=customer_doc.customer_name,
+            phone=default_phone,
+            email=default_email,
+        )
+
+    # Fallback to customer addresses only if invoice addresses are missing
+    if not billing_address or not billing_address.get("address_1"):
+        billing_address = customer_payload.get("billing") or {}
+    if not shipping_address or not shipping_address.get("address_1"):
+        shipping_address = customer_payload.get("shipping") or customer_payload.get("billing") or {}
+
+    # Ensure both billing and shipping are populated with the order address
+    if billing_address.get("address_1") and not shipping_address.get("address_1"):
+        shipping_address = dict(billing_address)
+    elif shipping_address.get("address_1") and not billing_address.get("address_1"):
+        billing_address = dict(shipping_address)
+
+    if default_phone:
+        billing_address.setdefault("phone", default_phone)
+        shipping_address.setdefault("phone", default_phone)
+    if default_email:
+        billing_address.setdefault("email", default_email)
+        shipping_address.setdefault("email", default_email)
+
+    # Final guardrail: do not push orders without any address
+    if not (billing_address.get("address_1") or shipping_address.get("address_1")):
+        LOGGER.error({
+            "event": "woo_outbound_order_missing_address",
+            "invoice": invoice.name,
+            "customer": invoice.customer,
+            "message": "Cannot push order to WooCommerce without billing or shipping address",
+        })
+        raise ValueError("No billing or shipping address available for Woo order")
+
     payload: dict = {
         "status": woo_status,
         "currency": invoice.currency,
@@ -541,24 +693,82 @@ def _build_order_payload(
         "payment_method_title": payment_title,
         "set_paid": bool(set_paid),
         "line_items": line_items,
-        "billing": customer_payload.get("billing") or {},
-        "shipping": customer_payload.get("shipping") or customer_payload.get("billing") or {},
+        "billing": billing_address,
+        "shipping": shipping_address,
         "meta_data": [
             {"key": "erpnext_sales_invoice", "value": invoice.name},
         ],
     }
+    
+    # Add delivery date and time using WooCommerce Order Delivery Date plugin fields
+    delivery_date = getattr(invoice, "custom_delivery_date", None) or getattr(invoice, "delivery_date", None)
+    delivery_time = getattr(invoice, "custom_delivery_time", None) or getattr(invoice, "delivery_time", None)
+    
+    if delivery_date:
+        from datetime import datetime, time as dt_time
+        import time
+        
+        # Format date for display (e.g., "Friday, November 22, 2025")
+        if isinstance(delivery_date, str):
+            delivery_date_obj = datetime.strptime(delivery_date, "%Y-%m-%d").date()
+        else:
+            delivery_date_obj = delivery_date
+        
+        formatted_date = delivery_date_obj.strftime("%A, %B %d, %Y")
+        
+        # Combine date and time for timestamp
+        if delivery_time:
+            # Parse time if it's a string
+            if isinstance(delivery_time, str):
+                try:
+                    time_obj = datetime.strptime(delivery_time, "%H:%M:%S").time()
+                except ValueError:
+                    try:
+                        time_obj = datetime.strptime(delivery_time, "%H:%M").time()
+                    except ValueError:
+                        time_obj = dt_time(12, 0)  # Default to noon
+            else:
+                time_obj = delivery_time
+            
+            delivery_datetime = datetime.combine(delivery_date_obj, time_obj)
+            time_slot_label = delivery_time if isinstance(delivery_time, str) else time_obj.strftime("%H:%M")
+        else:
+            delivery_datetime = datetime.combine(delivery_date_obj, dt_time(12, 0))
+            time_slot_label = ""
+        
+        # Convert to Unix timestamp
+        timestamp = int(time.mktime(delivery_datetime.timetuple()))
+        
+        # Add WooCommerce Order Delivery Date plugin fields
+        payload["meta_data"].extend([
+            {"key": "_orddd_timestamp", "value": str(timestamp)},
+            {"key": "_orddd_delivery_date", "value": formatted_date},
+            {"key": "Delivery Date", "value": formatted_date},
+        ])
+        
+        if time_slot_label:
+            payload["meta_data"].extend([
+                {"key": "_orddd_time_slot", "value": time_slot_label},
+                {"key": "Time Slot", "value": time_slot_label},
+            ])
+    
     woo_customer_id = getattr(customer_doc, "woo_customer_id", None)
     if woo_customer_id:
         payload["customer_id"] = cint(woo_customer_id)
 
     if shipping_total or cfg.shipping_method_id:
-        payload["shipping_lines"] = [
-            {
-                "method_id": cfg.shipping_method_id or "flat_rate",
-                "method_title": cfg.shipping_method_title or "Shipping",
-                "total": _format_money(shipping_total if shipping_total else 0),
-            }
-        ]
+        shipping_entry: dict = {
+            "method_id": cfg.shipping_method_id or "flat_rate",
+            "method_title": cfg.shipping_method_title or "Shipping",
+            "total": _format_money(shipping_total if shipping_total else 0),
+        }
+        # Attach existing shipping-line ID so WooCommerce updates the line
+        # in-place instead of appending a brand-new one on every PUT.
+        if existing_order:
+            existing_shipping = existing_order.get("shipping_lines") or []
+            if existing_shipping:
+                shipping_entry["id"] = existing_shipping[0].get("id")
+        payload["shipping_lines"] = [shipping_entry]
 
     if missing_products:
         raise MissingWooProductError(
@@ -587,6 +797,12 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
 
     if getattr(invoice.flags, "ignore_woo_outbound", False) or getattr(frappe.flags, "ignore_woo_outbound", False):
         return {"skipped": True, "reason": "inbound"}
+
+    # Permanent guard: invoices that originated from WooCommerce (inbound)
+    # must never be pushed back.  Only inbound sync creates Order Map entries.
+    _woo_id = invoice.get("woo_order_id")
+    if _woo_id and frappe.db.exists("WooCommerce Order Map", {"woo_order_id": _woo_id}):
+        return {"skipped": True, "reason": "inbound_order"}
 
     if invoice.docstatus == 0 and not cancel:
         return {"skipped": True, "reason": "draft"}
@@ -661,7 +877,7 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     woo_id = response.get("id") if isinstance(response, dict) else None
     woo_number = response.get("number") if isinstance(response, dict) else None
     updates = {
-        "woo_outbound_status": "synced",
+        "woo_outbound_status": "Synced",
         "woo_outbound_error": "",
         "woo_outbound_synced_on": now_datetime(),
     }
@@ -699,7 +915,7 @@ def reconcile_outbound_state(batch_limit: int = 100) -> dict:
         )
         error_customers = frappe.get_all(
             "Customer",
-            filters={"woo_outbound_status": "error"},
+            filters={"woo_outbound_status": ["in", ["Error", "error"]]},
             fields=["name"],
             limit=batch_limit,
         )
@@ -718,7 +934,7 @@ def reconcile_outbound_state(batch_limit: int = 100) -> dict:
         )
         error_invoices = frappe.get_all(
             "Sales Invoice",
-            filters={"woo_outbound_status": "error", "docstatus": ("!=", 2)},
+            filters={"woo_outbound_status": ["in", ["Error", "error"]], "docstatus": ("!=", 2)},
             fields=["name"],
             limit=batch_limit,
         )
