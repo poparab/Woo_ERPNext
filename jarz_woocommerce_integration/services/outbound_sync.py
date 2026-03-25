@@ -731,7 +731,7 @@ def _build_order_payload(
                 time_obj = delivery_time
             
             delivery_datetime = datetime.combine(delivery_date_obj, time_obj)
-            time_slot_label = delivery_time if isinstance(delivery_time, str) else time_obj.strftime("%H:%M")
+            time_slot_label = delivery_time if isinstance(delivery_time, str) else time_obj.strftime("%I:%M %p")
         else:
             delivery_datetime = datetime.combine(delivery_date_obj, dt_time(12, 0))
             time_slot_label = ""
