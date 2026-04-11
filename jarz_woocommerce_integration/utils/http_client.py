@@ -18,13 +18,18 @@ class WooAPIError(Exception):
         self.payload = payload or {}
 
 
-@dataclass(slots=True)
+@dataclass
 class WooClient:
     base_url: str
     consumer_key: str
     consumer_secret: str
     api_version: str = "v3"
     timeout: int = 60
+    _session: requests.Session | None = None
+
+    def __post_init__(self):
+        self._session = requests.Session()
+        self._session.auth = HTTPBasicAuth(self.consumer_key, self.consumer_secret)
 
     def _build_url(self, resource: str) -> str:
         resource = resource.lstrip("/")
@@ -34,8 +39,8 @@ class WooClient:
 
     def _request(self, method: str, resource: str, *, params: dict | None = None, data: dict | None = None) -> dict:
         url = self._build_url(resource)
-        auth = HTTPBasicAuth(self.consumer_key, self.consumer_secret)
-        response = requests.request(method.upper(), url, params=params, json=data, auth=auth, timeout=self.timeout)
+        session = self._session or requests
+        response = session.request(method.upper(), url, params=params, json=data, timeout=self.timeout)
         if response.status_code >= 400:
             try:
                 payload = response.json()
@@ -52,8 +57,8 @@ class WooClient:
     def _request_raw(self, method: str, resource: str, *, params: dict | None = None, data: dict | None = None) -> tuple[dict | list, dict]:
         """Like _request but returns (parsed_body, response_headers) tuple."""
         url = self._build_url(resource)
-        auth = HTTPBasicAuth(self.consumer_key, self.consumer_secret)
-        response = requests.request(method.upper(), url, params=params, json=data, auth=auth, timeout=self.timeout)
+        session = self._session or requests
+        response = session.request(method.upper(), url, params=params, json=data, timeout=self.timeout)
         if response.status_code >= 400:
             try:
                 payload = response.json()

@@ -11,6 +11,122 @@ from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_field
 from jarz_woocommerce_integration.services.customer_sync import ensure_customer_with_addresses
 
 
+class MigrationCache:
+    """In-memory lookup caches for historical migration.
+
+    Pre-loads Items, Item Prices, Bundles, and Territory chains so that
+    per-order processing can use dict lookups instead of DB queries.
+    """
+
+    def __init__(self, price_list: str | None = None):
+        self.sku_to_item: dict[str, str] = {}          # item_code → item_code
+        self.woo_pid_to_item: dict[str, str] = {}      # woo_product_id → item_code
+        self.item_prices: dict[tuple[str, str], float] = {}  # (price_list, item_code) → rate
+        self.bundle_map: dict[str, str] = {}            # woo_bundle_id → bundle_code
+        self.territory_chain: dict[str, dict] = {}      # territory → {pos_profile, warehouse, price_list}
+        self.customer_cache: dict[str, str] = {}        # composite key → customer name
+        self.order_map_set: set[int] = set()            # woo_order_ids already mapped
+        self._price_list = price_list
+
+    def load(self):
+        """Pre-load all lookup tables from DB."""
+        self._load_items()
+        self._load_prices()
+        self._load_bundles()
+        self._load_territory_chain()
+        self._load_existing_maps()
+
+    def _load_items(self):
+        rows = frappe.db.sql(
+            "SELECT name, IFNULL(woo_product_id, '') as woo_product_id "
+            "FROM `tabItem` WHERE disabled = 0",
+            as_dict=True,
+        )
+        for r in rows:
+            self.sku_to_item[r.name] = r.name
+            if r.woo_product_id:
+                self.woo_pid_to_item[str(r.woo_product_id).strip()] = r.name
+
+    def _load_prices(self):
+        rows = frappe.db.sql(
+            "SELECT price_list, item_code, price_list_rate FROM `tabItem Price` "
+            "WHERE selling = 1 AND IFNULL(price_list_rate, 0) > 0",
+            as_dict=True,
+        )
+        for r in rows:
+            self.item_prices[(r.price_list, r.item_code)] = float(r.price_list_rate)
+
+    def _load_bundles(self):
+        rows = frappe.db.sql(
+            "SELECT name, woo_bundle_id FROM `tabWoo Jarz Bundle`",
+            as_dict=True,
+        )
+        for r in rows:
+            if r.woo_bundle_id:
+                self.bundle_map[str(r.woo_bundle_id).strip()] = r.name
+
+    def _load_territory_chain(self):
+        territories = frappe.db.sql(
+            "SELECT name, IFNULL(pos_profile, '') as pos_profile, "
+            "IFNULL(delivery_income, 0) as delivery_income "
+            "FROM `tabTerritory`",
+            as_dict=True,
+        )
+        pos_profiles = {}
+        pp_rows = frappe.db.sql(
+            "SELECT name, IFNULL(warehouse, '') as warehouse, "
+            "IFNULL(price_list, '') as price_list "
+            "FROM `tabPOS Profile`",
+            as_dict=True,
+        )
+        for p in pp_rows:
+            pos_profiles[p.name] = {"warehouse": p.warehouse, "price_list": p.price_list}
+
+        for t in territories:
+            pp = t.pos_profile
+            pp_data = pos_profiles.get(pp, {}) if pp else {}
+            self.territory_chain[t.name] = {
+                "pos_profile": pp or None,
+                "warehouse": pp_data.get("warehouse") or None,
+                "price_list": pp_data.get("price_list") or None,
+                "delivery_income": float(t.delivery_income or 0),
+            }
+
+    def _load_existing_maps(self):
+        rows = frappe.db.sql(
+            "SELECT woo_order_id FROM `tabWooCommerce Order Map` "
+            "WHERE IFNULL(erpnext_sales_invoice, '') != ''",
+            as_dict=True,
+        )
+        for r in rows:
+            if r.woo_order_id:
+                self.order_map_set.add(int(r.woo_order_id))
+
+    def resolve_item(self, sku: str, product_id) -> str | None:
+        """Resolve a Woo line item to an ERPNext item_code via cache."""
+        if sku and sku in self.sku_to_item:
+            return self.sku_to_item[sku]
+        if product_id:
+            return self.woo_pid_to_item.get(str(product_id).strip())
+        return None
+
+    def get_price(self, item_code: str, price_list: str | None = None) -> float | None:
+        pl = price_list or self._price_list
+        if pl:
+            return self.item_prices.get((pl, item_code))
+        return None
+
+    def get_bundle_code(self, product_id) -> str | None:
+        if product_id:
+            return self.bundle_map.get(str(product_id).strip())
+        return None
+
+    def get_territory_data(self, territory_name: str | None) -> dict:
+        if not territory_name:
+            return {}
+        return self.territory_chain.get(territory_name, {})
+
+
 def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str, Any]:
     """Map Woo status to ERPNext docstatus and custom state.
     
@@ -128,6 +244,7 @@ def _build_bundle_selections(
     line_items: list[dict],
     parent_product_id: int | str,
     parent_qty: int,
+    cache: "MigrationCache | None" = None,
 ) -> dict:
     """Parse WooCommerce child line items to build *selected_items* for BundleProcessor.
 
@@ -170,12 +287,15 @@ def _build_bundle_selections(
 
         # Resolve to ERPNext Item code
         wc_item_code = None
-        if wc_sku and frappe.db.exists("Item", wc_sku):
-            wc_item_code = wc_sku
-        elif wc_product_id:
-            wc_item_code = frappe.db.get_value(
-                "Item", {"woo_product_id": str(wc_product_id)}, "name"
-            )
+        if cache:
+            wc_item_code = cache.resolve_item(wc_sku, wc_product_id)
+        else:
+            if wc_sku and frappe.db.exists("Item", wc_sku):
+                wc_item_code = wc_sku
+            elif wc_product_id:
+                wc_item_code = frappe.db.get_value(
+                    "Item", {"woo_product_id": str(wc_product_id)}, "name"
+                )
 
         if not wc_item_code:
             frappe.logger().warning(
@@ -219,7 +339,7 @@ def _build_bundle_selections(
     return selected_items
 
 
-def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[list[dict], list[dict]]:
+def _build_invoice_items(order: dict, price_list: str | None = None, cache: "MigrationCache | None" = None) -> Tuple[list[dict], list[dict]]:
     """Build Sales Invoice Item rows from Woo order line_items.
 
         Pricing policy:
@@ -264,17 +384,20 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         # 1) Prefer Woo Jarz Bundle expansion for bundle parents (even if woosb children exist)
         bundle_code = None
         if product_id:
-            try:
-                bundle_code = frappe.db.get_value("Woo Jarz Bundle", {"woo_bundle_id": str(product_id)}, "name")
-            except Exception:
-                bundle_code = None
+            if cache:
+                bundle_code = cache.get_bundle_code(product_id)
+            else:
+                try:
+                    bundle_code = frappe.db.get_value("Woo Jarz Bundle", {"woo_bundle_id": str(product_id)}, "name")
+                except Exception:
+                    bundle_code = None
         if bundle_code and (str(product_id) in child_parent_ids or not has_woosb_children):
             try:
                 # Import locally to avoid hard dependency at module import time
                 from jarz_woocommerce_integration.services.bundle_processing import BundleProcessor  # type: ignore
 
                 # --- Build selected_items from WooCommerce child line items ---
-                selected_items = _build_bundle_selections(line_items, product_id, int(qty))
+                selected_items = _build_bundle_selections(line_items, product_id, int(qty), cache=cache)
 
                 try:
                     bp = BundleProcessor(bundle_code, int(qty), selected_items=selected_items)
@@ -337,10 +460,13 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
 
         # 3) Fall back to direct Item by SKU or woo_product_id (ERPNext pricing only) - for regular items
         item_code = None
-        if sku and frappe.db.exists("Item", sku):
-            item_code = sku
-        elif product_id:
-            item_code = frappe.db.get_value("Item", {"woo_product_id": str(product_id)}, "name")
+        if cache:
+            item_code = cache.resolve_item(sku, product_id)
+        else:
+            if sku and frappe.db.exists("Item", sku):
+                item_code = sku
+            elif product_id:
+                item_code = frappe.db.get_value("Item", {"woo_product_id": str(product_id)}, "name")
         if not item_code:
             # If this is a woosb parent and has no mapped Item, don't fail the whole order.
             # We'll still apply parent's discount to children; parent line is skipped silently.
@@ -351,11 +477,14 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
 
         # ERPNext pricing: fetch Item Price for the selected price_list
         erp_price = None
-        try:
-            if price_list:
-                erp_price = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": price_list}, "price_list_rate")
-        except Exception:
-            erp_price = None
+        if cache:
+            erp_price = cache.get_price(item_code, price_list)
+        else:
+            try:
+                if price_list:
+                    erp_price = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": price_list}, "price_list_rate")
+            except Exception:
+                erp_price = None
 
         rate_value = float(erp_price or 0) if erp_price is not None else 0
         if rate_value == 0:
@@ -538,7 +667,7 @@ def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_meth
         return None
 
 
-def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False) -> dict:
+def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None) -> dict:
     """Process a single Woo order into a Sales Invoice.
     
     Args:
@@ -546,28 +675,35 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         settings: WooCommerce Settings singleton
         allow_update: Whether to update existing invoices
         is_historical: True for historical migration (paid invoices), False for live orders (unpaid)
+        cache: Optional MigrationCache for fast lookups during historical migration
     """
     woo_id = order.get("id")
 
-    # Prevent duplicate work when webhook and poller race on the same order
-    lock = None
-    try:
-        lock = get_redis_conn().lock(f"woo-order-lock-{woo_id}", timeout=120, blocking_timeout=1)
-        if not lock.acquire(blocking=False):
-            return {"status": "skipped", "reason": "locked", "woo_order_id": woo_id}
-    except Exception:
-        lock = None
+    # Fast-skip via cache: if this order is already mapped to an invoice, skip immediately
+    if cache and not allow_update and woo_id and int(woo_id) in cache.order_map_set:
+        return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
 
-    # DB-level advisory lock as a second guard (handles multi-worker races)
+    # Prevent duplicate work when webhook and poller race on the same order
+    # Skip locks during historical migration (single worker, no races)
+    lock = None
     db_lock_key = f"woo-order-{woo_id}"
     db_lock_acquired = False
-    try:
-        res = frappe.db.sql("SELECT GET_LOCK(%s, 2)", (db_lock_key,))
-        db_lock_acquired = bool(res and res[0] and res[0][0] == 1)
-        if not db_lock_acquired:
-            return {"status": "skipped", "reason": "db_locked", "woo_order_id": woo_id}
-    except Exception:
-        db_lock_acquired = False
+    if not (is_historical and cache):
+        try:
+            lock = get_redis_conn().lock(f"woo-order-lock-{woo_id}", timeout=120, blocking_timeout=1)
+            if not lock.acquire(blocking=False):
+                return {"status": "skipped", "reason": "locked", "woo_order_id": woo_id}
+        except Exception:
+            lock = None
+
+        # DB-level advisory lock as a second guard (handles multi-worker races)
+        try:
+            res = frappe.db.sql("SELECT GET_LOCK(%s, 2)", (db_lock_key,))
+            db_lock_acquired = bool(res and res[0] and res[0][0] == 1)
+            if not db_lock_acquired:
+                return {"status": "skipped", "reason": "db_locked", "woo_order_id": woo_id}
+        except Exception:
+            db_lock_acquired = False
 
     # Determine mapping link field name based on actual DB schema
     LINK_FIELD = "erpnext_sales_invoice"
@@ -679,7 +815,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
 
     # Ensure customer and at least one address before proceeding
     try:
-        customer, billing_addr, shipping_addr = ensure_customer_with_addresses(order, settings)
+        customer, billing_addr, shipping_addr = ensure_customer_with_addresses(
+            order, settings, customer_cache=cache.customer_cache if cache else None,
+        )
     except ValueError as ve:
         reason = str(ve)
         if reason == "no_address":
@@ -694,7 +832,11 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     default_warehouse = None
     try:
         territory_name = frappe.db.get_value("Customer", customer, "territory")
-        if territory_name:
+        if cache and territory_name:
+            td = cache.get_territory_data(territory_name)
+            pos_profile = td.get("pos_profile")
+            default_warehouse = td.get("warehouse")
+        elif territory_name:
             pos_profile = frappe.db.get_value("Territory", territory_name, "pos_profile")
             if pos_profile:
                 default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse")
@@ -707,7 +849,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     price_list = None
     try:
         # Prefer POS Profile's price list; else company default selling price list
-        if pos_profile:
+        if cache and territory_name:
+            td = cache.get_territory_data(territory_name)
+            price_list = td.get("price_list")
+        elif pos_profile:
             price_list = frappe.db.get_value("POS Profile", pos_profile, "price_list")
         if not price_list:
             default_company = getattr(settings, "default_company", None) or frappe.defaults.get_global_default("company")
@@ -716,7 +861,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except Exception:
         price_list = None
 
-    lines, missing = _build_invoice_items(order, price_list=price_list)
+    lines, missing = _build_invoice_items(order, price_list=price_list, cache=cache)
     if missing:
         return {"status": "skipped", "reason": "unmapped_items", "details": missing, "woo_order_id": woo_id}
     if not lines:
@@ -852,9 +997,14 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 try:
                     delivery_amt = woo_shipping_total
                     delivery_desc = "Shipping Income (WooCommerce)"
-                    if not delivery_amt and territory_name and frappe.db.exists("Territory", territory_name):
-                        delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
-                        delivery_desc = f"Shipping Income ({territory_name})"
+                    if not delivery_amt and territory_name:
+                        if cache:
+                            td = cache.get_territory_data(territory_name)
+                            delivery_amt = td.get("delivery_income", 0)
+                        elif frappe.db.exists("Territory", territory_name):
+                            delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
+                        if delivery_amt:
+                            delivery_desc = f"Shipping Income ({territory_name})"
                     if delivery_amt and delivery_amt > 0:
                         add_delivery_charges_to_taxes(inv, delivery_amt, delivery_description=delivery_desc)
                 except Exception:
@@ -933,12 +1083,18 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 pass
             # Apply delivery charges: prefer WooCommerce shipping_total, fall back to territory
             try:
-                territory_name = frappe.db.get_value("Customer", customer, "territory")
+                if not territory_name:
+                    territory_name = frappe.db.get_value("Customer", customer, "territory")
                 delivery_amt = woo_shipping_total
                 delivery_desc = "Shipping Income (WooCommerce)"
-                if not delivery_amt and territory_name and frappe.db.exists("Territory", territory_name):
-                    delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
-                    delivery_desc = f"Shipping Income ({territory_name})"
+                if not delivery_amt and territory_name:
+                    if cache:
+                        td = cache.get_territory_data(territory_name)
+                        delivery_amt = td.get("delivery_income", 0)
+                    elif frappe.db.exists("Territory", territory_name):
+                        delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
+                    if delivery_amt:
+                        delivery_desc = f"Shipping Income ({territory_name})"
                 if delivery_amt and delivery_amt > 0:
                     add_delivery_charges_to_taxes(inv, delivery_amt, delivery_description=delivery_desc)
             except Exception:
@@ -1293,7 +1449,7 @@ MIGRATION_PROGRESS_KEY = "woo_historical_migration_progress"
 def _run_full_historical_migration(
     date_from: str | None = None,
     date_to: str | None = None,
-    batch_size: int = 50,
+    batch_size: int = 100,
     statuses: str = "any",
 ) -> dict:
     """Paginated migration of ALL WooCommerce orders into ERPNext.
@@ -1317,6 +1473,15 @@ def _run_full_historical_migration(
         base_url=settings.base_url,
         consumer_key=settings.consumer_key,
         consumer_secret=settings.get_password("consumer_secret"),
+    )
+
+    # Pre-load all lookup tables into memory for fast dict-based resolution
+    cache = MigrationCache()
+    cache.load()
+    frappe.logger().info(
+        f"MigrationCache loaded: {len(cache.sku_to_item)} items, "
+        f"{len(cache.item_prices)} prices, {len(cache.bundle_map)} bundles, "
+        f"{len(cache.territory_chain)} territories, {len(cache.order_map_set)} existing maps"
     )
 
     # Build base params
@@ -1368,7 +1533,7 @@ def _run_full_historical_migration(
         stats["orders_fetched"] += len(page_orders)
         for o in page_orders:
             try:
-                result = process_order_phase1(o, settings, allow_update=False, is_historical=True)
+                result = process_order_phase1(o, settings, allow_update=False, is_historical=True, cache=cache)
                 stats["processed"] += 1
                 st = result.get("status", "")
                 if st in ("created", "updated"):
@@ -1392,16 +1557,17 @@ def _run_full_historical_migration(
 
         stats["pages_processed"] = page_num
 
-        # Commit + cleanup after every page
+        # Commit after every page
         try:
             frappe.db.commit()
         except Exception:
             pass
-        try:
-            frappe.clear_cache()
-            gc.collect()
-        except Exception:
-            pass
+        # Lightweight GC every 20 pages (frappe.clear_cache removed — too expensive)
+        if page_num % 20 == 0:
+            try:
+                gc.collect()
+            except Exception:
+                pass
         _save_progress()
 
     # Process first page (already fetched)

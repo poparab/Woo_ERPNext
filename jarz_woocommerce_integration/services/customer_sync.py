@@ -24,12 +24,21 @@ def _normalize_name(first: str | None, last: str | None, email: Optional[str] = 
     return "Woo Guest"
 
 
+_field_exists_cache: dict[tuple[str, str], bool] = {}
+
+
 def _field_exists(doctype: str, fieldname: str) -> bool:
+    key = (doctype, fieldname)
+    cached = _field_exists_cache.get(key)
+    if cached is not None:
+        return cached
     try:
         meta = frappe.get_meta(doctype)
-        return bool(meta and meta.get_field(fieldname))
+        result = bool(meta and meta.get_field(fieldname))
     except Exception:
-        return False
+        result = False
+    _field_exists_cache[key] = result
+    return result
 
 
 def _normalize_phone(p: Optional[str]) -> Optional[str]:
@@ -39,7 +48,7 @@ def _normalize_phone(p: Optional[str]) -> Optional[str]:
     return s or None
 
 
-def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None, custom_woo_customer_id: Optional[int] = None) -> str:
+def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None, custom_woo_customer_id: Optional[int] = None, customer_cache: dict | None = None) -> str:
     """Find or create a Customer, preferring uniqueness by username, then phone, then email.
 
     Priority:
@@ -48,49 +57,83 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     3) Customer.email_id == email
     4) Customer.customer_name == normalized name
     On create, set woo_username (if field exists), mobile_no, email_id.
+
+    When *customer_cache* is provided (historical migration), resolved
+    customers are stored there to skip redundant DB lookups.
     """
     phone_norm = _normalize_phone(phone)
+
+    # Fast path: check in-memory cache first (historical migration)
+    if customer_cache is not None:
+        for cache_key in (
+            f"woo_cid:{custom_woo_customer_id}" if custom_woo_customer_id else None,
+            f"user:{username}" if username else None,
+            f"phone:{phone_norm}" if phone_norm else None,
+            f"email:{email}" if email else None,
+        ):
+            if cache_key and cache_key in customer_cache:
+                return customer_cache[cache_key]
 
     # 0) woo_customer_id-based (most reliable, unique WooCommerce identifier)
     if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
         name = frappe.db.get_value("Customer", {"custom_woo_customer_id": custom_woo_customer_id}, "name")
         if name:
             try:
-                cust = frappe.get_doc("Customer", name)
-                changed = False
-                if username and _field_exists("Customer", "woo_username") and not getattr(cust, "woo_username", None):
-                    cust.woo_username = username
-                    changed = True
-                if phone_norm and not getattr(cust, "mobile_no", None):
-                    cust.mobile_no = phone_norm
-                    changed = True
-                if email and not getattr(cust, "email_id", None):
-                    cust.email_id = email
-                    changed = True
-                if changed:
-                    cust.save(ignore_permissions=True)
+                if customer_cache is not None:
+                    # Historical migration: lightweight field-level updates (no hooks)
+                    if username and _field_exists("Customer", "woo_username"):
+                        if not frappe.db.get_value("Customer", name, "woo_username"):
+                            frappe.db.set_value("Customer", name, "woo_username", username, update_modified=False)
+                    if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
+                        frappe.db.set_value("Customer", name, "mobile_no", phone_norm, update_modified=False)
+                    if email and not frappe.db.get_value("Customer", name, "email_id"):
+                        frappe.db.set_value("Customer", name, "email_id", email, update_modified=False)
+                else:
+                    # Live sync: full save() to trigger hooks (outbound push, validations)
+                    cust = frappe.get_doc("Customer", name)
+                    changed = False
+                    if username and _field_exists("Customer", "woo_username") and not getattr(cust, "woo_username", None):
+                        cust.woo_username = username
+                        changed = True
+                    if phone_norm and not getattr(cust, "mobile_no", None):
+                        cust.mobile_no = phone_norm
+                        changed = True
+                    if email and not getattr(cust, "email_id", None):
+                        cust.email_id = email
+                        changed = True
+                    if changed:
+                        cust.save(ignore_permissions=True)
             except Exception:
                 pass
+            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
             return name
 
     # 1) username-based
     if username and _field_exists("Customer", "woo_username"):
         name = frappe.db.get_value("Customer", {"woo_username": username}, "name")
         if name:
-            # ensure phone/email filled if missing
             try:
-                cust = frappe.get_doc("Customer", name)
-                changed = False
-                if phone_norm and not getattr(cust, "mobile_no", None):
-                    cust.mobile_no = phone_norm
-                    changed = True
-                if email and not getattr(cust, "email_id", None):
-                    cust.email_id = email
-                    changed = True
-                if changed:
-                    cust.save(ignore_permissions=True)
+                if customer_cache is not None:
+                    # Historical migration: lightweight field-level updates
+                    if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
+                        frappe.db.set_value("Customer", name, "mobile_no", phone_norm, update_modified=False)
+                    if email and not frappe.db.get_value("Customer", name, "email_id"):
+                        frappe.db.set_value("Customer", name, "email_id", email, update_modified=False)
+                else:
+                    # Live sync: full save() to trigger hooks
+                    cust = frappe.get_doc("Customer", name)
+                    changed = False
+                    if phone_norm and not getattr(cust, "mobile_no", None):
+                        cust.mobile_no = phone_norm
+                        changed = True
+                    if email and not getattr(cust, "email_id", None):
+                        cust.email_id = email
+                        changed = True
+                    if changed:
+                        cust.save(ignore_permissions=True)
             except Exception:
                 pass
+            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
             return name
 
     # 2) phone-based
@@ -99,36 +142,35 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         if not name and _field_exists("Customer", "phone"):
             name = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
         if name:
-            # backfill username if field exists and not set
             if username and _field_exists("Customer", "woo_username"):
                 try:
-                    cur = frappe.get_doc("Customer", name)
-                    if not getattr(cur, "woo_username", None):
-                        cur.db_set("woo_username", username, commit=False)
+                    cur_uname = frappe.db.get_value("Customer", name, "woo_username")
+                    if not cur_uname:
+                        frappe.db.set_value("Customer", name, "woo_username", username, update_modified=False)
                 except Exception:
                     pass
-            # backfill email if missing
             try:
-                cur = frappe.get_doc("Customer", name)
-                if email and not getattr(cur, "email_id", None):
-                    cur.db_set("email_id", email, commit=False)
+                if email:
+                    cur_email = frappe.db.get_value("Customer", name, "email_id")
+                    if not cur_email:
+                        frappe.db.set_value("Customer", name, "email_id", email, update_modified=False)
             except Exception:
                 pass
+            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
             return name
 
     # 3) email-based
     if email:
         name = frappe.db.get_value("Customer", {"email_id": email}, "name")
         if name:
-            # backfill username/phone if missing
             try:
-                cur = frappe.get_doc("Customer", name)
-                if username and _field_exists("Customer", "woo_username") and not getattr(cur, "woo_username", None):
-                    cur.db_set("woo_username", username, commit=False)
-                if phone_norm and not getattr(cur, "mobile_no", None):
-                    cur.db_set("mobile_no", phone_norm, commit=False)
+                if username and _field_exists("Customer", "woo_username") and not frappe.db.get_value("Customer", name, "woo_username"):
+                    frappe.db.set_value("Customer", name, "woo_username", username, update_modified=False)
+                if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
+                    frappe.db.set_value("Customer", name, "mobile_no", phone_norm, update_modified=False)
             except Exception:
                 pass
+            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
             return name
 
     # 4) display name fallback
@@ -146,6 +188,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                 cur.db_set("email_id", email, commit=False)
         except Exception:
             pass
+        _cache_customer(customer_cache, existing_by_name, custom_woo_customer_id, username, phone_norm, email)
         return existing_by_name
 
     # Create new
@@ -164,112 +207,80 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         fields["custom_woo_customer_id"] = custom_woo_customer_id
     doc = frappe.get_doc(fields)
     doc.insert(ignore_permissions=True)
+    _cache_customer(customer_cache, doc.name, custom_woo_customer_id, username, phone_norm, email)
     return doc.name
 
 
+def _cache_customer(cache: dict | None, name: str, woo_cid, username, phone, email):
+    """Store all known keys for a resolved customer into the in-memory cache."""
+    if cache is None:
+        return
+    if woo_cid:
+        cache[f"woo_cid:{woo_cid}"] = name
+    if username:
+        cache[f"user:{username}"] = name
+    if phone:
+        cache[f"phone:{phone}"] = name
+    if email:
+        cache[f"email:{email}"] = name
+
+
 def _find_existing_address_for_customer(customer: str, address_type: str, address_line1: str) -> Optional[str]:
-    # Try to find an Address linked to the customer with same type and line1
-    # Normalize address_line1 for better matching (trim, lowercase for comparison)
-    normalized_search = address_line1.strip().lower()
-    
-    # Get all addresses for this customer with this type
-    address_links = frappe.get_all(
-        "Dynamic Link",
-        filters={
-            "link_doctype": "Customer",
-            "link_name": customer,
-            "parenttype": "Address"
-        },
-        fields=["parent"]
-    )
-    
-    for link in address_links:
-        try:
-            addr = frappe.get_doc("Address", link.parent)
-            if addr.disabled:
-                continue
-            if addr.address_type != address_type:
-                continue
-            # Normalize existing address for comparison
-            existing_line1 = (addr.address_line1 or "").strip().lower()
-            if existing_line1 == normalized_search:
-                return addr.name
-        except Exception:
-            continue
-    
-    return None
+    normalized_search = address_line1.strip()
+    if not normalized_search:
+        return None
+    try:
+        result = frappe.db.sql(
+            """
+            SELECT a.name
+            FROM `tabAddress` a
+            JOIN `tabDynamic Link` dl ON dl.parent = a.name
+            WHERE dl.link_doctype = 'Customer'
+              AND dl.link_name = %s
+              AND dl.parenttype = 'Address'
+              AND a.address_type = %s
+              AND LOWER(TRIM(a.address_line1)) = LOWER(%s)
+              AND IFNULL(a.disabled, 0) = 0
+            LIMIT 1
+            """,
+            (customer, address_type, normalized_search),
+            as_dict=True,
+        )
+        return result[0].name if result else None
+    except Exception:
+        return None
 
 
 def _set_address_as_default(address_name: str, customer: str, address_type: str) -> None:
-    """Set an address as the preferred/default address for a customer.
-    
-    This function:
-    1. Marks the specified address as is_primary_address and/or is_shipping_address
-    2. Unmarks other addresses of the same type for this customer
-    
-    Args:
-        address_name: Name of the address to set as default
-        customer: Customer name
-        address_type: "Billing" or "Shipping"
-    """
+    """Set an address as the preferred/default for a customer using bulk SQL."""
     try:
-        # Get the address to set as default
-        target_addr = frappe.get_doc("Address", address_name)
-        
-        # Determine which field to set based on address type
-        if address_type == "Billing":
-            primary_field = "is_primary_address"
-        elif address_type == "Shipping":
-            primary_field = "is_shipping_address"
-        else:
-            # For other types, set both flags
-            primary_field = "is_primary_address"
-        
-        # Get all addresses for this customer
-        address_links = frappe.get_all(
-            "Dynamic Link",
-            filters={
-                "link_doctype": "Customer",
-                "link_name": customer,
-                "parenttype": "Address"
-            },
-            fields=["parent"]
+        flag_field = "is_primary_address" if address_type == "Billing" else "is_shipping_address"
+
+        # Unmark all same-type addresses for this customer in one UPDATE
+        frappe.db.sql(
+            f"""
+            UPDATE `tabAddress` a
+            JOIN `tabDynamic Link` dl ON dl.parent = a.name
+            SET a.`{flag_field}` = 0
+            WHERE dl.link_doctype = 'Customer'
+              AND dl.link_name = %s
+              AND dl.parenttype = 'Address'
+              AND a.address_type = %s
+              AND a.`{flag_field}` = 1
+              AND a.name != %s
+            """,
+            (customer, address_type, address_name),
         )
-        
-        # Unmark all other addresses of the same type
-        for link in address_links:
-            if link.parent == address_name:
-                continue
-            try:
-                addr = frappe.get_doc("Address", link.parent)
-                if addr.disabled:
-                    continue
-                if addr.address_type != address_type:
-                    continue
-                    
-                # Unmark this address
-                if address_type == "Billing" and getattr(addr, "is_primary_address", 0):
-                    addr.db_set("is_primary_address", 0, commit=False)
-                elif address_type == "Shipping" and getattr(addr, "is_shipping_address", 0):
-                    addr.db_set("is_shipping_address", 0, commit=False)
-            except Exception:
-                continue
-        
-        # Mark the target address as default
-        if address_type == "Billing":
-            if not getattr(target_addr, "is_primary_address", 0):
-                target_addr.db_set("is_primary_address", 1, commit=False)
-        elif address_type == "Shipping":
-            if not getattr(target_addr, "is_shipping_address", 0):
-                target_addr.db_set("is_shipping_address", 1, commit=False)
-        else:
-            # For other types, set both
-            if not getattr(target_addr, "is_primary_address", 0):
-                target_addr.db_set("is_primary_address", 1, commit=False)
-            if not getattr(target_addr, "is_shipping_address", 0):
-                target_addr.db_set("is_shipping_address", 1, commit=False)
-        
-        frappe.logger().info(f"Set address {address_name} as default {address_type} for customer {customer}")
+
+        # Mark the target address
+        frappe.db.sql(
+            f"""
+            UPDATE `tabAddress`
+            SET `{flag_field}` = 1
+            WHERE name = %s AND IFNULL(`{flag_field}`, 0) = 0
+            """,
+            (address_name,),
+        )
     except Exception as e:
         frappe.logger().warning(f"Failed to set address {address_name} as default: {e}")
 
@@ -415,12 +426,15 @@ def _create_address(customer: str, address_type: str, data: dict, phone: str | N
     return addr.name
 
 
-def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | None, str | None]:
+def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict | None = None) -> Tuple[str, str | None, str | None]:
     """Create or get Customer and their Billing/Shipping addresses from Woo order.
 
     Requirements:
     - At least one of billing.address_1 or shipping.address_1 must be non-empty.
     - Email must be present (validated by caller typically).
+
+    Args:
+        customer_cache: Optional dict for caching customer lookups across orders.
 
     Returns: (customer_name, billing_address_name, shipping_address_name)
     Raises: ValueError if no usable address present.
@@ -442,7 +456,7 @@ def ensure_customer_with_addresses(order: dict, settings) -> Tuple[str, str | No
     # Extract WooCommerce customer ID from order for idempotent lookups
     woo_customer_id = order.get("customer_id") if isinstance(order.get("customer_id"), int) and order.get("customer_id") > 0 else None
     
-    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone, custom_woo_customer_id=woo_customer_id)
+    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone, custom_woo_customer_id=woo_customer_id, customer_cache=customer_cache)
 
     billing_addr_name = None
     shipping_addr_name = None
