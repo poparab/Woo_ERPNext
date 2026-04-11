@@ -20,14 +20,20 @@ def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str
                       If False, creates unpaid submitted invoices (live orders)
     """
     s = (woo_status or "").lower()
-    if s in {"completed", "processing"}:
+    if s == "completed":
         if is_historical:
             # Historical: mark as paid (submitted + paid status)
             return {"docstatus": 1, "custom_state": "Completed", "is_paid": True}
         else:
             # Live: mark as submitted but unpaid
             return {"docstatus": 1, "custom_state": "Completed", "is_paid": False}
+    if s == "processing":
+        # Processing = payment received, not shipped yet. Submit but never mark as paid.
+        return {"docstatus": 1, "custom_state": "Processing", "is_paid": False}
     if s in {"cancelled", "refunded", "failed"}:
+        if is_historical:
+            # Historical: keep as Draft to avoid GL entry pollution from submit+cancel cycle
+            return {"docstatus": 0, "custom_state": "Cancelled", "is_paid": False}
         return {"docstatus": 2, "custom_state": "Cancelled", "is_paid": False}
     return {"docstatus": 0, "custom_state": "Draft", "is_paid": False}
 
@@ -351,10 +357,13 @@ def _build_invoice_items(order: dict, price_list: str | None = None) -> Tuple[li
         except Exception:
             erp_price = None
 
+        rate_value = float(erp_price or 0) if erp_price is not None else 0
+        if rate_value == 0:
+            frappe.logger().warning(f"Item {item_code} has zero rate (price_list={price_list}, sku={sku})")
         row = {
             "item_code": item_code,
             "qty": qty,
-            "rate": float(erp_price or 0) if erp_price is not None else 0,
+            "rate": rate_value,
         }
         if erp_price is not None:
             row["price_list_rate"] = float(erp_price)
@@ -588,6 +597,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             existing_map = None
     order_hash = _compute_order_hash(order)
 
+    # Skip if order hasn't changed since last sync (hash match + valid invoice link)
+    if existing_map and existing_map.get("hash") == order_hash and existing_map.get(LINK_FIELD):
+        return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
+
     # Hard idempotency: if a Sales Invoice already exists with this woo_order_id, use it
     linked_invoice_name = None
     duplicate_invoices = []
@@ -613,7 +626,20 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         elif not existing_map.get(LINK_FIELD):
             existing_map[LINK_FIELD] = linked_invoice_name
     if existing_map and not allow_update:
-        return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+        # If map has a linked invoice, genuinely skip (already processed)
+        if existing_map.get(LINK_FIELD):
+            return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+        # Orphan map entry (processing/error without invoice) — clean up and retry
+        map_status = (existing_map.get("status") or "").lower()
+        if map_status in ("processing", "error", ""):
+            try:
+                frappe.delete_doc("WooCommerce Order Map", existing_map["name"], force=1, ignore_permissions=True)
+                frappe.db.commit()
+                existing_map = None
+            except Exception:
+                return {"status": "skipped", "reason": "cleanup_failed", "woo_order_id": woo_id}
+        else:
+            return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
 
     # Concurrency guard: create a processing map to prevent duplicate invoices
     if not existing_map:
@@ -644,6 +670,11 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 return {"status": "skipped", "reason": "processing", "woo_order_id": woo_id}
             # If we cannot confirm, surface the error for logging
             raise map_err
+
+    # Suppress outbound sync hooks while processing inbound WooCommerce data.
+    # Must be set BEFORE customer operations to prevent Customer.on_update from
+    # pushing data back to WooCommerce during migration.
+    frappe.flags.ignore_woo_outbound = True
 
     # Ensure customer and at least one address before proceeding
     try:
@@ -690,6 +721,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     if not lines:
         return {"status": "skipped", "reason": "no_lines", "woo_order_id": woo_id}
 
+    # Extract WooCommerce shipping total (preferred over territory-based delivery income)
+    woo_shipping_total = 0.0
+    try:
+        woo_shipping_total = float(order.get("shipping_total") or 0)
+    except (ValueError, TypeError):
+        pass
+
     # Check payment status for live orders
     woo_status = (order.get("status") or "").lower()
     if not is_historical:
@@ -704,13 +742,6 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     status_map = _map_status(woo_status, is_historical=is_historical)
 
     try:
-        # ── Prevent outbound sync from firing back to WooCommerce ──
-        # When creating/updating invoices from an inbound WooCommerce order we
-        # must suppress the on_submit / on_update_after_submit hooks that would
-        # push the same data right back.  The outbound_sync.sync_sales_invoice
-        # function already checks this flag and returns early.
-        frappe.flags.ignore_woo_outbound = True
-
         delivery_date_val, time_from_val, duration_val = _parse_delivery_parts(order)
         if not (delivery_date_val and time_from_val and (duration_val is not None)):
             delivery_date_val = None
@@ -785,16 +816,15 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                             inv.custom_payment_method = custom_payment_method
                     except Exception:
                         pass
-                # Optional: territory-based delivery income row
+                # Apply delivery charges: prefer WooCommerce shipping_total, fall back to territory
                 try:
-                    if territory_name and frappe.db.exists("Territory", territory_name):
-                        delivery_income = frappe.db.get_value("Territory", territory_name, "delivery_income") or 0
-                        if delivery_income and float(delivery_income) > 0:
-                            add_delivery_charges_to_taxes(
-                                inv,
-                                delivery_income,
-                                delivery_description=f"Shipping Income ({territory_name})",
-                            )
+                    delivery_amt = woo_shipping_total
+                    delivery_desc = "Shipping Income (WooCommerce)"
+                    if not delivery_amt and territory_name and frappe.db.exists("Territory", territory_name):
+                        delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
+                        delivery_desc = f"Shipping Income ({territory_name})"
+                    if delivery_amt and delivery_amt > 0:
+                        add_delivery_charges_to_taxes(inv, delivery_amt, delivery_description=delivery_desc)
                 except Exception:
                     pass
                 inv.save(ignore_permissions=True, ignore_version=True)
@@ -869,16 +899,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         pass
             except Exception:
                 pass
+            # Apply delivery charges: prefer WooCommerce shipping_total, fall back to territory
             try:
                 territory_name = frappe.db.get_value("Customer", customer, "territory")
-                if territory_name and frappe.db.exists("Territory", territory_name):
-                    delivery_income = frappe.db.get_value("Territory", territory_name, "delivery_income") or 0
-                    if delivery_income and float(delivery_income) > 0:
-                        add_delivery_charges_to_taxes(
-                            inv,
-                            delivery_income,
-                            delivery_description=f"Shipping Income ({territory_name})",
-                        )
+                delivery_amt = woo_shipping_total
+                delivery_desc = "Shipping Income (WooCommerce)"
+                if not delivery_amt and territory_name and frappe.db.exists("Territory", territory_name):
+                    delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
+                    delivery_desc = f"Shipping Income ({territory_name})"
+                if delivery_amt and delivery_amt > 0:
+                    add_delivery_charges_to_taxes(inv, delivery_amt, delivery_description=delivery_desc)
             except Exception:
                 pass
             inv.insert(ignore_permissions=True)
@@ -967,6 +997,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         return {"status": action, "invoice": inv.name, "woo_order_id": woo_id}
     except Exception as e:  # noqa: BLE001
         frappe.db.rollback()
+        # Clean up orphan map entry left by the rollback (if committed separately)
+        try:
+            orphan_map = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_id}, "name")
+            if orphan_map:
+                orphan_inv = frappe.db.get_value("WooCommerce Order Map", orphan_map, LINK_FIELD)
+                if not orphan_inv:
+                    frappe.delete_doc("WooCommerce Order Map", orphan_map, force=1, ignore_permissions=True)
+                    frappe.db.commit()
+        except Exception:
+            pass
         return {"status": "error", "reason": str(e), "woo_order_id": woo_id}
     finally:
         # Always clear the outbound-suppression flag

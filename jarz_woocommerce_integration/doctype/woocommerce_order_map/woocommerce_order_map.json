@@ -45,5 +45,5 @@
   "autoname": "WOOMAP-.#####",
   "sort_field": "modified",
   "sort_order": "DESC",
-  "search_fields": "woo_order_id,woo_order_number,sales_invoice,status"
+  "search_fields": "woo_order_id,woo_order_number,erpnext_sales_invoice,status"
 }

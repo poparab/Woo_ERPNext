@@ -51,6 +51,28 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     """
     phone_norm = _normalize_phone(phone)
 
+    # 0) woo_customer_id-based (most reliable, unique WooCommerce identifier)
+    if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
+        name = frappe.db.get_value("Customer", {"custom_woo_customer_id": custom_woo_customer_id}, "name")
+        if name:
+            try:
+                cust = frappe.get_doc("Customer", name)
+                changed = False
+                if username and _field_exists("Customer", "woo_username") and not getattr(cust, "woo_username", None):
+                    cust.woo_username = username
+                    changed = True
+                if phone_norm and not getattr(cust, "mobile_no", None):
+                    cust.mobile_no = phone_norm
+                    changed = True
+                if email and not getattr(cust, "email_id", None):
+                    cust.email_id = email
+                    changed = True
+                if changed:
+                    cust.save(ignore_permissions=True)
+            except Exception:
+                pass
+            return name
+
     # 1) username-based
     if username and _field_exists("Customer", "woo_username"):
         name = frappe.db.get_value("Customer", {"woo_username": username}, "name")

@@ -1,0 +1,47 @@
+{
+  "doctype": "DocType",
+  "name": "WooCommerce Sync Log",
+  "module": "Jarz WooCommerce Integration",
+  "custom": 0,
+  "istable": 0,
+  "editable_grid": 0,
+  "engine": "InnoDB",
+  "quick_entry": 0,
+  "is_tree": 0,
+  "show_preview_popup": 0,
+  "issingle": 0,
+  "is_submittable": 0,
+  "index_web_pages_for_search": 0,
+  "actions": [],
+  "links": [],
+  "field_order": [
+    "operation",
+    "woo_order_id",
+    "status",
+    "message",
+    "traceback",
+    "started_on",
+    "ended_on",
+    "duration"
+  ],
+  "fields": [
+    {"fieldname": "operation", "fieldtype": "Data", "label": "Operation", "reqd": 1, "in_list_view": 1},
+    {"fieldname": "woo_order_id", "fieldtype": "Int", "label": "Woo Order ID", "in_list_view": 1},
+    {"fieldname": "status", "fieldtype": "Data", "label": "Status", "in_list_view": 1},
+    {"fieldname": "message", "fieldtype": "Small Text", "label": "Message"},
+    {"fieldname": "traceback", "fieldtype": "Long Text", "label": "Traceback"},
+    {"fieldname": "started_on", "fieldtype": "Datetime", "label": "Started On", "in_list_view": 1},
+    {"fieldname": "ended_on", "fieldtype": "Datetime", "label": "Ended On"},
+    {"fieldname": "duration", "fieldtype": "Float", "label": "Duration (seconds)"}
+  ],
+  "permissions": [
+    {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "export": 1, "report": 1, "print": 1, "email": 1, "share": 1},
+    {"role": "Administrator", "read": 1, "write": 1, "create": 1, "delete": 1}
+  ],
+  "allow_import": 0,
+  "allow_rename": 0,
+  "autoname": "WOOLOG-.#####",
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "search_fields": "operation,woo_order_id,status"
+}
