@@ -75,7 +75,7 @@ class MigrationCache:
         pos_profiles = {}
         pp_rows = frappe.db.sql(
             "SELECT name, IFNULL(warehouse, '') as warehouse, "
-            "IFNULL(price_list, '') as price_list "
+            "IFNULL(selling_price_list, '') as price_list "
             "FROM `tabPOS Profile`",
             as_dict=True,
         )
@@ -853,7 +853,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             td = cache.get_territory_data(territory_name)
             price_list = td.get("price_list")
         elif pos_profile:
-            price_list = frappe.db.get_value("POS Profile", pos_profile, "price_list")
+            price_list = frappe.db.get_value("POS Profile", pos_profile, "selling_price_list")
         if not price_list:
             default_company = getattr(settings, "default_company", None) or frappe.defaults.get_global_default("company")
             if default_company:
