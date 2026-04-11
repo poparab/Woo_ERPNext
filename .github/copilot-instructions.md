@@ -1,5 +1,7 @@
 # Jarz WooCommerce Integration – Copilot Instructions
 
+> **DOMAIN ISOLATION**: This app (`jarz_woocommerce_integration`) is completely independent from `jarz_pos`. Never import from, reference, or create dependencies on `jarz_pos` in this codebase.
+
 ## Project Overview
 Single ERPNext app located at `apps/jarz_woocommerce_integration`. It ingests WooCommerce data (customers, territories, orders) and creates/upgrades Sales Invoices using bundle logic maintained inside this app.
 
