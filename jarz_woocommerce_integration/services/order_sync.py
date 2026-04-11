@@ -619,12 +619,43 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except Exception:
         pass
 
-    # Reconcile mapping to found invoice if mapping is missing or points elsewhere
+    # Reconcile mapping to found invoice if mapping is missing or points elsewhere.
+    # Persist the recovered link so future re-runs and outbound guards see the
+    # order as inbound even when the invoice existed before the map row.
     if linked_invoice_name:
-        if not existing_map:
-            existing_map = {"name": None, LINK_FIELD: linked_invoice_name, "hash": None}
-        elif not existing_map.get(LINK_FIELD):
-            existing_map[LINK_FIELD] = linked_invoice_name
+        if not existing_map or not existing_map.get(LINK_FIELD):
+            map_values = {
+                "woo_order_id": woo_id,
+                "woo_order_number": order.get("number"),
+                LINK_FIELD: linked_invoice_name,
+                "status": order.get("status"),
+                "currency": order.get("currency"),
+                "total": order.get("total"),
+                "payment_method": order.get("payment_method"),
+                "synced_on": frappe.utils.now_datetime(),
+                "hash": order_hash,
+            }
+            try:
+                if existing_map and existing_map.get("name"):
+                    map_doc = frappe.get_doc("WooCommerce Order Map", existing_map["name"])
+                    map_doc.update(map_values)
+                    map_doc.save(ignore_permissions=True)
+                else:
+                    map_doc = frappe.get_doc({"doctype": "WooCommerce Order Map", **map_values})
+                    map_doc.insert(ignore_permissions=True)
+                existing_map = {
+                    "name": map_doc.name,
+                    LINK_FIELD: linked_invoice_name,
+                    "hash": order_hash,
+                    "status": order.get("status"),
+                }
+            except Exception:
+                if not existing_map:
+                    existing_map = {"name": None, LINK_FIELD: linked_invoice_name, "hash": order_hash, "status": order.get("status")}
+                else:
+                    existing_map[LINK_FIELD] = linked_invoice_name
+                    existing_map["hash"] = order_hash
+                    existing_map["status"] = order.get("status")
     if existing_map and not allow_update:
         # If map has a linked invoice, genuinely skip (already processed)
         if existing_map.get(LINK_FIELD):
@@ -640,36 +671,6 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 return {"status": "skipped", "reason": "cleanup_failed", "woo_order_id": woo_id}
         else:
             return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
-
-    # Concurrency guard: create a processing map to prevent duplicate invoices
-    if not existing_map:
-        try:
-            map_doc = frappe.get_doc({
-                "doctype": "WooCommerce Order Map",
-                "woo_order_id": woo_id,
-                "woo_order_number": order.get("number"),
-                "status": "processing",
-                "synced_on": frappe.utils.now_datetime(),
-            })
-            map_doc.insert(ignore_permissions=True)
-            existing_map = {"name": map_doc.name, LINK_FIELD: None, "hash": None, "status": "processing"}
-        except Exception as map_err:
-            # If a duplicate map already exists, avoid creating another invoice
-            try:
-                existing_map = frappe.db.get_value(
-                    "WooCommerce Order Map",
-                    {"woo_order_id": woo_id},
-                    ["name", LINK_FIELD, "hash", "status"],
-                    as_dict=True,
-                )
-            except Exception:
-                existing_map = None
-            if existing_map and existing_map.get(LINK_FIELD):
-                return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
-            if existing_map and (existing_map.get("status") or "").lower() == "processing":
-                return {"status": "skipped", "reason": "processing", "woo_order_id": woo_id}
-            # If we cannot confirm, surface the error for logging
-            raise map_err
 
     # Suppress outbound sync hooks while processing inbound WooCommerce data.
     # Must be set BEFORE customer operations to prevent Customer.on_update from
@@ -740,6 +741,37 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     custom_payment_method = _map_payment_method(woo_payment_method)
     
     status_map = _map_status(woo_status, is_historical=is_historical)
+
+    # Create the processing map only after deterministic skip conditions pass.
+    # This keeps no_address / no_lines / unmapped_items / pending_payment orders
+    # from leaving behind orphan map rows with no linked invoice.
+    if not existing_map:
+        try:
+            map_doc = frappe.get_doc({
+                "doctype": "WooCommerce Order Map",
+                "woo_order_id": woo_id,
+                "woo_order_number": order.get("number"),
+                "status": "processing",
+                "synced_on": frappe.utils.now_datetime(),
+            })
+            map_doc.insert(ignore_permissions=True)
+            existing_map = {"name": map_doc.name, LINK_FIELD: None, "hash": None, "status": "processing"}
+        except Exception as map_err:
+            # If a duplicate map already exists, avoid creating another invoice.
+            try:
+                existing_map = frappe.db.get_value(
+                    "WooCommerce Order Map",
+                    {"woo_order_id": woo_id},
+                    ["name", LINK_FIELD, "hash", "status"],
+                    as_dict=True,
+                )
+            except Exception:
+                existing_map = None
+            if existing_map and existing_map.get(LINK_FIELD):
+                return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+            if existing_map and (existing_map.get("status") or "").lower() == "processing":
+                return {"status": "skipped", "reason": "processing", "woo_order_id": woo_id}
+            raise map_err
 
     try:
         delivery_date_val, time_from_val, duration_val = _parse_delivery_parts(order)

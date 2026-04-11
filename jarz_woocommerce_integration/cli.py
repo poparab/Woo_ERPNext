@@ -59,3 +59,79 @@ def list_recent_woo_invoices_pos_profile(limit: int = 10):  # pragma: no cover
             "pos_profile": pos_profile,
         })
     return out
+
+
+def backfill_missing_order_maps_cli(limit: int = 0):  # pragma: no cover
+    """Create missing WooCommerce Order Map rows from existing Woo-linked invoices."""
+    import frappe
+
+    link_field = "erpnext_sales_invoice"
+    try:
+        cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
+        if link_field not in cols and "sales_invoice" in cols:
+            link_field = "sales_invoice"
+    except Exception:
+        pass
+
+    invoices = frappe.get_all(
+        "Sales Invoice",
+        filters=[["Sales Invoice", "woo_order_id", "is", "set"]],
+        fields=["name", "woo_order_id", "currency", "grand_total"],
+        order_by="creation desc",
+        page_length=limit or 50000,
+    )
+
+    processed_ids = set()
+    created = 0
+    updated = 0
+    already_present = 0
+    duplicate_invoices_skipped = 0
+    sample = []
+
+    for inv in invoices:
+        woo_order_id = inv.get("woo_order_id")
+        if woo_order_id in processed_ids:
+            duplicate_invoices_skipped += 1
+            continue
+        processed_ids.add(woo_order_id)
+
+        map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_order_id}, "name")
+        if map_name:
+            current_link = frappe.db.get_value("WooCommerce Order Map", map_name, link_field)
+            if current_link:
+                already_present += 1
+                continue
+
+            map_doc = frappe.get_doc("WooCommerce Order Map", map_name)
+            map_doc.update({
+                link_field: inv.get("name"),
+                "currency": inv.get("currency"),
+                "total": inv.get("grand_total"),
+                "synced_on": frappe.utils.now_datetime(),
+            })
+            map_doc.save(ignore_permissions=True)
+            updated += 1
+        else:
+            frappe.get_doc({
+                "doctype": "WooCommerce Order Map",
+                "woo_order_id": int(woo_order_id),
+                link_field: inv.get("name"),
+                "currency": inv.get("currency"),
+                "total": inv.get("grand_total"),
+                "synced_on": frappe.utils.now_datetime(),
+            }).insert(ignore_permissions=True)
+            created += 1
+
+        if len(sample) < 10:
+            sample.append({"invoice": inv.get("name"), "woo_order_id": woo_order_id})
+
+    frappe.db.commit()
+    return {
+        "scanned": len(invoices),
+        "unique_woo_orders": len(processed_ids),
+        "created": created,
+        "updated": updated,
+        "already_present": already_present,
+        "duplicate_invoices_skipped": duplicate_invoices_skipped,
+        "sample": sample,
+    }
