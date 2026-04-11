@@ -1376,24 +1376,3 @@ def get_migration_progress() -> dict:
     except Exception:
         pass
     return {"running": False, "message": "No migration in progress or data expired."}
-
-
-def debug_dump_invoice_items(inv_name: str):  # pragma: no cover - temporary debug helper
-    """Return a simplified list of items (item_code, qty, rate, price_list_rate, amount) for manual verification.
-
-    Usage:
-        bench --site <site> execute jarz_woocommerce_integration.services.order_sync.debug_dump_invoice_items --kwargs '{"inv_name":"ACC-SINV-2025-00621"}'
-    """
-    inv = frappe.get_doc("Sales Invoice", inv_name)
-    out = []
-    for it in inv.items:
-        out.append({
-            "item_code": it.item_code,
-            "qty": float(it.qty),
-            "rate": float(it.rate),
-            "price_list_rate": float(it.price_list_rate) if getattr(it, "price_list_rate", None) else None,
-            "amount": float(it.amount),
-            "discount_percentage": getattr(it, "discount_percentage", None),
-            "discount_amount": getattr(it, "discount_amount", None),
-        })
-    return out
