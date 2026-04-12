@@ -1203,11 +1203,25 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         f"Failed to create payment for {inv.name}: {str(pe_error)}",
                         "Payment Entry Creation Error",
                     )
+                    try:
+                        frappe.get_doc("Sales Invoice", inv.name).add_comment(
+                            "Comment",
+                            f"⚠ Payment Entry creation failed for WooCommerce order {woo_id}: {pe_error}",
+                        )
+                    except Exception:
+                        pass
             else:
                 frappe.log_error(
                     f"Paid Woo invoice {inv.name} has no mapped payment method (woo_method={woo_payment_method})",
                     "Payment Entry Mapping Missing",
                 )
+                try:
+                    frappe.get_doc("Sales Invoice", inv.name).add_comment(
+                        "Comment",
+                        f"⚠ No mapped payment method for WooCommerce order {woo_id} (woo_method={woo_payment_method})",
+                    )
+                except Exception:
+                    pass
 
         try:
             if status_map.get("custom_state"):
@@ -1515,6 +1529,7 @@ def _run_full_historical_migration(
     date_to: str | None = None,
     batch_size: int = 100,
     statuses: str = "any",
+    start_page: int = 1,
 ) -> dict:
     """Paginated migration of ALL WooCommerce orders into ERPNext.
 
@@ -1526,6 +1541,7 @@ def _run_full_historical_migration(
         date_to:   ISO date string (YYYY-MM-DD) – only orders created before this date.
         batch_size: Orders per page (max 100 per WooCommerce API).
         statuses: Comma-separated Woo statuses, or "any" for all.
+        start_page: Page number to start from (for resuming interrupted migrations).
     """
     import gc
     import time as _time
@@ -1562,7 +1578,7 @@ def _run_full_historical_migration(
         base_params["before"] = f"{date_to}T23:59:59"
 
     # First request to learn total counts
-    base_params["page"] = 1
+    base_params["page"] = int(start_page)
     orders, total_count, total_pages = client.list_orders_with_meta(params=base_params)
 
     stats = {
@@ -1575,6 +1591,8 @@ def _run_full_historical_migration(
         "errors": 0,
         "error_details": [],
         "pages_processed": 0,
+        "last_completed_page": 0,
+        "start_page": int(start_page),
         "batch_size": int(batch_size),
         "date_from": date_from,
         "date_to": date_to,
@@ -1620,12 +1638,16 @@ def _run_full_historical_migration(
                     stats["error_details"].append({"woo_order_id": wid, "reason": str(exc)[:200]})
 
         stats["pages_processed"] = page_num
+        stats["last_completed_page"] = page_num
 
         # Commit after every page
         try:
             frappe.db.commit()
-        except Exception:
-            pass
+        except Exception as commit_err:
+            frappe.log_error(
+                f"DB commit failed on page {page_num}: {commit_err}",
+                "Historical Migration Commit",
+            )
         # Lightweight GC every 20 pages (frappe.clear_cache removed — too expensive)
         if page_num % 20 == 0:
             try:
@@ -1635,10 +1657,10 @@ def _run_full_historical_migration(
         _save_progress()
 
     # Process first page (already fetched)
-    _process_page(orders, 1)
+    _process_page(orders, int(start_page))
 
     # Remaining pages
-    for page in range(2, (total_pages or 1) + 1):
+    for page in range(int(start_page) + 1, (total_pages or 1) + 1):
         base_params["page"] = page
         try:
             page_orders, _, _ = client.list_orders_with_meta(params=base_params)
