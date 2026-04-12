@@ -38,14 +38,18 @@ class MigrationCache:
 
     def _load_items(self):
         rows = frappe.db.sql(
-            "SELECT name, IFNULL(woo_product_id, '') as woo_product_id "
+            "SELECT name, IFNULL(item_name, '') as item_name, "
+            "IFNULL(woo_product_id, '') as woo_product_id "
             "FROM `tabItem` WHERE disabled = 0",
             as_dict=True,
         )
+        self.item_name_to_item: dict[str, str] = {}  # lower(item_name) → item_code
         for r in rows:
             self.sku_to_item[r.name] = r.name
             if r.woo_product_id:
                 self.woo_pid_to_item[str(r.woo_product_id).strip()] = r.name
+            if r.item_name:
+                self.item_name_to_item[r.item_name.strip().lower()] = r.name
 
     def _load_prices(self):
         rows = frappe.db.sql(
@@ -109,6 +113,12 @@ class MigrationCache:
         if product_id:
             return self.woo_pid_to_item.get(str(product_id).strip())
         return None
+
+    def resolve_item_by_name(self, item_name: str) -> str | None:
+        """Resolve a Woo line item to an ERPNext item_code by item name (case-insensitive)."""
+        if not item_name:
+            return None
+        return self.item_name_to_item.get(item_name.strip().lower())
 
     def get_price(self, item_code: str, price_list: str | None = None) -> float | None:
         pl = price_list or self._price_list
@@ -339,12 +349,13 @@ def _build_bundle_selections(
     return selected_items
 
 
-def _build_invoice_items(order: dict, price_list: str | None = None, cache: "MigrationCache | None" = None) -> Tuple[list[dict], list[dict]]:
+def _build_invoice_items(order: dict, price_list: str | None = None, cache: "MigrationCache | None" = None, is_historical: bool = False) -> Tuple[list[dict], list[dict]]:
     """Build Sales Invoice Item rows from Woo order line_items.
 
         Pricing policy:
-        - Ignore WooCommerce prices/totals completely.
-        - Use ERPNext Price List rates for normal items (Item Price by price_list).
+        - Live sync: Ignore WooCommerce prices/totals completely.
+          Use ERPNext Price List rates for normal items (Item Price by price_list).
+        - Historical sync: Use WooCommerce line item prices. If zero, fall back to ERPNext Price List rates.
     - Prefer Woo Jarz Bundle expansion for bundles (uses internal pricing from Woo Jarz Bundle),
             even when Woo sends woosb parent/child lines; expand once from the parent and skip
             the related children to avoid duplication.
@@ -458,7 +469,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
         if parent_id_in_meta and str(parent_id_in_meta) in handled_parents:
             continue
 
-        # 3) Fall back to direct Item by SKU or woo_product_id (ERPNext pricing only) - for regular items
+        # 3) Fall back to direct Item by SKU or woo_product_id - for regular items
         item_code = None
         if cache:
             item_code = cache.resolve_item(sku, product_id)
@@ -467,6 +478,22 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
                 item_code = sku
             elif product_id:
                 item_code = frappe.db.get_value("Item", {"woo_product_id": str(product_id)}, "name")
+
+        # 3b) Historical: name-based fallback for product_id=0 legacy bundles
+        if not item_code and is_historical:
+            woo_item_name = (li.get("name") or "").strip()
+            if woo_item_name:
+                if cache:
+                    item_code = cache.resolve_item_by_name(woo_item_name)
+                else:
+                    item_code = frappe.db.get_value(
+                        "Item", {"item_name": woo_item_name, "disabled": 0}, "name"
+                    )
+                if item_code:
+                    frappe.logger().info(
+                        f"Resolved product_id=0 item by name: '{woo_item_name}' → {item_code}"
+                    )
+
         if not item_code:
             # If this is a woosb parent and has no mapped Item, don't fail the whole order.
             # We'll still apply parent's discount to children; parent line is skipped silently.
@@ -475,7 +502,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
             missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id})
             continue
 
-        # ERPNext pricing: fetch Item Price for the selected price_list
+        # Pricing: historical uses Woo prices (fallback to ERPNext), live uses ERPNext only
         erp_price = None
         if cache:
             erp_price = cache.get_price(item_code, price_list)
@@ -486,7 +513,26 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
             except Exception:
                 erp_price = None
 
-        rate_value = float(erp_price or 0) if erp_price is not None else 0
+        if is_historical:
+            # Historical: prefer WooCommerce line item price, fallback to ERPNext
+            woo_price = 0.0
+            try:
+                woo_price = float(li.get("price") or 0)
+            except (ValueError, TypeError):
+                pass
+            if woo_price == 0 and qty > 0:
+                try:
+                    woo_price = float(li.get("subtotal") or 0) / qty
+                except (ValueError, TypeError, ZeroDivisionError):
+                    pass
+            if woo_price > 0:
+                rate_value = woo_price
+            else:
+                rate_value = float(erp_price or 0) if erp_price is not None else 0
+        else:
+            # Live: ERPNext pricing only (unchanged)
+            rate_value = float(erp_price or 0) if erp_price is not None else 0
+
         if rate_value == 0:
             frappe.logger().warning(f"Item {item_code} has zero rate (price_list={price_list}, sku={sku})")
         row = {
@@ -861,7 +907,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except Exception:
         price_list = None
 
-    lines, missing = _build_invoice_items(order, price_list=price_list, cache=cache)
+    lines, missing = _build_invoice_items(order, price_list=price_list, cache=cache, is_historical=is_historical)
     if missing:
         return {"status": "skipped", "reason": "unmapped_items", "details": missing, "woo_order_id": woo_id}
     if not lines:
