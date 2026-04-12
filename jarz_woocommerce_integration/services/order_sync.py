@@ -659,34 +659,47 @@ def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str 
     inv.append("taxes", row)
 
 
-def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_method: str, posting_date: str | None = None) -> str | None:
-    """Create Payment Entry for Kashier payments (kashier_card or kashier_wallet).
-    
-    Args:
-        invoice_name: Sales Invoice name
-        amount: Payment amount
-        payment_method: Either 'kashier_card' or 'kashier_wallet'
-        posting_date: Optional date string (YYYY-MM-DD). Defaults to today.
-    
-    Returns:
-        Payment Entry name if created, None otherwise
-    """
+def _resolve_paid_to_account(payment_method: str | None, company: str) -> str | None:
+    """Return the paid-to account for a mapped Woo payment method."""
+    pm = (payment_method or "").strip()
+    if pm == "Cash":
+        return frappe.db.get_value("Company", company, "default_cash_account")
+    if pm == "Instapay":
+        return frappe.db.get_value("Company", company, "default_bank_account")
+    if pm == "Mobile Wallet":
+        account = frappe.db.get_value(
+            "Mode of Payment Account",
+            {"parent": "Mobile Wallet", "company": company},
+            "default_account",
+        )
+        return account or frappe.db.get_value("Company", company, "default_bank_account")
+    if pm in ("Kashier Card", "Kashier Wallet"):
+        return frappe.db.get_value("Company", company, "custom_kashier_account")
+    return None
+
+
+def _create_payment_entry(invoice_name: str, payment_method: str | None, posting_date: str | None = None) -> str | None:
+    """Create a Payment Entry for the invoice's current outstanding amount."""
     try:
+        frappe.set_user("Administrator")
         inv = frappe.get_doc("Sales Invoice", invoice_name)
-        
-        # Get Kashier account from company
         company = inv.company
-        kashier_account = frappe.db.get_value("Company", company, "custom_kashier_account")
-        
-        if not kashier_account:
+
+        # Use the current outstanding amount so reruns top up partial payments
+        # instead of duplicating the original Woo total.
+        pay_amount = float(inv.outstanding_amount or inv.grand_total or 0)
+        if pay_amount <= 0:
+            return None
+
+        paid_to = _resolve_paid_to_account(payment_method, company)
+        if not paid_to:
             frappe.log_error(
-                f"Kashier account not configured for company {company}",
-                "Kashier Payment Entry Creation Failed"
+                f"No paid-to account resolved for payment_method={payment_method}, company={company}",
+                "Payment Entry Creation Failed",
             )
             return None
-        
+
         pe_date = posting_date or frappe.utils.today()
-        # Create Payment Entry
         pe = frappe.get_doc({
             "doctype": "Payment Entry",
             "payment_type": "Receive",
@@ -694,25 +707,25 @@ def _create_kashier_payment_entry(invoice_name: str, amount: float, payment_meth
             "company": company,
             "party_type": "Customer",
             "party": inv.customer,
-            "paid_to": kashier_account,
-            "paid_amount": amount,
-            "received_amount": amount,
-            "reference_no": f"Kashier-{invoice_name}",
+            "paid_to": paid_to,
+            "paid_amount": pay_amount,
+            "received_amount": pay_amount,
+            "reference_no": f"WOO-{invoice_name}",
             "reference_date": pe_date,
             "references": [{
                 "reference_doctype": "Sales Invoice",
                 "reference_name": invoice_name,
-                "allocated_amount": amount
+                "allocated_amount": pay_amount,
             }]
         })
         pe.insert(ignore_permissions=True)
         pe.submit()
-        
+
         return pe.name
     except Exception as e:
         frappe.log_error(
-            f"Failed to create Kashier payment entry for {invoice_name}: {str(e)}",
-            "Kashier Payment Entry Error"
+            f"Failed to create payment entry for {invoice_name} (method={payment_method}): {str(e)}",
+            "Payment Entry Creation Error",
         )
         return None
 
@@ -1162,44 +1175,45 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         inv.db_set("is_pos", 1, commit=False)
                 except Exception:
                     pass
-
-                if custom_payment_method in ["Kashier Card", "Kashier Wallet"]:
-                    try:
-                        pe_posting_date = _resolve_posting_date(order, is_historical)
-                        payment_entry = _create_kashier_payment_entry(
-                            inv.name,
-                            float(order.get("total") or 0),
-                            custom_payment_method,
-                            posting_date=pe_posting_date,
-                        )
-                        if payment_entry:
-                            frappe.logger().info(
-                                {
-                                    "event": "kashier_payment_entry_created",
-                                    "invoice": inv.name,
-                                    "payment_entry": payment_entry,
-                                }
-                            )
-                    except Exception as pe_error:
-                        frappe.log_error(
-                            f"Failed to create Kashier payment for {inv.name}: {str(pe_error)}",
-                            "Kashier Payment Creation Error",
-                        )
-
-                if status_map.get("is_paid"):
-                    try:
-                        inv.db_set("status", "Paid", commit=False)
-                    except Exception:
-                        pass
             elif status_map["docstatus"] == 2:
                 if inv.docstatus == 0:
                     inv.submit()
                 inv.cancel()
-            try:
-                if status_map.get("custom_state"):
-                    inv.db_set("sales_invoice_state", status_map["custom_state"], commit=True)
-            except Exception:
-                pass
+
+        if inv and inv.docstatus == 1 and status_map.get("is_paid"):
+            if custom_payment_method:
+                try:
+                    pe_posting_date = _resolve_posting_date(order, is_historical)
+                    payment_entry = _create_payment_entry(
+                        inv.name,
+                        custom_payment_method,
+                        posting_date=pe_posting_date,
+                    )
+                    if payment_entry:
+                        frappe.logger().info(
+                            {
+                                "event": "payment_entry_created",
+                                "invoice": inv.name,
+                                "payment_entry": payment_entry,
+                                "method": custom_payment_method,
+                            }
+                        )
+                except Exception as pe_error:
+                    frappe.log_error(
+                        f"Failed to create payment for {inv.name}: {str(pe_error)}",
+                        "Payment Entry Creation Error",
+                    )
+            else:
+                frappe.log_error(
+                    f"Paid Woo invoice {inv.name} has no mapped payment method (woo_method={woo_payment_method})",
+                    "Payment Entry Mapping Missing",
+                )
+
+        try:
+            if status_map.get("custom_state"):
+                inv.db_set("sales_invoice_state", status_map["custom_state"], commit=True)
+        except Exception:
+            pass
 
         if woo_status == "failed" and inv:
             _add_payment_failure_comment(inv.name, woo_id)
@@ -1356,9 +1370,9 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
 
 def migrate_historical_orders(limit: int = 100, page: int = 1) -> dict[str, Any]:
     """One-time migration of historical orders (completed/cancelled only).
-    
+
     Creates paid Sales Invoices without accounting/inventory effects for reporting.
-    
+
     Usage:
         bench --site <site> execute jarz_woocommerce_integration.services.order_sync.migrate_historical_orders --kwargs '{"limit": 100, "page": 1}'
     """
