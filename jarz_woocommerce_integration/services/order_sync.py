@@ -39,15 +39,19 @@ class MigrationCache:
     def _load_items(self):
         rows = frappe.db.sql(
             "SELECT name, IFNULL(item_name, '') as item_name, "
-            "IFNULL(woo_product_id, '') as woo_product_id "
-            "FROM `tabItem` WHERE disabled = 0",
+            "IFNULL(woo_product_id, '') as woo_product_id, "
+            "IFNULL(disabled, 0) as disabled "
+            "FROM `tabItem`",
             as_dict=True,
         )
         self.item_name_to_item: dict[str, str] = {}  # lower(item_name) → item_code
         for r in rows:
-            self.sku_to_item[r.name] = r.name
-            if r.woo_product_id:
-                self.woo_pid_to_item[str(r.woo_product_id).strip()] = r.name
+            if not r.disabled:
+                # Active items: available for SKU and product_id resolution
+                self.sku_to_item[r.name] = r.name
+                if r.woo_product_id:
+                    self.woo_pid_to_item[str(r.woo_product_id).strip()] = r.name
+            # All items (including disabled): available for name-based historical matching
             if r.item_name:
                 self.item_name_to_item[r.item_name.strip().lower()] = r.name
 
@@ -487,7 +491,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
                     item_code = cache.resolve_item_by_name(woo_item_name)
                 else:
                     item_code = frappe.db.get_value(
-                        "Item", {"item_name": woo_item_name, "disabled": 0}, "name"
+                        "Item", {"item_name": woo_item_name}, "name"
                     )
                 if item_code:
                     frappe.logger().info(
