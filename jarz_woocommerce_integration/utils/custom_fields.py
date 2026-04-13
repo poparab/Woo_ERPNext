@@ -108,6 +108,15 @@ REQUIRED_FIELDS = [
         "label": "Delivery Income",
         "insert_after": "pos_profile",
     },
+    # Company -> Kashier account (used for Kashier Card / Kashier Wallet Payment Entries)
+    {
+        "dt": "Company",
+        "fieldname": "custom_kashier_account",
+        "fieldtype": "Link",
+        "options": "Account",
+        "label": "Kashier Account",
+        "insert_after": "default_bank_account",
+    },
 ]
 
 
