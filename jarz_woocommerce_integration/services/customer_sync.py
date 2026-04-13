@@ -191,24 +191,88 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         _cache_customer(customer_cache, existing_by_name, custom_woo_customer_id, username, phone_norm, email)
         return existing_by_name
 
-    # Create new
-    fields = {
-        "doctype": "Customer",
-        "customer_name": display_name if display_name else (username or "Woo Customer"),
-        "customer_type": "Individual",
-    }
-    if email:
-        fields["email_id"] = email
-    if phone_norm:
-        fields["mobile_no"] = phone_norm
-    if username and _field_exists("Customer", "woo_username"):
-        fields["woo_username"] = username
-    if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
-        fields["custom_woo_customer_id"] = custom_woo_customer_id
-    doc = frappe.get_doc(fields)
-    doc.insert(ignore_permissions=True)
-    _cache_customer(customer_cache, doc.name, custom_woo_customer_id, username, phone_norm, email)
-    return doc.name
+    # Create new — use a per-customer Redis lock to prevent parallel worker races.
+    # Lock key is scoped to the most reliable identifier available.  Workers processing
+    # different page ranges may hit the same customer simultaneously; without this lock
+    # they would both fall through all lookup checks and insert duplicates.
+    _lock_id = (
+        f"woo_cid:{custom_woo_customer_id}" if custom_woo_customer_id
+        else f"user:{username}" if username
+        else f"phone:{phone_norm}" if phone_norm
+        else f"email:{email}" if email
+        else f"name:{display_name}"
+    )
+    _lock = None
+    _lock_acquired = False
+    try:
+        from frappe.utils.background_jobs import get_redis_conn as _get_redis
+        _r = _get_redis()
+        _lock = _r.lock(f"woo-customer-lock:{_lock_id}", timeout=30, blocking_timeout=10)
+        _lock_acquired = _lock.acquire(blocking=True)
+    except Exception:
+        _lock = None
+        _lock_acquired = True  # proceed without lock if Redis unavailable
+
+    try:
+        if _lock_acquired:
+            # Re-check under the lock: another worker may have created the customer
+            # while we were waiting for it
+            for cache_key in (
+                f"woo_cid:{custom_woo_customer_id}" if custom_woo_customer_id else None,
+                f"user:{username}" if username else None,
+                f"phone:{phone_norm}" if phone_norm else None,
+                f"email:{email}" if email else None,
+            ):
+                if cache_key and customer_cache is not None and cache_key in customer_cache:
+                    return customer_cache[cache_key]
+
+            # Re-query DB under lock for the most reliable identifiers
+            if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
+                _recheck = frappe.db.get_value("Customer", {"custom_woo_customer_id": custom_woo_customer_id}, "name")
+                if _recheck:
+                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    return _recheck
+            if username and _field_exists("Customer", "woo_username"):
+                _recheck = frappe.db.get_value("Customer", {"woo_username": username}, "name")
+                if _recheck:
+                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    return _recheck
+            if phone_norm:
+                _recheck = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
+                if _recheck:
+                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    return _recheck
+            if email:
+                _recheck = frappe.db.get_value("Customer", {"email_id": email}, "name")
+                if _recheck:
+                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    return _recheck
+
+        # All rechecks exhausted under lock — safe to create
+        fields = {
+            "doctype": "Customer",
+            "customer_name": display_name if display_name else (username or "Woo Customer"),
+            "customer_type": "Individual",
+        }
+        if email:
+            fields["email_id"] = email
+        if phone_norm:
+            fields["mobile_no"] = phone_norm
+        if username and _field_exists("Customer", "woo_username"):
+            fields["woo_username"] = username
+        if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
+            fields["custom_woo_customer_id"] = custom_woo_customer_id
+        doc = frappe.get_doc(fields)
+        doc.insert(ignore_permissions=True)
+        _cache_customer(customer_cache, doc.name, custom_woo_customer_id, username, phone_norm, email)
+        return doc.name
+
+    finally:
+        if _lock is not None and _lock_acquired:
+            try:
+                _lock.release()
+            except Exception:
+                pass
 
 
 def _cache_customer(cache: dict | None, name: str, woo_cid, username, phone, email):

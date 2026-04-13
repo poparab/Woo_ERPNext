@@ -798,7 +798,7 @@ def _create_payment_entry(invoice_name: str, payment_method: str | None, posting
         return None
 
 
-def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None) -> dict:
+def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None, skip_payment_entry: bool = False) -> dict:
     """Process a single Woo order into a Sales Invoice.
     
     Args:
@@ -807,6 +807,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         allow_update: Whether to update existing invoices
         is_historical: True for historical migration (paid invoices), False for live orders (unpaid)
         cache: Optional MigrationCache for fast lookups during historical migration
+        skip_payment_entry: When True, skip Payment Entry creation even for paid completed orders.
+            Use with _run_full_historical_migration(defer_payment_entries=True) to defer PE creation
+            to a separate batch pass via _batch_create_payment_entries().
     """
     woo_id = order.get("id")
 
@@ -1255,7 +1258,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     inv.submit()
                 inv.cancel()
 
-        if inv and inv.docstatus == 1 and status_map.get("is_paid"):
+        if inv and inv.docstatus == 1 and status_map.get("is_paid") and not skip_payment_entry:
             if custom_payment_method:
                 try:
                     pe_posting_date = _resolve_posting_date(order, is_historical)
@@ -1497,6 +1500,10 @@ def _run_full_historical_migration(
     statuses: str = "any",
     start_page: int = 1,
     page_sample_interval: int = 0,
+    commit_every: int = 5,
+    defer_payment_entries: bool = False,
+    end_page: int = 0,
+    worker_id: str = "",
 ) -> dict:
     """Paginated migration of ALL WooCommerce orders into ERPNext.
 
@@ -1513,15 +1520,48 @@ def _run_full_historical_migration(
             for others). Use for sampled test runs — e.g. 5 means process pages
             1, 6, 11, 16... covering ~20% of orders across all time frames.
             Default 0 = process every page (full migration).
+        commit_every: Commit the DB transaction every N processed pages (default 5).
+            Reduces DB commit overhead significantly vs per-page commits.
+            On crash, at most commit_every * batch_size orders must be re-processed.
+        defer_payment_entries: When True, skip Payment Entry creation during order
+            processing. Run _batch_create_payment_entries() as a separate pass after
+            all pages are complete. Eliminates ~50% of doc-creation overhead for
+            completed orders.
+        end_page: Stop after processing this page number (0 = no limit, process all
+            pages). Use with worker_id for parallel multi-worker runs where each
+            worker covers a distinct page range.
+        worker_id: Optional identifier for parallel runs. When set, progress is written
+            to Redis key ``woo_historical_migration_progress:{worker_id}`` instead of
+            the default key, allowing multiple workers to run simultaneously.
+            Use get_parallel_migration_progress() to aggregate all worker stats.
     """
     import gc
     import time as _time
 
     sample_mode = int(page_sample_interval) > 0
     sample_interval = int(page_sample_interval) if sample_mode else 1
+    commit_every = max(1, int(commit_every))
+    end_page = int(end_page)
 
     settings = frappe.get_single("WooCommerce Settings")
     ensure_custom_fields()
+
+    # Suppress Frappe non-essential hooks during bulk migration:
+    # - in_migrate: skips notifications, document following, route conflict checks, server scripts
+    # - in_import: skips email notifications, posting-time auto-set (allows historical dates)
+    # Both flags are standard Frappe bulk-operation patterns. All GL, validation, and
+    # permissions hooks still run normally.
+    _prev_in_migrate = getattr(frappe.flags, "in_migrate", False)
+    _prev_in_import = getattr(frappe.flags, "in_import", False)
+    frappe.flags.in_migrate = True
+    frappe.flags.in_import = True
+
+    # Choose Redis progress key: worker-scoped for parallel runs, default for serial
+    progress_key = (
+        f"{MIGRATION_PROGRESS_KEY}:{worker_id.strip()}"
+        if worker_id and worker_id.strip()
+        else MIGRATION_PROGRESS_KEY
+    )
 
     client = WooClient(
         base_url=settings.base_url,
@@ -1570,9 +1610,12 @@ def _run_full_historical_migration(
         "pages_skipped": 0,
         "last_completed_page": 0,
         "start_page": int(start_page),
+        "end_page": end_page or total_pages,
         "batch_size": int(batch_size),
         "sample_mode": sample_mode,
         "page_sample_interval": int(page_sample_interval),
+        "defer_payment_entries": bool(defer_payment_entries),
+        "worker_id": worker_id or "",
         "date_from": date_from,
         "date_to": date_to,
         "statuses": statuses,
@@ -1586,7 +1629,7 @@ def _run_full_historical_migration(
             from frappe.utils.background_jobs import get_redis_conn
             r = get_redis_conn()
             import json as _json
-            r.set(MIGRATION_PROGRESS_KEY, _json.dumps(stats, default=str), ex=86400)
+            r.set(progress_key, _json.dumps(stats, default=str), ex=86400)
         except Exception:
             pass
 
@@ -1594,7 +1637,13 @@ def _run_full_historical_migration(
         stats["orders_fetched"] += len(page_orders)
         for o in page_orders:
             try:
-                result = process_order_phase1(o, settings, allow_update=False, is_historical=True, cache=cache)
+                result = process_order_phase1(
+                    o, settings,
+                    allow_update=False,
+                    is_historical=True,
+                    cache=cache,
+                    skip_payment_entry=bool(defer_payment_entries),
+                )
                 stats["processed"] += 1
                 st = result.get("status", "")
                 if st in ("created", "updated"):
@@ -1619,15 +1668,7 @@ def _run_full_historical_migration(
         stats["pages_processed"] = page_num
         stats["last_completed_page"] = page_num
 
-        # Commit after every page
-        try:
-            frappe.db.commit()
-        except Exception as commit_err:
-            frappe.log_error(
-                f"DB commit failed on page {page_num}: {commit_err}",
-                "Historical Migration Commit",
-            )
-        # Lightweight GC every 20 pages (frappe.clear_cache removed — too expensive)
+        # Lightweight GC every 20 pages
         if page_num % 20 == 0:
             try:
                 gc.collect()
@@ -1635,46 +1676,78 @@ def _run_full_historical_migration(
                 pass
         _save_progress()
 
-    # Process first page (already fetched)
-    _process_page(orders, int(start_page))
+    try:
+        # Process first page (already fetched)
+        _process_page(orders, int(start_page))
 
-    # Remaining pages
-    for page in range(int(start_page) + 1, (total_pages or 1) + 1):
-        # Sample mode: skip pages that don't fall on the interval
-        if sample_mode and (page - int(start_page)) % sample_interval != 0:
-            stats["pages_skipped"] += 1
-            continue
+        # Effective last page: honour end_page cap if set
+        effective_last_page = end_page if end_page > 0 else (total_pages or 1)
 
-        base_params["page"] = page
+        # Remaining pages
+        pages_since_commit = 1  # first page already processed
+        for page in range(int(start_page) + 1, effective_last_page + 1):
+            # Sample mode: skip pages that don't fall on the interval
+            if sample_mode and (page - int(start_page)) % sample_interval != 0:
+                stats["pages_skipped"] += 1
+                continue
+
+            base_params["page"] = page
+            try:
+                page_orders, _, _ = client.list_orders_with_meta(params=base_params)
+            except Exception as fetch_err:
+                frappe.log_error(f"Migration fetch error page {page}: {fetch_err}", "Historical Migration")
+                stats["errors"] += 1
+                continue
+            if not page_orders:
+                break
+            _process_page(page_orders, page)
+            pages_since_commit += 1
+
+            # Commit every commit_every pages (not per-page) — reduces DB overhead
+            if pages_since_commit >= commit_every:
+                try:
+                    frappe.db.commit()
+                except Exception as commit_err:
+                    frappe.log_error(
+                        f"DB commit failed after page {page}: {commit_err}",
+                        "Historical Migration Commit",
+                    )
+                pages_since_commit = 0
+
+            # Brief pause every 10 pages to avoid overwhelming the WooCommerce API
+            if page % 10 == 0:
+                _time.sleep(1)
+                sample_label = " [SAMPLE]" if sample_mode else ""
+                worker_label = f" [worker={worker_id}]" if worker_id else ""
+                frappe.logger().info(
+                    f"Migration checkpoint{sample_label}{worker_label}: page {page}/{effective_last_page}, "
+                    f"created={stats['created']}, skipped={stats['skipped']}, errors={stats['errors']}"
+                )
+
+        # Final commit for any remaining uncommitted pages
         try:
-            page_orders, _, _ = client.list_orders_with_meta(params=base_params)
-        except Exception as fetch_err:
-            frappe.log_error(f"Migration fetch error page {page}: {fetch_err}", "Historical Migration")
-            stats["errors"] += 1
-            continue
-        if not page_orders:
-            break
-        _process_page(page_orders, page)
-
-        # Brief pause every 10 pages to avoid overwhelming the server
-        if page % 10 == 0:
-            _time.sleep(1)
-            sample_label = " [SAMPLE]" if sample_mode else ""
-            frappe.logger().info(
-                f"Migration checkpoint{sample_label}: page {page}/{total_pages}, "
-                f"created={stats['created']}, skipped={stats['skipped']}, errors={stats['errors']}"
+            frappe.db.commit()
+        except Exception as commit_err:
+            frappe.log_error(
+                f"DB final commit failed: {commit_err}",
+                "Historical Migration Commit",
             )
 
-    stats["finished_at"] = frappe.utils.now_datetime().isoformat()
-    stats["running"] = False
-    _save_progress()
+        stats["finished_at"] = frappe.utils.now_datetime().isoformat()
+        stats["running"] = False
+        _save_progress()
 
-    frappe.logger().info({"event": "woo_full_historical_migration_complete", "stats": stats})
-    return stats
+        frappe.logger().info({"event": "woo_full_historical_migration_complete", "stats": stats, "worker_id": worker_id})
+        return stats
+
+    finally:
+        # Restore Frappe flags regardless of success or failure
+        frappe.flags.in_migrate = _prev_in_migrate
+        frappe.flags.in_import = _prev_in_import
 
 
 def get_migration_progress() -> dict:
-    """Read current migration progress from Redis."""
+    """Read current migration progress from Redis (default / non-parallel key)."""
     try:
         from frappe.utils.background_jobs import get_redis_conn
         import json as _json
@@ -1685,3 +1758,230 @@ def get_migration_progress() -> dict:
     except Exception:
         pass
     return {"running": False, "message": "No migration in progress or data expired."}
+
+
+def get_parallel_migration_progress() -> dict:
+    """Aggregate progress across all active parallel workers.
+
+    Scans Redis for all keys matching ``woo_historical_migration_progress:*``
+    and the default key, then returns per-worker breakdown plus aggregated totals.
+    Workers are considered running if any of them have ``running: True``.
+
+    Returns a dict with:
+        - ``workers``: list of per-worker progress dicts
+        - ``total_created``, ``total_errors``, ``total_skipped``, ``total_fetched``
+        - ``any_running``: bool — True if at least one worker is still active
+        - ``all_finished``:  bool — True when all workers have ``running: False``
+    """
+    try:
+        from frappe.utils.background_jobs import get_redis_conn
+        import json as _json
+        r = get_redis_conn()
+
+        workers = []
+
+        # Collect all worker-scoped keys
+        for key in r.scan_iter(f"{MIGRATION_PROGRESS_KEY}:*"):
+            raw = r.get(key)
+            if raw:
+                try:
+                    workers.append(_json.loads(raw))
+                except Exception:
+                    pass
+
+        # Also check the default key (non-parallel / single-worker run)
+        raw_default = r.get(MIGRATION_PROGRESS_KEY)
+        if raw_default:
+            try:
+                default_data = _json.loads(raw_default)
+                # Only include if it's a real run (not stale empty)
+                if default_data.get("started_at"):
+                    workers.append(default_data)
+            except Exception:
+                pass
+
+        if not workers:
+            return {
+                "workers": [],
+                "total_created": 0,
+                "total_errors": 0,
+                "total_skipped": 0,
+                "total_fetched": 0,
+                "any_running": False,
+                "all_finished": True,
+                "message": "No active or recent migration workers found.",
+            }
+
+        aggregated = {
+            "workers": workers,
+            "total_created": sum(w.get("created", 0) for w in workers),
+            "total_errors": sum(w.get("errors", 0) for w in workers),
+            "total_skipped": sum(w.get("skipped", 0) for w in workers),
+            "total_fetched": sum(w.get("orders_fetched", 0) for w in workers),
+            "any_running": any(w.get("running", False) for w in workers),
+            "all_finished": all(not w.get("running", True) for w in workers),
+        }
+        return aggregated
+
+    except Exception as e:
+        return {"error": str(e), "workers": [], "any_running": False, "all_finished": False}
+
+
+BATCH_PE_PROGRESS_KEY = "woo_batch_pe_progress"
+
+
+def _batch_create_payment_entries(
+    statuses: str = "completed",
+    commit_every: int = 50,
+) -> dict:
+    """Create Payment Entries in a single batch pass for all Woo-linked submitted
+    Sales Invoices that still have an outstanding balance.
+
+    Use after running _run_full_historical_migration(defer_payment_entries=True).
+    This function is idempotent — invoices already at outstanding=0 are silently
+    skipped, so it is safe to re-run if interrupted.
+
+    Args:
+        statuses: Comma-separated WooCommerce order statuses to include (default "completed").
+            Only completed orders normally have Payment Entries. Other statuses are
+            included as a safeguard for partial reruns.
+        commit_every: Commit the DB transaction every N Payment Entries (default 50).
+
+    Returns:
+        dict with keys: created, skipped, errors, error_details, running=False.
+    """
+    commit_every = max(1, int(commit_every))
+    status_list = [s.strip() for s in (statuses or "completed").split(",") if s.strip()]
+
+    settings = frappe.get_single("WooCommerce Settings")
+    company = getattr(settings, "default_company", None) or frappe.defaults.get_global_default("company")
+
+    # Light cache for account lookups only — no item/territory loading needed
+    cache = MigrationCache(company=company)
+    cache._load_company_accounts()
+
+    stats = {
+        "created": 0,
+        "skipped": 0,
+        "errors": 0,
+        "error_details": [],
+        "statuses": statuses,
+        "running": True,
+        "started_at": frappe.utils.now_datetime().isoformat(),
+        "finished_at": None,
+    }
+
+    def _save_pe_progress():
+        try:
+            from frappe.utils.background_jobs import get_redis_conn
+            import json as _json
+            r = get_redis_conn()
+            r.set(BATCH_PE_PROGRESS_KEY, _json.dumps(stats, default=str), ex=86400)
+        except Exception:
+            pass
+
+    _save_pe_progress()
+
+    # Fetch all Woo-linked submitted invoices with outstanding > 0 for the target statuses
+    # Join via WooCommerce Order Map to filter by WooCommerce status
+    try:
+        placeholders = ", ".join(["%s"] * len(status_list))
+        rows = frappe.db.sql(
+            f"""
+            SELECT si.name, si.customer, si.outstanding_amount, si.grand_total,
+                   si.custom_payment_method, si.posting_date, si.company,
+                   wm.status as woo_status
+            FROM `tabSales Invoice` si
+            JOIN `tabWooCommerce Order Map` wm ON wm.erpnext_sales_invoice = si.name
+            WHERE si.docstatus = 1
+              AND IFNULL(si.outstanding_amount, 0) > 0
+              AND si.woo_order_id IS NOT NULL
+              AND wm.status IN ({placeholders})
+            ORDER BY si.posting_date ASC, si.name ASC
+            """,
+            tuple(status_list),
+            as_dict=True,
+        )
+    except Exception as fetch_err:
+        frappe.log_error(str(fetch_err), "Batch PE: Invoice Fetch Error")
+        stats["running"] = False
+        stats["finished_at"] = frappe.utils.now_datetime().isoformat()
+        stats["error_details"].append({"reason": f"Invoice fetch failed: {fetch_err}"})
+        _save_pe_progress()
+        return stats
+
+    total = len(rows)
+    frappe.logger().info(f"Batch PE: found {total} invoices with outstanding > 0")
+    commits_since = 0
+
+    for i, row in enumerate(rows):
+        invoice_name = row["name"]
+        payment_method = row.get("custom_payment_method") or ""
+        posting_date = row.get("posting_date")
+
+        if not payment_method:
+            stats["skipped"] += 1
+            continue
+
+        try:
+            pe_name = _create_payment_entry(
+                invoice_name,
+                payment_method,
+                posting_date=str(posting_date) if posting_date else None,
+                cache=cache,
+            )
+            if pe_name:
+                stats["created"] += 1
+            else:
+                stats["skipped"] += 1
+        except Exception as pe_err:
+            stats["errors"] += 1
+            frappe.log_error(
+                f"Batch PE error for {invoice_name}: {pe_err}",
+                "Batch Payment Entry Error",
+            )
+            if len(stats["error_details"]) < 50:
+                stats["error_details"].append({"invoice": invoice_name, "reason": str(pe_err)[:200]})
+
+        commits_since += 1
+        if commits_since >= commit_every:
+            try:
+                frappe.db.commit()
+            except Exception as commit_err:
+                frappe.log_error(str(commit_err), "Batch PE Commit Error")
+            commits_since = 0
+
+        # Save progress every 100 invoices
+        if (i + 1) % 100 == 0:
+            _save_pe_progress()
+            frappe.logger().info(
+                f"Batch PE progress: {i + 1}/{total}, created={stats['created']}, "
+                f"skipped={stats['skipped']}, errors={stats['errors']}"
+            )
+
+    # Final commit
+    try:
+        frappe.db.commit()
+    except Exception as commit_err:
+        frappe.log_error(str(commit_err), "Batch PE Final Commit Error")
+
+    stats["running"] = False
+    stats["finished_at"] = frappe.utils.now_datetime().isoformat()
+    _save_pe_progress()
+    frappe.logger().info({"event": "woo_batch_pe_complete", "stats": stats})
+    return stats
+
+
+def get_batch_pe_progress() -> dict:
+    """Read current batch Payment Entry creation progress from Redis."""
+    try:
+        from frappe.utils.background_jobs import get_redis_conn
+        import json as _json
+        r = get_redis_conn()
+        raw = r.get(BATCH_PE_PROGRESS_KEY)
+        if raw:
+            return _json.loads(raw)
+    except Exception:
+        pass
+    return {"running": False, "message": "No batch PE in progress or data expired."}
+
