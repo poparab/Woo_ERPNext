@@ -1548,13 +1548,11 @@ def _run_full_historical_migration(
 
     # Suppress Frappe non-essential hooks during bulk migration:
     # - in_migrate: skips notifications, document following, route conflict checks, server scripts
-    # - in_import: skips email notifications, posting-time auto-set (allows historical dates)
-    # Both flags are standard Frappe bulk-operation patterns. All GL, validation, and
-    # permissions hooks still run normally.
+    # NOTE: in_import is intentionally NOT set — it suppresses set_missing_values() in ERPNext's
+    # SellingController which causes SI fields (selling_price_list, price_list_currency,
+    # plc_conversion_rate) to be empty, failing mandatory validation.
     _prev_in_migrate = getattr(frappe.flags, "in_migrate", False)
-    _prev_in_import = getattr(frappe.flags, "in_import", False)
     frappe.flags.in_migrate = True
-    frappe.flags.in_import = True
 
     # Choose Redis progress key: worker-scoped for parallel runs, default for serial
     progress_key = (
@@ -1743,7 +1741,6 @@ def _run_full_historical_migration(
     finally:
         # Restore Frappe flags regardless of success or failure
         frappe.flags.in_migrate = _prev_in_migrate
-        frappe.flags.in_import = _prev_in_import
 
 
 def get_migration_progress() -> dict:
