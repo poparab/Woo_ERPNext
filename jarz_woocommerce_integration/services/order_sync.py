@@ -18,7 +18,7 @@ class MigrationCache:
     per-order processing can use dict lookups instead of DB queries.
     """
 
-    def __init__(self, price_list: str | None = None):
+    def __init__(self, price_list: str | None = None, company: str | None = None):
         self.sku_to_item: dict[str, str] = {}          # item_code → item_code
         self.woo_pid_to_item: dict[str, str] = {}      # woo_product_id → item_code
         self.item_prices: dict[tuple[str, str], float] = {}  # (price_list, item_code) → rate
@@ -26,7 +26,13 @@ class MigrationCache:
         self.territory_chain: dict[str, dict] = {}      # territory → {pos_profile, warehouse, price_list}
         self.customer_cache: dict[str, str] = {}        # composite key → customer name
         self.order_map_set: set[int] = set()            # woo_order_ids already mapped
+        self.item_groups: dict[str, str] = {}           # item_code → item_group
+        self.company_accounts: dict[str, str | None] = {}  # account_key → account name
+        self.link_field: str = "erpnext_sales_invoice"  # Order Map link field name
+        self.address_cache: dict[tuple, str] = {}       # (customer, type, line1_hash) → address name
+        self.territory_state_cache: dict[str, str | None] = {}  # state_value → territory name
         self._price_list = price_list
+        self._company = company
 
     def load(self):
         """Pre-load all lookup tables from DB."""
@@ -35,17 +41,22 @@ class MigrationCache:
         self._load_bundles()
         self._load_territory_chain()
         self._load_existing_maps()
+        self._load_company_accounts()
+        self._load_link_field()
 
     def _load_items(self):
         rows = frappe.db.sql(
             "SELECT name, IFNULL(item_name, '') as item_name, "
             "IFNULL(woo_product_id, '') as woo_product_id, "
-            "IFNULL(disabled, 0) as disabled "
+            "IFNULL(disabled, 0) as disabled, "
+            "IFNULL(item_group, '') as item_group "
             "FROM `tabItem`",
             as_dict=True,
         )
         self.item_name_to_item: dict[str, str] = {}  # lower(item_name) → item_code
         for r in rows:
+            if r.item_group:
+                self.item_groups[r.name] = r.item_group
             if not r.disabled:
                 # Active items: available for SKU and product_id resolution
                 self.sku_to_item[r.name] = r.name
@@ -109,6 +120,42 @@ class MigrationCache:
         for r in rows:
             if r.woo_order_id:
                 self.order_map_set.add(int(r.woo_order_id))
+
+    def _load_company_accounts(self):
+        company = self._company
+        if not company:
+            company = frappe.defaults.get_global_default("company")
+        if not company:
+            return
+        row = frappe.db.get_value(
+            "Company", company,
+            ["default_cash_account", "default_bank_account",
+             "custom_kashier_account", "default_receivable_account"],
+            as_dict=True,
+        )
+        if row:
+            self.company_accounts["Cash"] = row.get("default_cash_account")
+            self.company_accounts["Instapay"] = row.get("default_bank_account")
+            self.company_accounts["Kashier Card"] = row.get("custom_kashier_account")
+            self.company_accounts["Kashier Wallet"] = row.get("custom_kashier_account")
+            self.company_accounts["default_receivable_account"] = row.get("default_receivable_account")
+        # Mobile Wallet: from Mode of Payment Account
+        mw = frappe.db.get_value(
+            "Mode of Payment Account",
+            {"parent": "Mobile Wallet", "company": company},
+            "default_account",
+        )
+        self.company_accounts["Mobile Wallet"] = mw or row.get("default_bank_account") if row else mw
+
+    def _load_link_field(self):
+        try:
+            cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
+            if "erpnext_sales_invoice" in cols:
+                self.link_field = "erpnext_sales_invoice"
+            elif "sales_invoice" in cols:
+                self.link_field = "sales_invoice"
+        except Exception:
+            pass
 
     def resolve_item(self, sku: str, product_id) -> str | None:
         """Resolve a Woo line item to an ERPNext item_code via cache."""
@@ -328,7 +375,7 @@ def _build_bundle_selections(
             per_bundle_qty = wc_qty  # assume already per-bundle
 
         # Determine item group so BundleProcessor can match to the right bundle row
-        wc_item_group = frappe.db.get_value("Item", wc_item_code, "item_group")
+        wc_item_group = (cache.item_groups.get(wc_item_code) if cache else None) or frappe.db.get_value("Item", wc_item_code, "item_group")
         if not wc_item_group:
             frappe.logger().warning(
                 f"Bundle selection: item {wc_item_code} has no item_group – falling back"
@@ -663,9 +710,14 @@ def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str 
     inv.append("taxes", row)
 
 
-def _resolve_paid_to_account(payment_method: str | None, company: str) -> str | None:
+def _resolve_paid_to_account(payment_method: str | None, company: str, cache: "MigrationCache | None" = None) -> str | None:
     """Return the paid-to account for a mapped Woo payment method."""
     pm = (payment_method or "").strip()
+    if not pm:
+        return None
+    # Fast path: use pre-loaded accounts from cache
+    if cache and cache.company_accounts:
+        return cache.company_accounts.get(pm)
     if pm == "Cash":
         return frappe.db.get_value("Company", company, "default_cash_account")
     if pm == "Instapay":
@@ -682,7 +734,7 @@ def _resolve_paid_to_account(payment_method: str | None, company: str) -> str | 
     return None
 
 
-def _create_payment_entry(invoice_name: str, payment_method: str | None, posting_date: str | None = None) -> str | None:
+def _create_payment_entry(invoice_name: str, payment_method: str | None, posting_date: str | None = None, cache: "MigrationCache | None" = None) -> str | None:
     """Create a Payment Entry for the invoice's current outstanding amount."""
     try:
         frappe.set_user("Administrator")
@@ -695,7 +747,7 @@ def _create_payment_entry(invoice_name: str, payment_method: str | None, posting
         if pay_amount <= 0:
             return None
 
-        paid_to = _resolve_paid_to_account(payment_method, company)
+        paid_to = _resolve_paid_to_account(payment_method, company, cache=cache)
         if not paid_to:
             frappe.log_error(
                 f"No paid-to account resolved for payment_method={payment_method}, company={company}",
@@ -703,7 +755,10 @@ def _create_payment_entry(invoice_name: str, payment_method: str | None, posting
             )
             return None
 
-        paid_from = frappe.db.get_value("Company", company, "default_receivable_account")
+        if cache and cache.company_accounts:
+            paid_from = cache.company_accounts.get("default_receivable_account")
+        else:
+            paid_from = frappe.db.get_value("Company", company, "default_receivable_account")
         if not paid_from:
             frappe.log_error(
                 f"No default_receivable_account for company={company}",
@@ -782,13 +837,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             db_lock_acquired = False
 
     # Determine mapping link field name based on actual DB schema
-    LINK_FIELD = "erpnext_sales_invoice"
-    try:
-        cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
-        if LINK_FIELD not in cols and "sales_invoice" in cols:
-            LINK_FIELD = "sales_invoice"
-    except Exception:
-        pass
+    if cache:
+        LINK_FIELD = cache.link_field
+    else:
+        LINK_FIELD = "erpnext_sales_invoice"
+        try:
+            cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
+            if LINK_FIELD not in cols and "sales_invoice" in cols:
+                LINK_FIELD = "sales_invoice"
+        except Exception:
+            pass
 
     # Get existing mapping (robust to column name differences)
     existing_map = None
@@ -892,7 +950,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     # Ensure customer and at least one address before proceeding
     try:
         customer, billing_addr, shipping_addr = ensure_customer_with_addresses(
-            order, settings, customer_cache=cache.customer_cache if cache else None,
+            order, settings,
+            customer_cache=cache.customer_cache if cache else None,
+            address_cache=cache.address_cache if cache else None,
+            territory_state_cache=cache.territory_state_cache if cache else None,
         )
     except ValueError as ve:
         reason = str(ve)
@@ -1202,6 +1263,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         inv.name,
                         custom_payment_method,
                         posting_date=pe_posting_date,
+                        cache=cache,
                     )
                     if payment_entry:
                         frappe.logger().info(
@@ -1239,7 +1301,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
 
         try:
             if status_map.get("custom_state"):
-                inv.db_set("sales_invoice_state", status_map["custom_state"], commit=True)
+                inv.db_set("sales_invoice_state", status_map["custom_state"], commit=False)
         except Exception:
             pass
 
@@ -1273,6 +1335,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "synced_on": frappe.utils.now_datetime(),
                 "hash": order_hash,
             }).insert(ignore_permissions=True)
+
+        # Keep cache fresh so reruns benefit from O(1) skip
+        if cache and woo_id:
+            cache.order_map_set.add(int(woo_id))
 
         return {"status": action, "invoice": inv.name, "woo_order_id": woo_id}
     except Exception as e:  # noqa: BLE001
@@ -1430,6 +1496,7 @@ def _run_full_historical_migration(
     batch_size: int = 100,
     statuses: str = "any",
     start_page: int = 1,
+    page_sample_interval: int = 0,
 ) -> dict:
     """Paginated migration of ALL WooCommerce orders into ERPNext.
 
@@ -1442,9 +1509,16 @@ def _run_full_historical_migration(
         batch_size: Orders per page (max 100 per WooCommerce API).
         statuses: Comma-separated Woo statuses, or "any" for all.
         start_page: Page number to start from (for resuming interrupted migrations).
+        page_sample_interval: When > 0, only process every Nth page (skip API fetch
+            for others). Use for sampled test runs — e.g. 5 means process pages
+            1, 6, 11, 16... covering ~20% of orders across all time frames.
+            Default 0 = process every page (full migration).
     """
     import gc
     import time as _time
+
+    sample_mode = int(page_sample_interval) > 0
+    sample_interval = int(page_sample_interval) if sample_mode else 1
 
     settings = frappe.get_single("WooCommerce Settings")
     ensure_custom_fields()
@@ -1456,12 +1530,14 @@ def _run_full_historical_migration(
     )
 
     # Pre-load all lookup tables into memory for fast dict-based resolution
-    cache = MigrationCache()
+    company = getattr(settings, "default_company", None) or frappe.defaults.get_global_default("company")
+    cache = MigrationCache(company=company)
     cache.load()
     frappe.logger().info(
         f"MigrationCache loaded: {len(cache.sku_to_item)} items, "
         f"{len(cache.item_prices)} prices, {len(cache.bundle_map)} bundles, "
-        f"{len(cache.territory_chain)} territories, {len(cache.order_map_set)} existing maps"
+        f"{len(cache.territory_chain)} territories, {len(cache.order_map_set)} existing maps, "
+        f"{len(cache.company_accounts)} accounts, {len(cache.item_groups)} item_groups"
     )
 
     # Build base params
@@ -1491,9 +1567,12 @@ def _run_full_historical_migration(
         "errors": 0,
         "error_details": [],
         "pages_processed": 0,
+        "pages_skipped": 0,
         "last_completed_page": 0,
         "start_page": int(start_page),
         "batch_size": int(batch_size),
+        "sample_mode": sample_mode,
+        "page_sample_interval": int(page_sample_interval),
         "date_from": date_from,
         "date_to": date_to,
         "statuses": statuses,
@@ -1561,6 +1640,11 @@ def _run_full_historical_migration(
 
     # Remaining pages
     for page in range(int(start_page) + 1, (total_pages or 1) + 1):
+        # Sample mode: skip pages that don't fall on the interval
+        if sample_mode and (page - int(start_page)) % sample_interval != 0:
+            stats["pages_skipped"] += 1
+            continue
+
         base_params["page"] = page
         try:
             page_orders, _, _ = client.list_orders_with_meta(params=base_params)
@@ -1575,8 +1659,9 @@ def _run_full_historical_migration(
         # Brief pause every 10 pages to avoid overwhelming the server
         if page % 10 == 0:
             _time.sleep(1)
+            sample_label = " [SAMPLE]" if sample_mode else ""
             frappe.logger().info(
-                f"Migration checkpoint: page {page}/{total_pages}, "
+                f"Migration checkpoint{sample_label}: page {page}/{total_pages}, "
                 f"created={stats['created']}, skipped={stats['skipped']}, errors={stats['errors']}"
             )
 

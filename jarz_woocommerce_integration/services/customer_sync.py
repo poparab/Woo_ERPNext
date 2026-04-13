@@ -225,10 +225,18 @@ def _cache_customer(cache: dict | None, name: str, woo_cid, username, phone, ema
         cache[f"email:{email}"] = name
 
 
-def _find_existing_address_for_customer(customer: str, address_type: str, address_line1: str) -> Optional[str]:
+def _find_existing_address_for_customer(customer: str, address_type: str, address_line1: str, address_cache: dict | None = None) -> Optional[str]:
     normalized_search = address_line1.strip()
     if not normalized_search:
         return None
+
+    # Check in-memory cache first (historical migration)
+    if address_cache is not None:
+        cache_key = (customer, address_type, normalized_search.lower())
+        cached = address_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
     try:
         result = frappe.db.sql(
             """
@@ -246,7 +254,12 @@ def _find_existing_address_for_customer(customer: str, address_type: str, addres
             (customer, address_type, normalized_search),
             as_dict=True,
         )
-        return result[0].name if result else None
+        found = result[0].name if result else None
+        # Populate cache for future lookups
+        if address_cache is not None and found:
+            cache_key = (customer, address_type, normalized_search.lower())
+            address_cache[cache_key] = found
+        return found
     except Exception:
         return None
 
@@ -332,7 +345,7 @@ def _resolve_country(raw: str | None) -> Optional[str]:
     return None
 
 
-def _resolve_territory_from_state(state_value: str | None) -> str | None:
+def _resolve_territory_from_state(state_value: str | None, territory_state_cache: dict | None = None) -> str | None:
     """Extract territory from WooCommerce state field (which contains delivery zone).
     
     WooCommerce stores the delivery zone in the 'state' field like "Dokki - الدقي" or "Nasr City - مدينه نصر".
@@ -340,6 +353,7 @@ def _resolve_territory_from_state(state_value: str | None) -> str | None:
     
     Args:
         state_value: The state field from WooCommerce address (e.g., "Dokki - الدقي")
+        territory_state_cache: Optional dict for caching state → territory lookups.
         
     Returns:
         Territory name (code) if found, None otherwise
@@ -350,6 +364,10 @@ def _resolve_territory_from_state(state_value: str | None) -> str | None:
     state_value = state_value.strip()
     if not state_value:
         return None
+
+    # Check in-memory cache first (historical migration)
+    if territory_state_cache is not None and state_value in territory_state_cache:
+        return territory_state_cache[state_value]
     
     # Import the mapping from territory_sync
     from jarz_woocommerce_integration.services.territory_sync import CODE_TO_DISPLAY
@@ -357,47 +375,59 @@ def _resolve_territory_from_state(state_value: str | None) -> str | None:
     # Create reverse mapping (display -> code)
     DISPLAY_TO_CODE = {v: k for k, v in CODE_TO_DISPLAY.items()}
     
+    result = None
+
     # Try exact match in reverse mapping
     if state_value in DISPLAY_TO_CODE:
         territory_code = DISPLAY_TO_CODE[state_value]
         if frappe.db.exists("Territory", territory_code):
-            return territory_code
+            result = territory_code
     
-    # Try matching just the English part (before the hyphen)
-    english_part = state_value.split(" - ")[0].strip() if " - " in state_value else state_value
+    if not result:
+        # Try matching just the English part (before the hyphen)
+        english_part = state_value.split(" - ")[0].strip() if " - " in state_value else state_value
+        
+        # Try finding by English part in the display values
+        for code, display in CODE_TO_DISPLAY.items():
+            display_english = display.split(" - ")[0].strip() if " - " in display else display
+            if english_part.lower() == display_english.lower():
+                if frappe.db.exists("Territory", code):
+                    result = code
+                    break
     
-    # Try finding by English part in the display values
-    for code, display in CODE_TO_DISPLAY.items():
-        display_english = display.split(" - ")[0].strip() if " - " in display else display
-        if english_part.lower() == display_english.lower():
-            if frappe.db.exists("Territory", code):
-                return code
+    if not result:
+        # Try exact match against territory name directly (for territories not in CODE_TO_DISPLAY)
+        if frappe.db.exists("Territory", {"territory_name": state_value, "is_group": 0}):
+            result = frappe.db.get_value("Territory", {"territory_name": state_value, "is_group": 0}, "name")
     
-    # Try exact match against territory name directly (for territories not in CODE_TO_DISPLAY)
-    if frappe.db.exists("Territory", {"territory_name": state_value, "is_group": 0}):
-        return frappe.db.get_value("Territory", {"territory_name": state_value, "is_group": 0}, "name")
-    
-    # Try case-insensitive search on all territories
-    territories = frappe.get_all(
-        "Territory",
-        filters={"is_group": 0},
-        fields=["name", "territory_name"]
-    )
-    
-    state_lower = state_value.lower()
-    for terr in territories:
-        if terr.territory_name and terr.territory_name.lower() == state_lower:
-            return terr.name
+    if not result:
+        # Try case-insensitive search on all territories
+        territories = frappe.get_all(
+            "Territory",
+            filters={"is_group": 0},
+            fields=["name", "territory_name"]
+        )
+        
+        state_lower = state_value.lower()
+        for terr in territories:
+            if terr.territory_name and terr.territory_name.lower() == state_lower:
+                result = terr.name
+                break
 
-    # Final fallback: use global default territory if configured
-    try:
-        default_territory = frappe.defaults.get_global_default("territory")
-        if default_territory and frappe.db.exists("Territory", default_territory):
-            return default_territory
-    except Exception:
-        pass
+    if not result:
+        # Final fallback: use global default territory if configured
+        try:
+            default_territory = frappe.defaults.get_global_default("territory")
+            if default_territory and frappe.db.exists("Territory", default_territory):
+                result = default_territory
+        except Exception:
+            pass
+
+    # Populate cache for future lookups
+    if territory_state_cache is not None:
+        territory_state_cache[state_value] = result
     
-    return None
+    return result
 
 
 def _create_address(customer: str, address_type: str, data: dict, phone: str | None, email: str | None) -> str:
@@ -426,7 +456,7 @@ def _create_address(customer: str, address_type: str, data: dict, phone: str | N
     return addr.name
 
 
-def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict | None = None) -> Tuple[str, str | None, str | None]:
+def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict | None = None, address_cache: dict | None = None, territory_state_cache: dict | None = None) -> Tuple[str, str | None, str | None]:
     """Create or get Customer and their Billing/Shipping addresses from Woo order.
 
     Requirements:
@@ -435,6 +465,8 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
 
     Args:
         customer_cache: Optional dict for caching customer lookups across orders.
+        address_cache: Optional dict for caching address lookups across orders.
+        territory_state_cache: Optional dict for caching state → territory lookups.
 
     Returns: (customer_name, billing_address_name, shipping_address_name)
     Raises: ValueError if no usable address present.
@@ -463,25 +495,31 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
 
     # Ensure billing address if present
     if billing_line1:
-        existing = _find_existing_address_for_customer(customer, "Billing", billing_line1)
+        existing = _find_existing_address_for_customer(customer, "Billing", billing_line1, address_cache=address_cache)
         billing_addr_name = existing or _create_address(customer, "Billing", billing, billing.get("phone"), email)
         # Set as default billing address for this customer
         if billing_addr_name:
             _set_address_as_default(billing_addr_name, customer, "Billing")
+            # Cache newly created address too
+            if address_cache is not None and not existing:
+                address_cache[(customer, "Billing", billing_line1.lower())] = billing_addr_name
 
     # Ensure shipping address if present
     if shipping_line1:
-        existing = _find_existing_address_for_customer(customer, "Shipping", shipping_line1)
+        existing = _find_existing_address_for_customer(customer, "Shipping", shipping_line1, address_cache=address_cache)
         shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email)
         # Set as default shipping address for this customer
         if shipping_addr_name:
             _set_address_as_default(shipping_addr_name, customer, "Shipping")
+            # Cache newly created address too
+            if address_cache is not None and not existing:
+                address_cache[(customer, "Shipping", shipping_line1.lower())] = shipping_addr_name
 
     # Assign territory from shipping state (delivery zone)
     # Prefer shipping address, fallback to billing
     state_value = (shipping.get("state") or billing.get("state") or "").strip()
     if state_value:
-        territory = _resolve_territory_from_state(state_value)
+        territory = _resolve_territory_from_state(state_value, territory_state_cache=territory_state_cache)
         if territory:
             try:
                 # Update customer territory if not already set or different
