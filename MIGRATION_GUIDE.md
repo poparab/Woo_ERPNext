@@ -1,112 +1,86 @@
-caceled invoices # WooCommerce Historical Order Migration Guide
+# WooCommerce Historical Order Migration Guide
 
 ## Quick Start
 
-### Run Historical Migration
+### Step 1: Add Database Indexes (one-time per environment)
 ```bash
-# SSH to server
-ssh ubuntu@your-server
-
-# Navigate to docker directory
-cd erpnext_docker
-
-# Run optimized migration (150-200 orders/minute)
-docker-compose exec -T backend bench --site frontend execute \
-  jarz_woocommerce_integration.utils.migrate_ultra_optimized.migrate_all_historical_orders_ultra_optimized_cli
+docker exec erp_backend_1 bench --site frontend execute \
+  jarz_woocommerce_integration.utils.add_sync_indexes.add_sync_indexes_cli
 ```
 
-### Check Progress
+### Step 2: Pause Scheduler
 ```bash
-# View total synced orders
-docker-compose exec -T backend bench --site frontend execute \
-  frappe.db.sql --args "['SELECT COUNT(*) FROM \`tabWooCommerce Order Map\`', 1]"
+docker exec erp_backend_1 bench --site frontend set-config pause_scheduler 1
+```
 
-# Or check in UI
-# Navigate to: WooCommerce Order Map (sort by Creation DESC)
+### Step 3: Run Migration (3 sequential runs)
+```bash
+# Completed orders — bulk, creates submitted invoices + Payment Entries
+docker exec erp_backend_1 bench --site frontend execute \
+  jarz_woocommerce_integration.services.order_sync._run_full_historical_migration \
+  --kwargs '{"statuses": "completed", "batch_size": 50}'
+
+# Cancelled / Refunded / Failed — draft invoices, no GL impact
+docker exec erp_backend_1 bench --site frontend execute \
+  jarz_woocommerce_integration.services.order_sync._run_full_historical_migration \
+  --kwargs '{"statuses": "cancelled,refunded,failed", "batch_size": 50}'
+
+# Processing — submitted invoices, no Payment Entries
+docker exec erp_backend_1 bench --site frontend execute \
+  jarz_woocommerce_integration.services.order_sync._run_full_historical_migration \
+  --kwargs '{"statuses": "processing", "batch_size": 50}'
+```
+
+### Step 4: Monitor Progress
+```bash
+docker exec erp_backend_1 bench --site frontend execute \
+  jarz_woocommerce_integration.services.order_sync.get_migration_progress
+```
+
+### Step 5: Re-enable Scheduler
+```bash
+docker exec erp_backend_1 bench --site frontend set-config pause_scheduler 0
+```
+
+### Step 6: Post-Processing (mandatory)
+```bash
+docker exec erp_backend_1 bench --site frontend execute \
+  jarz_woocommerce_integration.utils.update_historical_invoice_status.update_historical_invoice_status_cli
+```
+
+---
+
+## Resume an Interrupted Migration
+
+Check progress to find `last_completed_page`, then resume:
+```bash
+docker exec erp_backend_1 bench --site frontend execute \
+  jarz_woocommerce_integration.services.order_sync._run_full_historical_migration \
+  --kwargs '{"statuses": "completed", "batch_size": 50, "start_page": <last_completed_page + 1>}'
 ```
 
 ---
 
 ## Performance
 
-- **Speed**: 150-200 orders/minute
-- **Time for 10K orders**: 50-70 minutes
-- **Optimizations**: Database indexes + bulk caching + batch commits
-- **Safety**: 100% transactional, automatic deduplication
+- **Speed**: ~100-150 orders/minute
+- **Resume support**: Yes — `start_page` parameter
+- **Progress tracking**: Redis key `woo_historical_migration_progress`
+- **Cache**: `MigrationCache` pre-loads all items, prices, bundles, territories once
+- **Safety**: Per-order error isolation, outbound sync suppressed automatically
 
 ---
 
-## One-Time Setup (if not done)
+## Migration Tools
 
-### 1. Add Database Indexes
-```bash
-docker-compose exec -T backend bench --site frontend execute \
-  jarz_woocommerce_integration.utils.add_sync_indexes.add_sync_indexes_cli
-```
-
-### 2. Update Customer Territories
-```bash
-docker-compose exec -T backend bench --site frontend execute \
-  jarz_woocommerce_integration.services.customer_sync.update_all_customer_territories_cli
-```
-
-### 3. Update Historical Invoice Status (IMPORTANT - Run After Migration)
-```bash
-# After completing historical migration, run this to set custom status fields
-docker-compose exec -T backend bench --site frontend execute \
-  jarz_woocommerce_integration.utils.update_historical_invoice_status.update_historical_invoice_status_cli
-```
-
-**What this does:**
-- Sets `custom_acceptance_status` to "Accepted" for all completed/cancelled orders
-- Sets `custom_sales_invoice_state` to "Delivered" for completed orders
-- Sets `custom_sales_invoice_state` to "Cancelled" for cancelled/refunded orders
-
----
-
-## Monitoring
-
-### Watch Logs
-```bash
-docker-compose logs -f backend | grep -E "Page|created|skipped"
-```
-
-### Expected Output
-```
-Page 27/200: ✓ 100 orders (31 created, 69 skipped) - Rate: 187 orders/min
-Page 28/200: ✓ 100 orders (28 created, 72 skipped) - Rate: 184 orders/min
-...
-```
-
----
-
-## Features
-
-✅ **Bulk Customer/Item Loading** - 80% fewer database queries  
-✅ **Batch Commits** - Every 10 orders (vs per order)  
-✅ **Database Indexes** - 2-3x faster lookups  
-✅ **Memory Management** - Handles unlimited orders  
-✅ **Automatic Deduplication** - Won't create duplicates  
-✅ **Error Isolation** - Single failure doesn't stop migration  
-
----
-
-## Production Files
-
-### Core Services
 ```
 services/
-├── order_sync.py           # Order processing logic
-├── customer_sync.py        # Customer & territory sync
-└── territory_sync.py       # Territory mapping
-```
+└── order_sync.py                      # Canonical runner: _run_full_historical_migration()
 
-### Migration Tools
-```
 utils/
-├── migrate_ultra_optimized.py    # Fast migration (USE THIS)
-├── add_sync_indexes.py           # Database indexes (one-time)
-└── http_client.py                # WooCommerce API client
+├── add_sync_indexes.py                # One-time DB index setup (run before migration)
+├── update_historical_invoice_status.py # Post-processing (run after migration)
+└── migrate_ultra_optimized.py         # DEPRECATED — use _run_full_historical_migration()
 ```
 
 ---
@@ -115,32 +89,14 @@ utils/
 
 ### Check Specific Order
 ```bash
-bench --site frontend console
-
->>> frappe.db.exists("WooCommerce Order Map", {"woo_order_id": "6284"})
->>> frappe.get_doc("WooCommerce Order Map", {"woo_order_id": "6284"})
-```
-
-### Restart Backend
-```bash
-docker-compose restart backend
-sleep 15
+docker exec erp_backend_1 bench --site frontend execute \
+  frappe.db.get_value \
+  --args "['WooCommerce Order Map', {'woo_order_id': 6284}, ['name', 'status', 'erpnext_sales_invoice']]"
 ```
 
 ### View Errors
-Navigate to: **Error Log** in ERPNext UI (filter by "woo")
+Navigate to: **Error Log** in ERPNext UI (filter by "order_sync" or "Migration")
 
 ---
 
-## Success Metrics
-
-✅ **150-200 orders/minute** (3-4x faster than baseline)  
-✅ **50-70 minutes** for 10K orders (vs 3.5 hours)  
-✅ **80% fewer** database queries  
-✅ **100% safe** - zero business logic changes  
-
----
-
-**Status**: ✅ Production Ready  
-**Method**: Ultra-Optimized Sequential Migration  
-**Last Updated**: October 22, 2025
+**Last Updated**: April 2026

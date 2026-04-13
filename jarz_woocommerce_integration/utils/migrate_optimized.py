@@ -1,4 +1,11 @@
-"""Simple CLI wrapper for optimized historical migration."""
+"""Simple CLI wrapper for optimized historical migration.
+
+.. deprecated::
+    This module is superseded by ``_run_full_historical_migration()`` in
+    ``jarz_woocommerce_integration.services.order_sync``, which is the single
+    canonical migration runner.  Do not use this module for new migrations.
+    It is kept only for historical reference.
+"""
 import frappe
 from jarz_woocommerce_integration.services.order_sync import migrate_historical_orders
 import gc

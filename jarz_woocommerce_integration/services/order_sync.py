@@ -1382,60 +1382,6 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
     return result
 
 
-def migrate_historical_orders(limit: int = 100, page: int = 1) -> dict[str, Any]:
-    """One-time migration of historical orders (completed/cancelled only).
-
-    Creates paid Sales Invoices without accounting/inventory effects for reporting.
-
-    Usage:
-        bench --site <site> execute jarz_woocommerce_integration.services.order_sync.migrate_historical_orders --kwargs '{"limit": 100, "page": 1}'
-    """
-    settings = frappe.get_single("WooCommerce Settings")
-    ensure_custom_fields()
-
-    client = WooClient(
-        base_url=settings.base_url,
-        consumer_key=settings.consumer_key,
-        consumer_secret=settings.get_password("consumer_secret"),
-    )
-
-    # Fetch only completed and cancelled orders
-    params = {
-        "per_page": limit,
-        "page": page,
-        "status": "completed,cancelled,refunded",
-        "orderby": "date",
-        "order": "desc"
-    }
-    
-    orders = client.list_orders(params=params)
-    metrics: dict[str, Any] = {
-        "orders_fetched": len(orders),
-        "processed": 0,
-        "created": 0,
-        "skipped": 0,
-        "errors": 0,
-        "results_sample": [],
-        "is_historical": True,
-        "page": page,
-    }
-
-    for o in orders:
-        result = process_order_phase1(o, settings, allow_update=False, is_historical=True)
-        metrics["processed"] += 1
-        if result["status"] in ("created", "updated"):
-            metrics["created"] += 1
-        elif result["status"] == "error":
-            metrics["errors"] += 1
-        elif result["status"] == "skipped":
-            metrics["skipped"] += 1
-        if len(metrics["results_sample"]) < 10:
-            metrics["results_sample"].append(result)
-
-    frappe.logger().info({"event": "woo_historical_migration", "result": metrics})
-    return metrics
-
-
 def sync_orders_cron_phase1():  # pragma: no cover - scheduler entry for live orders
     """Cron job for live order sync (every 2 minutes).
     
@@ -1455,66 +1401,6 @@ def run_pos_profile_update_cli():  # pragma: no cover
             bench --site <site> execute jarz_woocommerce_integration.services.order_sync.run_pos_profile_update_cli
         """
         return pull_recent_orders_phase1(limit=10, dry_run=False, force=True, allow_update=True)
-
-
-def migrate_all_historical_orders_cli(max_pages: int = 100, batch_size: int = 50):  # pragma: no cover
-    """CLI entry point to migrate all historical orders across multiple pages with smart memory management.
-    
-    Handles up to 10,000 orders efficiently by:
-    - Using smaller batch sizes (50 orders/page instead of 100)
-    - Clearing cache and committing DB after each batch
-    - Monitoring memory and taking breaks if needed
-    
-    Usage:
-        bench --site <site> execute jarz_woocommerce_integration.services.order_sync.migrate_all_historical_orders_cli
-    """
-    import gc
-    
-    total_stats = {
-        "orders_fetched": 0,
-        "processed": 0,
-        "created": 0,
-        "skipped": 0,
-        "errors": 0,
-        "pages_processed": 0,
-        "batches_completed": 0,
-    }
-    
-    for page in range(1, max_pages + 1):
-        # Process one batch with smaller limit for better memory management
-        result = migrate_historical_orders(limit=batch_size, page=page)
-        total_stats["orders_fetched"] += result.get("orders_fetched", 0)
-        total_stats["processed"] += result.get("processed", 0)
-        total_stats["created"] += result.get("created", 0)
-        total_stats["skipped"] += result.get("skipped", 0)
-        total_stats["errors"] += result.get("errors", 0)
-        total_stats["pages_processed"] = page
-        total_stats["batches_completed"] += 1
-        
-        frappe.logger().info(f"Historical migration page {page}/{max_pages} complete: {result}")
-        
-        # Memory management: commit and clear cache every batch
-        try:
-            frappe.db.commit()
-            frappe.clear_cache()
-            gc.collect()  # Force garbage collection
-        except Exception as e:
-            frappe.logger().error(f"Cache clear error on page {page}: {str(e)}")
-        
-        # Stop if we fetched fewer orders than batch_size (reached the end)
-        if result.get("orders_fetched", 0) < batch_size:
-            frappe.logger().info(f"Migration complete - reached end of orders at page {page}")
-            break
-        
-        # Add small delay every 10 batches to prevent worker timeout
-        if page % 10 == 0:
-            import time
-            time.sleep(2)  # 2 second break every 10 batches
-            frappe.logger().info(f"Checkpoint: {total_stats['created']} orders migrated so far...")
-    
-    # Final summary
-    frappe.logger().info(f"=== MIGRATION COMPLETE === Total: {total_stats}")
-    return total_stats
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,13 @@
 """Optimized bulk order migration with caching and batch commits.
 
+.. deprecated::
+    This module is superseded by ``_run_full_historical_migration()`` in
+    ``jarz_woocommerce_integration.services.order_sync``, which is the single
+    canonical migration runner.  It adds status filtering, resume-from-page,
+    Redis progress tracking, and a full MigrationCache (all data pre-loaded
+    once) — all missing from this module.  Do not use this module for new
+    migrations.  It is kept only for historical reference.
+
 This module provides optimized order sync functions that:
 1. Cache customer/item lookups upfront (bulk queries)
 2. Batch database commits (every 10 orders instead of every order)
