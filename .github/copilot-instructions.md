@@ -2,6 +2,8 @@
 
 > **DOMAIN ISOLATION**: This app (`jarz_woocommerce_integration`) is completely independent from `jarz_pos`. Never import from, reference, or create dependencies on `jarz_pos` in this codebase.
 
+> **GIT-ONLY DEPLOYMENT**: All code changes to staging/production MUST go through git (local edit → commit → push → pull on server). NEVER edit files directly on any server. If uncommitted local changes are found on a server, commit them to a branch first, merge, then deploy.
+
 ## Project Overview
 Single ERPNext app located at `apps/jarz_woocommerce_integration`. It ingests WooCommerce data (customers, territories, orders) and creates/upgrades Sales Invoices using bundle logic maintained inside this app.
 
