@@ -699,6 +699,14 @@ def _create_payment_entry(invoice_name: str, payment_method: str | None, posting
             )
             return None
 
+        paid_from = frappe.db.get_value("Company", company, "default_receivable_account")
+        if not paid_from:
+            frappe.log_error(
+                f"No default_receivable_account for company={company}",
+                "Payment Entry Creation Failed",
+            )
+            return None
+
         pe_date = posting_date or frappe.utils.today()
         pe = frappe.get_doc({
             "doctype": "Payment Entry",
@@ -707,6 +715,7 @@ def _create_payment_entry(invoice_name: str, payment_method: str | None, posting
             "company": company,
             "party_type": "Customer",
             "party": inv.customer,
+            "paid_from": paid_from,
             "paid_to": paid_to,
             "paid_amount": pay_amount,
             "received_amount": pay_amount,
