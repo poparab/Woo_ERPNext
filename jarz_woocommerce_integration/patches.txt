@@ -6,3 +6,4 @@
 # Patches added in this section will be executed after doctypes are migrated
 jarz_woocommerce_integration.patches.ensure_woo_code_column
 jarz_woocommerce_integration.patches.ensure_custom_woo_code_column
+jarz_woocommerce_integration.patches.set_default_kashier_account
