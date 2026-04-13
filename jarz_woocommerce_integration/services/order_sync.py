@@ -168,7 +168,7 @@ def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str
     return {"docstatus": 0, "custom_state": "Draft", "is_paid": False}
 
 
-def _map_payment_method(woo_payment_method: str | None) -> str | None:
+def _map_payment_method(woo_payment_method: str | None, woo_payment_method_title: str | None = None) -> str | None:
     """Map WooCommerce payment method to ERPNext custom_payment_method.
     
     WooCommerce -> ERPNext mapping:
@@ -177,12 +177,14 @@ def _map_payment_method(woo_payment_method: str | None) -> str | None:
     - wallet -> Mobile Wallet
     - card -> Kashier Card
     - kashier_card -> Kashier Card
+    - kashier -> title-aware fallback (wallet -> Kashier Wallet, else Kashier Card)
     - kashier_wallet -> Kashier Wallet
     """
     if not woo_payment_method:
         return None
     
     pm = woo_payment_method.lower().strip()
+    title = (woo_payment_method_title or "").lower().strip()
     if pm == "cod":
         return "Cash"
     elif pm == "instapay":
@@ -191,6 +193,8 @@ def _map_payment_method(woo_payment_method: str | None) -> str | None:
         return "Mobile Wallet"
     elif pm in ("card", "kashier_card"):
         return "Kashier Card"
+    elif pm == "kashier":
+        return "Kashier Wallet" if "wallet" in title else "Kashier Card"
     elif pm == "kashier_wallet":
         return "Kashier Wallet"
     else:
@@ -955,7 +959,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     
     # Map payment method
     woo_payment_method = order.get("payment_method")
-    custom_payment_method = _map_payment_method(woo_payment_method)
+    woo_payment_method_title = order.get("payment_method_title")
+    custom_payment_method = _map_payment_method(woo_payment_method, woo_payment_method_title)
     
     status_map = _map_status(woo_status, is_historical=is_historical)
 
