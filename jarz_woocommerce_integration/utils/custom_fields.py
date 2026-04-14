@@ -407,11 +407,13 @@ def ensure_custom_fields():  # pragma: no cover - install / migration helper
             "dt": dt,
             "fieldname": fn,
             "fieldtype": spec["fieldtype"],
-            "label": spec["label"],
+            "label": spec.get("label", ""),
             "insert_after": spec.get("insert_after"),
             "options": spec.get("options"),
-            "read_only": 0,
-            "no_copy": 1,
+            "collapsible": spec.get("collapsible", 0),
+            "read_only": spec.get("read_only", 0),
+            "no_copy": spec.get("no_copy", 0),
+            "in_standard_filter": spec.get("in_standard_filter", 0),
         })
         cf.insert(ignore_permissions=True)
     frappe.clear_cache()
