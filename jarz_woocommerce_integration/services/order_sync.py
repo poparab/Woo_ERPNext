@@ -660,6 +660,65 @@ def _parse_delivery_parts(o: dict) -> tuple[str | None, str | None, int | None]:
     return date_part, time_from, duration_minutes
 
 
+# Maps WooCommerce Order Attribution meta_data keys to ERPNext Sales Invoice fieldnames.
+ATTRIBUTION_META_MAP: dict[str, str] = {
+    "_wc_order_attribution_source_type": "woo_source_type",
+    "_wc_order_attribution_utm_source": "woo_utm_source",
+    "_wc_order_attribution_utm_medium": "woo_utm_medium",
+    "_wc_order_attribution_utm_campaign": "woo_utm_campaign",
+    "_wc_order_attribution_utm_content": "woo_utm_content",
+    "_wc_order_attribution_utm_term": "woo_utm_term",
+    "_wc_order_attribution_utm_id": "woo_utm_id",
+    "_wc_order_attribution_referrer": "woo_referrer",
+    "_wc_order_attribution_device_type": "woo_device_type",
+    "_wc_order_attribution_session_entry": "woo_session_entry",
+    "_wc_order_attribution_session_start_time": "woo_session_start",
+    "_wc_order_attribution_session_pages": "woo_session_pages",
+    "_wc_order_attribution_session_count": "woo_session_count",
+    "_wc_order_attribution_user_agent": "woo_user_agent",
+}
+
+# First-touch fields to copy from Sales Invoice attribution → Customer record.
+# Only the 6 business-critical fields — session analytics are per-order, not per-customer.
+ATTRIBUTION_FIRST_TOUCH_FIELDS = {
+    "woo_source_type": "woo_first_source_type",
+    "woo_utm_source": "woo_first_utm_source",
+    "woo_utm_medium": "woo_first_utm_medium",
+    "woo_utm_campaign": "woo_first_utm_campaign",
+    "woo_referrer": "woo_first_referrer",
+    "woo_device_type": "woo_first_device_type",
+}
+
+
+def _extract_attribution(meta_data_list: "list[dict] | None") -> dict:
+    """Extract WooCommerce Order Attribution fields from order-level meta_data.
+
+    Returns a dict of {erpnext_fieldname: value} for every attribution key found.
+    Only includes keys that have a non-empty value.
+    Integer fields (session_pages, session_count) are cast to int where possible.
+    """
+    result: dict = {}
+    for md in (meta_data_list or []):
+        key = (md.get("key") or md.get("display_key") or "").strip()
+        field = ATTRIBUTION_META_MAP.get(key)
+        if not field:
+            continue
+        value = (md.get("value") or md.get("display_value") or "")
+        if value is None:
+            continue
+        value = str(value).strip()
+        if not value:
+            continue
+        # Cast integer fields
+        if field in ("woo_session_pages", "woo_session_count"):
+            try:
+                value = int(float(value))
+            except (ValueError, TypeError):
+                continue
+        result[field] = value
+    return result
+
+
 def _get_shipping_income_account(company: str) -> str | None:
     """Return Freight and Forwarding Charges account for the company if it exists."""
     abbr = frappe.db.get_value("Company", company, "abbr") or ""
@@ -1066,6 +1125,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             time_from_val = None
             duration_val = None
 
+        attribution = _extract_attribution(order.get("meta_data"))
+
         candidate_name = None
         candidate_doc = None
         if allow_update:
@@ -1098,6 +1159,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         inv.append("items", it)
                     if price_list:
                         inv.selling_price_list = price_list
+                    # Fix posting_date for backdated historical invoices
+                    if is_historical:
+                        inv.posting_date = _resolve_posting_date(order, is_historical)
+                        inv.set_posting_time = 1
                 if billing_addr or shipping_addr:
                     inv.customer_address = billing_addr or shipping_addr
                     inv.shipping_address_name = shipping_addr or billing_addr
@@ -1132,6 +1197,23 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                             inv.db_set("custom_payment_method", custom_payment_method, commit=False)
                         else:
                             inv.custom_payment_method = custom_payment_method
+                    except Exception:
+                        pass
+                # Apply attribution fields (marketing source, UTM, referrer, device, session)
+                if attribution:
+                    try:
+                        if inv.docstatus == 1:
+                            for _attr_field, _attr_val in attribution.items():
+                                try:
+                                    inv.db_set(_attr_field, _attr_val, commit=False)
+                                except Exception:
+                                    pass
+                        else:
+                            for _attr_field, _attr_val in attribution.items():
+                                try:
+                                    setattr(inv, _attr_field, _attr_val)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                 # Apply delivery charges: prefer WooCommerce shipping_total, fall back to territory
@@ -1182,11 +1264,15 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             if default_warehouse:
                 for it in lines:
                     it["warehouse"] = default_warehouse
+            resolved_posting_date = _resolve_posting_date(order, is_historical)
             inv_data = {
                 "doctype": "Sales Invoice",
                 "customer": customer,
                 "currency": order.get("currency") or getattr(settings, "default_currency", None) or "USD",
-                "posting_date": _resolve_posting_date(order, is_historical),
+                "posting_date": resolved_posting_date,
+                # Must set set_posting_time=1 to prevent ERPNext's validate from
+                # overriding a backdated posting_date back to today.
+                "set_posting_time": 1 if is_historical else 0,
                 "company": getattr(settings, "default_company", None) or frappe.defaults.get_global_default("company"),
                 "woo_order_id": woo_id,
                 "woo_order_number": order.get("number"),
@@ -1194,6 +1280,17 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "shipping_address_name": shipping_addr or billing_addr,
                 "items": lines,
             }
+            # Capture customer note as remarks
+            customer_note = (order.get("customer_note") or "").strip()
+            if customer_note:
+                inv_data["remarks"] = customer_note
+            # Capture WooCommerce transaction ID
+            transaction_id = (order.get("transaction_id") or "").strip()
+            if transaction_id:
+                try:
+                    inv_data["woo_transaction_id"] = transaction_id
+                except Exception:
+                    pass
             if delivery_date_val:
                 inv_data["custom_delivery_date"] = delivery_date_val
             if time_from_val:
@@ -1211,6 +1308,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             elif woo_status in ("cancelled", "refunded", "failed"):
                 inv_data["custom_acceptance_status"] = "Accepted"
                 inv_data["custom_sales_invoice_state"] = "Cancelled"
+
+            # Merge all attribution fields (safe — only non-empty values returned)
+            if attribution:
+                inv_data.update(attribution)
 
             inv = frappe.get_doc(inv_data)
             try:
@@ -1342,6 +1443,22 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         # Keep cache fresh so reruns benefit from O(1) skip
         if cache and woo_id:
             cache.order_map_set.add(int(woo_id))
+
+        # --- Customer first-touch attribution ---
+        # Only write if the customer has no first-touch data yet (first order wins).
+        if attribution and customer:
+            try:
+                existing_first = frappe.db.get_value("Customer", customer, "woo_first_source_type")
+                if not existing_first:
+                    first_touch_data = {
+                        customer_field: attribution[inv_field]
+                        for inv_field, customer_field in ATTRIBUTION_FIRST_TOUCH_FIELDS.items()
+                        if inv_field in attribution
+                    }
+                    if first_touch_data:
+                        frappe.db.set_value("Customer", customer, first_touch_data, update_modified=False)
+            except Exception:
+                pass  # Non-critical — do not block order sync
 
         return {"status": action, "invoice": inv.name, "woo_order_id": woo_id}
     except Exception as e:  # noqa: BLE001
