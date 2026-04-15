@@ -106,12 +106,14 @@ class WooClient:
         query = (params or {}).copy()
         body, headers = self._request_raw("GET", "orders", params=query)
         orders = body if isinstance(body, list) else []
+        # Normalise header keys to lowercase — some servers/proxies lowercase them
+        norm = {k.lower(): v for k, v in headers.items()}
         try:
-            total_count = int(headers.get("X-WP-Total", 0))
+            total_count = int(norm.get("x-wp-total", 0))
         except (ValueError, TypeError):
             total_count = 0
         try:
-            total_pages = int(headers.get("X-WP-TotalPages", 0))
+            total_pages = int(norm.get("x-wp-totalpages", 0))
         except (ValueError, TypeError):
             total_pages = 0
         return orders, total_count, total_pages

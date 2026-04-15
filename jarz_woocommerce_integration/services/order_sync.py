@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Tuple
 
 from frappe.utils.background_jobs import get_redis_conn
@@ -717,17 +718,20 @@ def _extract_attribution(meta_data_list: "list[dict] | None") -> dict:
     Returns a dict of {erpnext_fieldname: value} for every attribution key found.
     Only includes keys that have a non-empty value.
     Integer fields (session_pages, session_count) are cast to int where possible.
+    HTML tags from display_value fallbacks are stripped.
     """
+    _strip_html = re.compile(r"<[^>]+>")
     result: dict = {}
     for md in (meta_data_list or []):
         key = (md.get("key") or md.get("display_key") or "").strip()
         field = ATTRIBUTION_META_MAP.get(key)
         if not field:
             continue
-        value = (md.get("value") or md.get("display_value") or "")
-        if value is None:
-            continue
-        value = str(value).strip()
+        value = md.get("value")
+        if value is None or str(value).strip() == "":
+            # Fallback to display_value but strip HTML tags
+            value = md.get("display_value") or ""
+        value = _strip_html.sub("", str(value)).strip()
         if not value:
             continue
         # Cast integer fields
@@ -736,6 +740,9 @@ def _extract_attribution(meta_data_list: "list[dict] | None") -> dict:
                 value = int(float(value))
             except (ValueError, TypeError):
                 continue
+        # Truncate string values for Data fields (140 char limit)
+        if isinstance(value, str) and len(value) > 140:
+            value = value[:140]
         result[field] = value
     return result
 
