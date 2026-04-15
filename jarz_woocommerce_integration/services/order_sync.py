@@ -617,7 +617,11 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
             "qty": qty,
             "rate": rate_value,
         }
-        if erp_price is not None:
+        if is_historical:
+            # Historical: lock price_list_rate to the WooCommerce rate so
+            # ERPNext does not override it from the Price List during save.
+            row["price_list_rate"] = rate_value
+        elif erp_price is not None:
             row["price_list_rate"] = float(erp_price)
         items.append(row)
     return items, missing
@@ -1191,6 +1195,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     if is_historical:
                         inv.posting_date = _resolve_posting_date(order, is_historical)
                         inv.set_posting_time = 1
+                        inv.ignore_pricing_rule = 1
                 if billing_addr or shipping_addr:
                     inv.customer_address = billing_addr or shipping_addr
                     inv.shipping_address_name = shipping_addr or billing_addr
@@ -1308,6 +1313,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "shipping_address_name": shipping_addr or billing_addr,
                 "items": lines,
             }
+            # Historical: lock WooCommerce rates — prevent ERPNext pricing rules
+            # from overriding the rates during insert/save.
+            if is_historical:
+                inv_data["ignore_pricing_rule"] = 1
             # Capture customer note as remarks
             customer_note = (order.get("customer_note") or "").strip()
             if customer_note:
