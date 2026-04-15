@@ -212,6 +212,13 @@ REQUIRED_FIELDS = [
         "insert_after": "item_name",
     },
     {
+        "dt": "Item",
+        "fieldname": "woo_variation_id",
+        "fieldtype": "Data",
+        "label": "Woo Variation ID",
+        "insert_after": "woo_product_id",
+    },
+    {
         "dt": "Customer",
         "fieldname": "woo_customer_id",
         "fieldtype": "Data",

@@ -21,6 +21,7 @@ class MigrationCache:
     def __init__(self, price_list: str | None = None, company: str | None = None):
         self.sku_to_item: dict[str, str] = {}          # item_code → item_code
         self.woo_pid_to_item: dict[str, str] = {}      # woo_product_id → item_code
+        self.woo_vid_to_item: dict[str, str] = {}      # woo_variation_id → item_code
         self.item_prices: dict[tuple[str, str], float] = {}  # (price_list, item_code) → rate
         self.bundle_map: dict[str, str] = {}            # woo_bundle_id → bundle_code
         self.territory_chain: dict[str, dict] = {}      # territory → {pos_profile, warehouse, price_list}
@@ -48,6 +49,7 @@ class MigrationCache:
         rows = frappe.db.sql(
             "SELECT name, IFNULL(item_name, '') as item_name, "
             "IFNULL(woo_product_id, '') as woo_product_id, "
+            "IFNULL(woo_variation_id, '') as woo_variation_id, "
             "IFNULL(disabled, 0) as disabled, "
             "IFNULL(item_group, '') as item_group "
             "FROM `tabItem`",
@@ -62,6 +64,8 @@ class MigrationCache:
                 self.sku_to_item[r.name] = r.name
                 if r.woo_product_id:
                     self.woo_pid_to_item[str(r.woo_product_id).strip()] = r.name
+                if r.woo_variation_id:
+                    self.woo_vid_to_item[str(r.woo_variation_id).strip()] = r.name
             # All items (including disabled): available for name-based historical matching
             if r.item_name:
                 self.item_name_to_item[r.item_name.strip().lower()] = r.name
@@ -157,8 +161,15 @@ class MigrationCache:
         except Exception:
             pass
 
-    def resolve_item(self, sku: str, product_id) -> str | None:
-        """Resolve a Woo line item to an ERPNext item_code via cache."""
+    def resolve_item(self, sku: str, product_id, variation_id=None) -> str | None:
+        """Resolve a Woo line item to an ERPNext item_code via cache.
+
+        Resolution order: variation_id → sku → product_id.
+        """
+        if variation_id and int(variation_id) > 0:
+            found = self.woo_vid_to_item.get(str(variation_id).strip())
+            if found:
+                return found
         if sku and sku in self.sku_to_item:
             return self.sku_to_item[sku]
         if product_id:
@@ -346,6 +357,7 @@ def _build_bundle_selections(
     for wc in woo_children:
         wc_sku = (wc.get("sku") or "").strip()
         wc_product_id = wc.get("product_id")
+        wc_variation_id = wc.get("variation_id")
         wc_qty = int(float(wc.get("quantity") or 0))
         if wc_qty <= 0:
             continue
@@ -353,11 +365,16 @@ def _build_bundle_selections(
         # Resolve to ERPNext Item code
         wc_item_code = None
         if cache:
-            wc_item_code = cache.resolve_item(wc_sku, wc_product_id)
+            wc_item_code = cache.resolve_item(wc_sku, wc_product_id, variation_id=wc_variation_id)
         else:
-            if wc_sku and frappe.db.exists("Item", wc_sku):
+            # Variation lookup first
+            if wc_variation_id and int(wc_variation_id) > 0:
+                wc_item_code = frappe.db.get_value(
+                    "Item", {"woo_variation_id": str(wc_variation_id)}, "name"
+                )
+            if not wc_item_code and wc_sku and frappe.db.exists("Item", wc_sku):
                 wc_item_code = wc_sku
-            elif wc_product_id:
+            if not wc_item_code and wc_product_id:
                 wc_item_code = frappe.db.get_value(
                     "Item", {"woo_product_id": str(wc_product_id)}, "name"
                 )
@@ -443,6 +460,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
     for li in line_items:
         sku = (li.get("sku") or "").strip()
         product_id = li.get("product_id")
+        variation_id = li.get("variation_id")
         qty = float(li.get("quantity") or 0) or 0
         if qty <= 0:
             continue
@@ -524,14 +542,17 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
         if parent_id_in_meta and str(parent_id_in_meta) in handled_parents:
             continue
 
-        # 3) Fall back to direct Item by SKU or woo_product_id - for regular items
+        # 3) Fall back to direct Item by variation_id, SKU, or woo_product_id
         item_code = None
         if cache:
-            item_code = cache.resolve_item(sku, product_id)
+            item_code = cache.resolve_item(sku, product_id, variation_id=variation_id)
         else:
-            if sku and frappe.db.exists("Item", sku):
+            # Variation lookup first
+            if variation_id and int(variation_id) > 0:
+                item_code = frappe.db.get_value("Item", {"woo_variation_id": str(variation_id)}, "name")
+            if not item_code and sku and frappe.db.exists("Item", sku):
                 item_code = sku
-            elif product_id:
+            if not item_code and product_id:
                 item_code = frappe.db.get_value("Item", {"woo_product_id": str(product_id)}, "name")
 
         # 3b) Historical: name-based fallback for product_id=0 legacy bundles
