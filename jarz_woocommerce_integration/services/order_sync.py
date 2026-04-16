@@ -538,6 +538,16 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
                 missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id, "reason": "bundle_error"})
                 continue
 
+        # 1b) Unregistered WOOSB parent — flag as missing rather than creating flat items
+        if not bundle_code and product_id and str(product_id) in child_parent_ids:
+            frappe.logger().error(
+                f"Unregistered WOOSB bundle parent: product_id={product_id}, "
+                f"name={li.get('name')}. Register it in the Woo Jarz Bundle table."
+            )
+            missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id, "reason": "unregistered_bundle"})
+            handled_parents.add(str(product_id))
+            continue
+
         # 2) If this is a woosb child for a parent we've already handled via Woo Jarz Bundle, skip it
         parent_id_in_meta = _get_parent_id_from_meta(li.get("meta_data"))
         if parent_id_in_meta and str(parent_id_in_meta) in handled_parents:

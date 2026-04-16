@@ -557,6 +557,13 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     billing_addr_name = None
     shipping_addr_name = None
 
+    # Check if billing and shipping are the same physical address
+    same_address = (
+        billing_line1
+        and shipping_line1
+        and billing_line1.strip().lower() == shipping_line1.strip().lower()
+    )
+
     # Ensure billing address if present
     if billing_line1:
         existing = _find_existing_address_for_customer(customer, "Billing", billing_line1, address_cache=address_cache)
@@ -568,8 +575,12 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
             if address_cache is not None and not existing:
                 address_cache[(customer, "Billing", billing_line1.lower())] = billing_addr_name
 
-    # Ensure shipping address if present
-    if shipping_line1:
+    if same_address and billing_addr_name:
+        # Reuse billing address for shipping — same physical address
+        shipping_addr_name = billing_addr_name
+        _set_address_as_default(billing_addr_name, customer, "Shipping")
+    elif shipping_line1:
+        # Different address — create/find shipping separately
         existing = _find_existing_address_for_customer(customer, "Shipping", shipping_line1, address_cache=address_cache)
         shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email)
         # Set as default shipping address for this customer
@@ -678,8 +689,21 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
             _set_address_as_default(new_addr, customer_name, kind)
         return new_addr
 
+    billing_line1 = (billing.get("address_1") or "").strip()
+    shipping_line1 = (shipping.get("address_1") or "").strip()
+    same_address = (
+        billing_line1
+        and shipping_line1
+        and billing_line1.lower() == shipping_line1.lower()
+    )
+
     billing_name = _upsert_address("Billing", billing)
-    shipping_name = _upsert_address("Shipping", shipping)
+    if same_address and billing_name:
+        # Reuse billing address for shipping — same physical address
+        shipping_name = billing_name
+        _set_address_as_default(billing_name, customer_name, "Shipping")
+    else:
+        shipping_name = _upsert_address("Shipping", shipping)
 
     # Assign territory from shipping state (delivery zone)
     # Prefer shipping address, fallback to billing

@@ -49,9 +49,21 @@ def _sync_single_customer(cust: Dict[str, Any]) -> dict:
             return existing
         return _create_address(customer_name, kind.capitalize(), data, data.get("phone"), email)
 
+    billing_line1 = (billing.get("address_1") or "").strip()
+    shipping_line1 = (shipping.get("address_1") or "").strip()
+    same_address = (
+        billing_line1
+        and shipping_line1
+        and billing_line1.lower() == shipping_line1.lower()
+    )
+
     try:
         billing_addr = _upsert_address("billing", billing)
-        shipping_addr = _upsert_address("shipping", shipping)
+        if same_address and billing_addr:
+            # Reuse billing address for shipping — same physical address
+            shipping_addr = billing_addr
+        else:
+            shipping_addr = _upsert_address("shipping", shipping)
         created_or_updated["billing"] = billing_addr
         created_or_updated["shipping"] = shipping_addr
     except Exception as e:  # noqa: BLE001
