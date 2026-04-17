@@ -313,7 +313,8 @@ class BundleProcessor:
             unit_rate = flt(item["rate"], rate_precision)
             qty_total = flt(item["qty"]) * self.quantity
             expected_rate = unit_rate * (1 - uniform_pct / 100.0)
-            line_total = flt(expected_rate * qty_total, amount_precision)
+            discounted_rate = flt(expected_rate, rate_precision)
+            line_total = flt(discounted_rate * qty_total, amount_precision)
             running_total += line_total
 
             child_lines.append(
@@ -322,7 +323,7 @@ class BundleProcessor:
                     "item_name": item["item"].item_name,
                     "description": item["item"].description or item["item"].item_name,
                     "qty": qty_total,
-                    "rate": unit_rate,
+                    "rate": discounted_rate,
                     "price_list_rate": unit_rate,
                     "discount_percentage": uniform_pct,
                     "is_bundle_child": 1,
@@ -351,6 +352,7 @@ class BundleProcessor:
                 adjusted_pct = ((unit_rate - desired_rate) / unit_rate) * 100.0
                 adjusted_pct = min(max(0.0, adjusted_pct), 100.0)
                 last["discount_percentage"] = flt(adjusted_pct, 6)
+                last["rate"] = flt(desired_rate, rate_precision)
 
         for line in child_lines:
             line.pop("_unit_rate", None)
@@ -480,9 +482,7 @@ def test_bundle_pricing(bundle_identifier: str, qty: int = 1) -> dict:
     child_discounted_sum = 0.0
     for line in items:
         if line.get("is_bundle_child"):
-            original = line["rate"] * line["qty"]
-            discount = original * (line.get("discount_percentage", 0) / 100.0)
-            child_discounted_sum += flt(original - discount, 2)
+            child_discounted_sum += flt(line["rate"] * line["qty"], 2)
     return {
         "bundle_identifier": bundle_identifier,
         "qty": qty,

@@ -971,17 +971,21 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             existing_map = None
     order_hash = _compute_order_hash(order)
 
-    # Skip if order hasn't changed since last sync (hash match + valid invoice link)
+    # Skip if order hasn't changed since last sync (hash match + valid invoice link
+    # AND the linked Sales Invoice is still live, i.e. not cancelled).
     if existing_map and existing_map.get("hash") == order_hash and existing_map.get(LINK_FIELD):
-        return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
+        linked_docstatus = frappe.db.get_value("Sales Invoice", existing_map[LINK_FIELD], "docstatus")
+        if linked_docstatus is not None and int(linked_docstatus) != 2:
+            return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
 
     # Hard idempotency: if a Sales Invoice already exists with this woo_order_id, use it
+    # Exclude cancelled invoices (docstatus=2) so re-sync after cancellation works correctly
     linked_invoice_name = None
     duplicate_invoices = []
     try:
         si_list = frappe.get_all(
             "Sales Invoice",
-            filters={"woo_order_id": woo_id},
+            filters={"woo_order_id": woo_id, "docstatus": ["!=", 2]},
             fields=["name", "creation"],
             order_by="creation desc",
             page_length=5,
@@ -1201,11 +1205,12 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         inv.append("items", it)
                     if price_list:
                         inv.selling_price_list = price_list
+                    # Prevent ERPNext pricing rules from overriding bundle rates
+                    inv.ignore_pricing_rule = 1
                     # Fix posting_date for backdated historical invoices
                     if is_historical:
                         inv.posting_date = _resolve_posting_date(order, is_historical)
                         inv.set_posting_time = 1
-                        inv.ignore_pricing_rule = 1
                 if billing_addr or shipping_addr:
                     inv.customer_address = billing_addr or shipping_addr
                     inv.shipping_address_name = shipping_addr or billing_addr
@@ -1323,10 +1328,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "shipping_address_name": shipping_addr or billing_addr,
                 "items": lines,
             }
-            # Historical: lock WooCommerce rates — prevent ERPNext pricing rules
-            # from overriding the rates during insert/save.
-            if is_historical:
-                inv_data["ignore_pricing_rule"] = 1
+            # Prevent ERPNext pricing rules from overriding the rates set by
+            # BundleProcessor (or any other rate logic) during insert/save.
+            inv_data["ignore_pricing_rule"] = 1
             # Capture customer note as remarks
             customer_note = (order.get("customer_note") or "").strip()
             if customer_note:
@@ -1633,7 +1637,10 @@ def sync_orders_cron_phase1():  # pragma: no cover - scheduler entry for live or
     """Cron job for live order sync (every 2 minutes).
     
     Fetches recent orders, skips pending payment, creates unpaid submitted invoices.
+    Guarded by WooCommerce Settings → Enable Inbound Order Sync.
     """
+    if not frappe.db.get_single_value("WooCommerce Settings", "enable_inbound_orders"):
+        return
     try:
         res = pull_recent_orders_phase1(limit=20, is_historical=False)
         frappe.logger().info({"event": "woo_order_sync_live", "result": res})

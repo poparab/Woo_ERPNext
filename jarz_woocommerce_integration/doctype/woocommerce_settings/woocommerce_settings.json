@@ -13,6 +13,8 @@
   "auto_create_customers",
   "last_synced_customer_created",
   "webhook_secret",
+  "section_inbound",
+  "enable_inbound_orders",
   "section_outbound",
   "enable_outbound_customers",
   "enable_outbound_orders",
@@ -81,6 +83,17 @@
    "label": "Webhook Secret"
   },
   {
+   "fieldname": "section_inbound",
+   "fieldtype": "Section Break",
+   "label": "Inbound Sync"
+  },
+  {
+   "default": "1",
+   "fieldname": "enable_inbound_orders",
+   "fieldtype": "Check",
+   "label": "Enable Inbound Order Sync"
+  },
+  {
    "fieldname": "section_outbound",
    "fieldtype": "Section Break",
    "label": "Outbound Sync"
@@ -139,7 +152,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2025-08-30 15:43:27.288661",
+ "modified": "2026-04-17 18:00:00.000000",
  "modified_by": "Administrator",
  "module": "Jarz WooCommerce Integration",
  "name": "WooCommerce Settings",

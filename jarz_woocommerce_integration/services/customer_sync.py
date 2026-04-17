@@ -497,12 +497,15 @@ def _resolve_territory_from_state(state_value: str | None, territory_state_cache
 def _create_address(customer: str, address_type: str, data: dict, phone: str | None, email: str | None) -> str:
     country_val = _resolve_country(data.get("country"))
     city_val = (data.get("city") or "").strip() or (data.get("state") or "").strip() or "Unknown"
+    # Truncate address fields to ERPNext's 240-char limit (WC sometimes has junk HTML)
+    addr_line1 = (data.get("address_1") or "")[:240]
+    addr_line2 = (data.get("address_2") or "")[:240]
     addr = frappe.get_doc({
         "doctype": "Address",
         "address_title": customer,
         "address_type": address_type,
-        "address_line1": data.get("address_1") or "",
-        "address_line2": data.get("address_2") or "",
+        "address_line1": addr_line1,
+        "address_line2": addr_line2,
         "city": city_val,
         "state": data.get("state") or "",
         "pincode": data.get("postcode") or "",
