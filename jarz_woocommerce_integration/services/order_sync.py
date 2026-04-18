@@ -426,9 +426,8 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
     """Build Sales Invoice Item rows from Woo order line_items.
 
         Pricing policy:
-        - Live sync: Ignore WooCommerce prices/totals completely.
-          Use ERPNext Price List rates for normal items (Item Price by price_list).
-        - Historical sync: Use WooCommerce line item prices. If zero, fall back to ERPNext Price List rates.
+        - Always use ERPNext Price List rates for standalone items.
+        - WooCommerce prices/totals/discounts are NEVER used for item rates.
     - Prefer Woo Jarz Bundle expansion for bundles (uses internal pricing from Woo Jarz Bundle),
             even when Woo sends woosb parent/child lines; expand once from the parent and skip
             the related children to avoid duplication.
@@ -589,7 +588,9 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
             missing.append({"name": li.get("name"), "sku": sku, "product_id": product_id})
             continue
 
-        # Pricing: historical uses Woo prices (fallback to ERPNext), live uses ERPNext only
+        # Pricing: always use ERPNext Price List rate.
+        # Bundle items are already handled by BundleProcessor above (with their own
+        # discount_percentage logic).  Standalone items always get ERPNext prices.
         erp_price = None
         if cache:
             erp_price = cache.get_price(item_code, price_list)
@@ -600,25 +601,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
             except Exception:
                 erp_price = None
 
-        if is_historical:
-            # Historical: prefer WooCommerce line item price, fallback to ERPNext
-            woo_price = 0.0
-            try:
-                woo_price = float(li.get("price") or 0)
-            except (ValueError, TypeError):
-                pass
-            if woo_price == 0 and qty > 0:
-                try:
-                    woo_price = float(li.get("subtotal") or 0) / qty
-                except (ValueError, TypeError, ZeroDivisionError):
-                    pass
-            if woo_price > 0:
-                rate_value = woo_price
-            else:
-                rate_value = float(erp_price or 0) if erp_price is not None else 0
-        else:
-            # Live: ERPNext pricing only (unchanged)
-            rate_value = float(erp_price or 0) if erp_price is not None else 0
+        rate_value = float(erp_price or 0) if erp_price is not None else 0
 
         if rate_value == 0:
             frappe.logger().warning(f"Item {item_code} has zero rate (price_list={price_list}, sku={sku})")
@@ -627,11 +610,7 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
             "qty": qty,
             "rate": rate_value,
         }
-        if is_historical:
-            # Historical: lock price_list_rate to the WooCommerce rate so
-            # ERPNext does not override it from the Price List during save.
-            row["price_list_rate"] = rate_value
-        elif erp_price is not None:
+        if erp_price is not None:
             row["price_list_rate"] = float(erp_price)
         items.append(row)
     return items, missing
