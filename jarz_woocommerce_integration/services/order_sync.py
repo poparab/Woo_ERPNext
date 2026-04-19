@@ -1275,6 +1275,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 elif woo_status in ("cancelled", "refunded", "failed"):
                     inv.db_set("custom_acceptance_status", "Accepted", commit=False)
                     inv.db_set("custom_sales_invoice_state", "Cancelled", commit=False)
+                    # Populate cancellation classification fields (owned by jarz_pos; defensive check)
+                    try:
+                        _meta = frappe.get_meta("Sales Invoice")
+                        if _meta.get_field("custom_cancellation_type"):
+                            _cancel_type = "WooCommerce Refunded" if woo_status == "refunded" else "WooCommerce Cancelled"
+                            _cancel_reason = f"Order {woo_status} on WooCommerce (Order #{woo_id})"
+                            inv.db_set("custom_cancellation_type", _cancel_type, commit=False)
+                            inv.db_set("custom_cancellation_reason", _cancel_reason, commit=False)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -1338,6 +1348,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             elif woo_status in ("cancelled", "refunded", "failed"):
                 inv_data["custom_acceptance_status"] = "Accepted"
                 inv_data["custom_sales_invoice_state"] = "Cancelled"
+                # Populate cancellation classification fields (owned by jarz_pos; defensive check)
+                try:
+                    if frappe.get_meta("Sales Invoice").get_field("custom_cancellation_type"):
+                        inv_data["custom_cancellation_type"] = "WooCommerce Refunded" if woo_status == "refunded" else "WooCommerce Cancelled"
+                        inv_data["custom_cancellation_reason"] = f"Order {woo_status} on WooCommerce (Order #{woo_id})"
+                except Exception:
+                    pass
 
             # Merge all attribution fields (safe — only non-empty values returned)
             if attribution:
