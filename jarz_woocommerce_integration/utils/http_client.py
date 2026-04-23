@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import requests  # third-party
 from requests.auth import HTTPBasicAuth
+from urllib3 import disable_warnings
+from urllib3.exceptions import InsecureRequestWarning
 
 
 class WooAPIError(Exception):
@@ -18,6 +21,28 @@ class WooAPIError(Exception):
         self.payload = payload or {}
 
 
+def _should_bypass_ssl_verification(base_url: str) -> bool:
+    """Allow a temporary SSL bypass only for staging ERP talking to staging Woo."""
+
+    try:
+        import frappe
+    except Exception:  # noqa: BLE001
+        return False
+
+    hostname = (urlparse(base_url).hostname or "").lower()
+    if hostname != "stage.orderjarz.com":
+        return False
+
+    host_name = str(getattr(frappe.conf, "host_name", "") or "").rstrip("/")
+    if not host_name:
+        try:
+            host_name = str(frappe.get_site_config().get("host_name", "") or "").rstrip("/")
+        except Exception:  # noqa: BLE001
+            host_name = ""
+
+    return host_name == "https://erpstg.orderjarz.com"
+
+
 @dataclass
 class WooClient:
     base_url: str
@@ -25,11 +50,17 @@ class WooClient:
     consumer_secret: str
     api_version: str = "v3"
     timeout: int = 60
+    verify_ssl: bool | None = None
     _session: requests.Session | None = None
 
     def __post_init__(self):
         self._session = requests.Session()
         self._session.auth = HTTPBasicAuth(self.consumer_key, self.consumer_secret)
+        if self.verify_ssl is None:
+            self.verify_ssl = not _should_bypass_ssl_verification(self.base_url)
+        self._session.verify = self.verify_ssl
+        if self.verify_ssl is False:
+            disable_warnings(InsecureRequestWarning)
 
     def _build_url(self, resource: str) -> str:
         resource = resource.lstrip("/")
