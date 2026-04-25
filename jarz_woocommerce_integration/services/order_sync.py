@@ -1581,6 +1581,8 @@ def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: boo
             process_order_phase1(o, settings, allow_update=allow_update, is_historical=is_historical)
             if not dry_run else {"status": "dry_run", "woo_order_id": o.get("id")}
         )
+        if not dry_run and result.get("status") != "error":
+            frappe.db.commit()
         metrics["processed"] += 1
         if result["status"] in ("created", "updated"):
             metrics["created"] += 1
@@ -1625,7 +1627,17 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
         }
 
     result = process_order_phase1(order, settings, allow_update=allow_update)
-    result["success"] = result.get("status") in ("created", "updated")
+    skipped_success_reasons = {
+        "already_mapped",
+        "unchanged",
+        "pending_payment",
+        "processing",
+        "locked",
+        "db_locked",
+    }
+    result["success"] = result.get("status") in ("created", "updated") or (
+        result.get("status") == "skipped" and result.get("reason") in skipped_success_reasons
+    )
     return result
 
 
