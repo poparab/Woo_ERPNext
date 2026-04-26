@@ -957,14 +957,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         if linked_docstatus is not None and int(linked_docstatus) != 2:
             return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
 
-    # Hard idempotency: if a Sales Invoice already exists with this woo_order_id, use it
-    # Exclude cancelled invoices (docstatus=2) so re-sync after cancellation works correctly
+    # Hard idempotency: if a live Sales Invoice already exists with this woo_order_id, use it.
+    # Only consider submitted (docstatus=1) or draft (docstatus=0) invoices — never cancelled.
+    # Previously this filter used ["!=", 2] which caused a new SI to be created after every
+    # cancellation while the cancelled ghost persisted, generating duplicate SIs over time.
     linked_invoice_name = None
     duplicate_invoices = []
     try:
         si_list = frappe.get_all(
             "Sales Invoice",
-            filters={"woo_order_id": woo_id, "docstatus": ["!=", 2]},
+            filters={"woo_order_id": woo_id, "docstatus": ["in", [0, 1]]},
             fields=["name", "creation"],
             order_by="creation desc",
             page_length=5,
