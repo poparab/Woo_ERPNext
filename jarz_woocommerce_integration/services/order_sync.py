@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any, Tuple
 
 from frappe.utils.background_jobs import get_redis_conn
@@ -283,6 +284,57 @@ def _add_payment_failure_comment(invoice_name: str, woo_order_id: Any) -> None:
                 frappe.get_traceback(),
                 "Woo Payment Failure Comment Error",
             )
+
+
+def _format_datetime_for_woo(dt_val: datetime) -> str:
+    if dt_val.tzinfo is None:
+        dt_val = dt_val.replace(tzinfo=timezone.utc)
+    dt_utc = dt_val.astimezone(timezone.utc)
+    return dt_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _minutes_ago_for_woo(minutes: int) -> str:
+    dt_val = frappe.utils.add_to_date(
+        frappe.utils.now_datetime(), minutes=-int(minutes), as_datetime=True
+    )
+    return _format_datetime_for_woo(dt_val)
+
+
+def _list_orders_window(
+    client: WooClient,
+    params: dict[str, Any],
+    max_pages: int = 1,
+) -> tuple[list[dict[str, Any]], int, int]:
+    base_params = (params or {}).copy()
+    per_page = max(1, min(int(base_params.get("per_page") or 20), 100))
+    page = max(1, int(base_params.get("page") or 1))
+    page_limit = max(1, int(max_pages or 1))
+    base_params["per_page"] = per_page
+
+    orders: list[dict[str, Any]] = []
+    pages_fetched = 0
+    total_pages = 0
+
+    while pages_fetched < page_limit:
+        current_params = base_params.copy()
+        current_params["page"] = page
+        page_orders, _, response_total_pages = client.list_orders_with_meta(params=current_params)
+        pages_fetched += 1
+        total_pages = max(total_pages, int(response_total_pages or 0))
+
+        if not page_orders:
+            break
+
+        orders.extend(page_orders)
+
+        if len(page_orders) < per_page:
+            break
+        if response_total_pages and page >= int(response_total_pages):
+            break
+
+        page += 1
+
+    return orders, pages_fetched, total_pages
 
 
 def _resolve_posting_date(order: dict, is_historical: bool) -> str:
@@ -1177,6 +1229,24 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         if candidate_doc:
             inv = candidate_doc
             action = "updated"
+            try:
+                current_woo_order_id = getattr(inv, "woo_order_id", None)
+                current_woo_order_number = getattr(inv, "woo_order_number", None)
+                needs_db_set = inv.docstatus in (1, 2)
+
+                if str(current_woo_order_id or "") != str(woo_id):
+                    if needs_db_set:
+                        inv.db_set("woo_order_id", woo_id, commit=False)
+                    else:
+                        inv.woo_order_id = woo_id
+
+                if order.get("number") and str(current_woo_order_number or "") != str(order.get("number")):
+                    if needs_db_set:
+                        inv.db_set("woo_order_number", order.get("number"), commit=False)
+                    else:
+                        inv.woo_order_number = order.get("number")
+            except Exception:
+                pass
             if inv.docstatus != 2:
                 if inv.docstatus == 0:
                     inv.set("items", [])
@@ -1538,7 +1608,19 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 pass
 
 
-def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: bool = False, allow_update: bool = True, is_historical: bool = False) -> dict[str, Any]:
+def pull_recent_orders_phase1(
+    limit: int = 20,
+    dry_run: bool = False,
+    force: bool = False,
+    allow_update: bool = True,
+    is_historical: bool = False,
+    status: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    orderby: str | None = None,
+    order: str | None = None,
+    max_pages: int = 1,
+) -> dict[str, Any]:
     """Pull recent orders from WooCommerce.
     
     Args:
@@ -1548,6 +1630,12 @@ def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: boo
         allow_update: Allow updating existing invoices
         is_historical: True for historical migration (completed/cancelled only, marked as paid)
                       False for live orders (all statuses, marked as unpaid)
+        status: Optional WooCommerce status filter
+        after: Optional WooCommerce lower timestamp bound (ISO 8601)
+        before: Optional WooCommerce upper timestamp bound (ISO 8601)
+        orderby: Optional WooCommerce sort field
+        order: Optional WooCommerce sort direction
+        max_pages: Maximum pages to scan from WooCommerce
     """
     settings = frappe.get_single("WooCommerce Settings")
     ensure_custom_fields()
@@ -1558,15 +1646,30 @@ def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: boo
         consumer_secret=settings.get_password("consumer_secret"),
     )
 
-    # Build params based on mode
-    params = {"per_page": limit}
-    if is_historical:
-        # Historical: only fetch completed and cancelled orders
-        params["status"] = "completed,cancelled,refunded"
-    
-    orders = client.list_orders(params=params)
+    params: dict[str, Any] = {"per_page": max(1, min(int(limit), 100))}
+    effective_status = status
+    if is_historical and not effective_status:
+        effective_status = "completed,cancelled,refunded"
+    if effective_status:
+        params["status"] = effective_status
+    if after:
+        params["after"] = after
+    if before:
+        params["before"] = before
+    if orderby:
+        params["orderby"] = orderby
+    if order:
+        params["order"] = order
+
+    orders, pages_fetched, total_pages = _list_orders_window(
+        client,
+        params=params,
+        max_pages=max_pages,
+    )
     metrics: dict[str, Any] = {
         "orders_fetched": len(orders),
+        "pages_fetched": pages_fetched,
+        "total_pages": total_pages,
         "processed": 0,
         "created": 0,
         "skipped": 0,
@@ -1576,6 +1679,12 @@ def pull_recent_orders_phase1(limit: int = 20, dry_run: bool = False, force: boo
         "force": force,
         "allow_update": allow_update,
         "is_historical": is_historical,
+        "status": effective_status,
+        "after": after,
+        "before": before,
+        "orderby": orderby,
+        "order": order,
+        "max_pages": max_pages,
     }
 
     for o in orders:
@@ -1652,10 +1761,36 @@ def sync_orders_cron_phase1():  # pragma: no cover - scheduler entry for live or
     if not frappe.db.get_single_value("WooCommerce Settings", "enable_inbound_orders"):
         return
     try:
-        res = pull_recent_orders_phase1(limit=20, is_historical=False)
+        res = pull_recent_orders_phase1(
+            limit=100,
+            is_historical=False,
+            after=_minutes_ago_for_woo(30),
+            orderby="modified",
+            order="desc",
+            max_pages=1,
+        )
         frappe.logger().info({"event": "woo_order_sync_live", "result": res})
     except Exception:  # noqa: BLE001
         frappe.logger().error({"event": "woo_order_sync_live_error", "traceback": frappe.get_traceback()})
+
+
+def sync_cancelled_orders_cron():  # pragma: no cover - scheduler entry for cancelled/refunded orders
+    """Catch cancelled/refunded Woo orders that fall outside the short live polling window."""
+    if not frappe.db.get_single_value("WooCommerce Settings", "enable_inbound_orders"):
+        return
+    try:
+        res = pull_recent_orders_phase1(
+            limit=100,
+            is_historical=False,
+            status="cancelled,refunded,failed",
+            after=_minutes_ago_for_woo(120),
+            orderby="modified",
+            order="desc",
+            max_pages=6,
+        )
+        frappe.logger().info({"event": "woo_order_sync_cancelled", "result": res})
+    except Exception:  # noqa: BLE001
+        frappe.logger().error({"event": "woo_order_sync_cancelled_error", "traceback": frappe.get_traceback()})
 
 
 def run_pos_profile_update_cli():  # pragma: no cover

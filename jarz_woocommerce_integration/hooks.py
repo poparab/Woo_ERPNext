@@ -170,6 +170,10 @@ scheduler_events = {
 		"*/2 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
 		],
+		# Cancelled/refunded catch-up sync every 15 minutes (by modified timestamp)
+		"7,22,37,52 * * * *": [
+			"jarz_woocommerce_integration.services.order_sync.sync_cancelled_orders_cron"
+		],
 		"10 * * * *": [
 			"jarz_woocommerce_integration.services.outbound_sync.reconcile_outbound_state"
 		]
