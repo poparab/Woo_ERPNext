@@ -409,14 +409,25 @@ def reconcile_cancelled_orders(
                 if dry_run:
                     result = {"success": True, "status": "dry_run", "woo_order_id": woo_order_id}
                 else:
-                    result = pull_single_order_phase1(
-                        order_id=woo_order_id,
-                        dry_run=False,
-                        force=False,
-                        allow_update=True,
-                    )
-                    if result.get("success"):
-                        frappe.db.commit()
+                    try:
+                        result = pull_single_order_phase1(
+                            order_id=woo_order_id,
+                            dry_run=False,
+                            force=False,
+                            allow_update=True,
+                        )
+                        if result.get("success"):
+                            frappe.db.commit()
+                    except Exception:
+                        try:
+                            frappe.db.rollback()
+                        except Exception:
+                            pass
+                        result = {
+                            "success": False,
+                            "reason": frappe.get_traceback()[:500],
+                            "woo_order_id": woo_order_id,
+                        }
 
                 if result.get("success"):
                     if bucket == "MATCH_ACTIVE":
