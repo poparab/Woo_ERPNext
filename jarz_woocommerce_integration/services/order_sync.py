@@ -56,6 +56,7 @@ class MigrationCache:
         self.woo_vid_to_item: dict[str, str] = {}      # woo_variation_id → item_code
         self.item_prices: dict[tuple[str, str], float] = {}  # (price_list, item_code) → rate
         self.bundle_map: dict[str, str] = {}            # woo_bundle_id → bundle_code
+        self.bundle_free_shipping: dict[str, bool] = {}  # bundle_code → free_shipping
         self.territory_chain: dict[str, dict] = {}      # territory → {pos_profile, warehouse, price_list}
         self.customer_cache: dict[str, str] = {}        # composite key → customer name
         self.order_map_set: set[int] = set()            # woo_order_ids already mapped
@@ -113,10 +114,12 @@ class MigrationCache:
 
     def _load_bundles(self):
         rows = frappe.db.sql(
-            "SELECT name, woo_bundle_id FROM `tabWoo Jarz Bundle`",
+            "SELECT name, woo_bundle_id, IFNULL(free_shipping, 0) AS free_shipping "
+            "FROM `tabWoo Jarz Bundle`",
             as_dict=True,
         )
         for r in rows:
+            self.bundle_free_shipping[r.name] = bool(r.free_shipping)
             if r.woo_bundle_id:
                 self.bundle_map[str(r.woo_bundle_id).strip()] = r.name
 
@@ -224,6 +227,11 @@ class MigrationCache:
         if product_id:
             return self.bundle_map.get(str(product_id).strip())
         return None
+
+    def bundle_has_free_shipping(self, bundle_code: str | None) -> bool:
+        if not bundle_code:
+            return False
+        return bool(self.bundle_free_shipping.get(bundle_code))
 
     def get_territory_data(self, territory_name: str | None) -> dict:
         if not territory_name:
@@ -673,7 +681,7 @@ def _build_bundle_selections(
     return selected_items
 
 
-def _build_invoice_items(order: dict, price_list: str | None = None, cache: "MigrationCache | None" = None, is_historical: bool = False) -> Tuple[list[dict], list[dict]]:
+def _build_invoice_items(order: dict, price_list: str | None = None, cache: "MigrationCache | None" = None, is_historical: bool = False) -> Tuple[list[dict], list[dict], dict[str, Any]]:
     """Build Sales Invoice Item rows from Woo order line_items.
 
         Pricing policy:
@@ -683,11 +691,13 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
             even when Woo sends woosb parent/child lines; expand once from the parent and skip
             the related children to avoid duplication.
 
-    Returns: (items, missing_items_info)
+    Returns: (items, missing_items_info, bundle_context)
     missing contains entries for lines we could not map (no item code/sku).
     """
     items: list[dict] = []
     missing: list[dict] = []
+    bundle_codes: set[str] = set()
+    free_shipping_bundle_codes: set[str] = set()
 
     line_items = order.get("line_items") or []
 
@@ -766,6 +776,9 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
                 frappe.logger().info(f"====================================")
 
                 frappe.logger().info(f"Bundle {bundle_code} expanded into {len(bundle_lines)} line items for qty {qty}")
+                bundle_codes.add(bundle_code)
+                if _bundle_has_free_shipping(bundle_code, cache=cache):
+                    free_shipping_bundle_codes.add(bundle_code)
                 
                 # CRITICAL: Use BundleProcessor items AS-IS with price_list_rate and discount_percentage
                 # BundleProcessor follows the integration's bundle logic:
@@ -865,7 +878,15 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
         if erp_price is not None:
             row["price_list_rate"] = float(erp_price)
         items.append(row)
-    return items, missing
+    return (
+        items,
+        missing,
+        {
+            "bundle_codes": sorted(bundle_codes),
+            "free_shipping_bundle_codes": sorted(free_shipping_bundle_codes),
+            "has_free_shipping_bundle": bool(free_shipping_bundle_codes),
+        },
+    )
 
 
 def _parse_delivery_parts(o: dict) -> tuple[str | None, str | None, int | None]:
@@ -1040,6 +1061,160 @@ def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str 
     if account_head:
         row["account_head"] = account_head
     inv.append("taxes", row)
+
+
+def _tax_row_value(row: Any, fieldname: str, default: Any = None) -> Any:
+    if hasattr(row, "get"):
+        try:
+            return row.get(fieldname, default)
+        except TypeError:
+            value = row.get(fieldname)
+            return default if value is None else value
+    return getattr(row, fieldname, default)
+
+
+def _bundle_has_free_shipping(bundle_code: str | None, cache: "MigrationCache | None" = None) -> bool:
+    if not bundle_code:
+        return False
+    if cache:
+        return cache.bundle_has_free_shipping(bundle_code)
+    try:
+        return bool(int(frappe.db.get_value("Woo Jarz Bundle", bundle_code, "free_shipping") or 0))
+    except Exception:
+        return False
+
+
+def _get_delivery_charge_rows(inv) -> list[dict[str, Any]]:
+    rows = []
+    for tax in inv.get("taxes", []) or []:
+        description = str(_tax_row_value(tax, "description", "") or "")
+        if description.startswith("Shipping Income"):
+            try:
+                amount = float(_tax_row_value(tax, "tax_amount", 0) or 0)
+            except Exception:
+                amount = 0.0
+            rows.append(
+                {
+                    "description": description,
+                    "tax_amount": amount,
+                }
+            )
+    return rows
+
+
+def _clear_delivery_charge_rows(inv) -> None:
+    keep_rows = []
+    for tax in inv.get("taxes", []) or []:
+        description = str(_tax_row_value(tax, "description", "") or "")
+        if not description.startswith("Shipping Income"):
+            keep_rows.append(tax)
+    inv.set("taxes", keep_rows)
+
+
+def _resolve_delivery_charge_policy(
+    territory_name: str | None,
+    has_free_shipping_bundle: bool,
+    cache: "MigrationCache | None" = None,
+) -> dict[str, Any]:
+    if has_free_shipping_bundle:
+        return {
+            "amount": 0.0,
+            "description": None,
+            "reason": "free_shipping_bundle",
+        }
+
+    delivery_amt = 0.0
+    if territory_name:
+        if cache:
+            territory_data = cache.get_territory_data(territory_name)
+            delivery_amt = float(territory_data.get("delivery_income", 0) or 0)
+        elif frappe.db.exists("Territory", territory_name):
+            delivery_amt = float(
+                frappe.db.get_value("Territory", territory_name, "delivery_income") or 0
+            )
+
+    if delivery_amt > 0:
+        return {
+            "amount": delivery_amt,
+            "description": f"Shipping Income ({territory_name})",
+            "reason": "territory_delivery_income",
+        }
+
+    return {
+        "amount": 0.0,
+        "description": None,
+        "reason": "territory_missing_or_zero",
+    }
+
+
+def _apply_delivery_charge_policy(
+    inv,
+    territory_name: str | None,
+    has_free_shipping_bundle: bool,
+    cache: "MigrationCache | None" = None,
+) -> dict[str, Any]:
+    before_rows = _get_delivery_charge_rows(inv)
+    decision = _resolve_delivery_charge_policy(
+        territory_name,
+        has_free_shipping_bundle=has_free_shipping_bundle,
+        cache=cache,
+    )
+
+    _clear_delivery_charge_rows(inv)
+    if decision["amount"] > 0:
+        add_delivery_charges_to_taxes(
+            inv,
+            decision["amount"],
+            delivery_description=decision["description"],
+        )
+
+    try:
+        inv.calculate_taxes_and_totals()
+    except Exception:
+        pass
+
+    after_rows = _get_delivery_charge_rows(inv)
+    decision["changed"] = before_rows != after_rows
+    decision["before_rows"] = before_rows
+    decision["after_rows"] = after_rows
+
+    try:
+        frappe.logger().info(
+            {
+                "event": "woo_delivery_policy_applied",
+                "invoice": getattr(inv, "name", None),
+                "territory": territory_name,
+                "has_free_shipping_bundle": has_free_shipping_bundle,
+                "reason": decision["reason"],
+                "amount": decision["amount"],
+                "changed": decision["changed"],
+            }
+        )
+    except Exception:
+        pass
+
+    return decision
+
+
+def _enqueue_delivery_charge_repost(inv) -> None:
+    if getattr(inv, "docstatus", 0) != 1:
+        return
+
+    repost_doc = frappe.get_doc(
+        {
+            "doctype": "Repost Accounting Ledger",
+            "company": inv.company,
+            "delete_cancelled_entries": 1,
+            "vouchers": [
+                {
+                    "voucher_type": inv.doctype,
+                    "voucher_no": inv.name,
+                }
+            ],
+        }
+    )
+    repost_doc.insert(ignore_permissions=True)
+    repost_doc.submit()
 
 
 def _resolve_paid_to_account(payment_method: str | None, company: str, cache: "MigrationCache | None" = None) -> str | None:
@@ -1420,18 +1595,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except Exception:
         price_list = None
 
-    lines, missing = _build_invoice_items(order, price_list=price_list, cache=cache, is_historical=is_historical)
+    lines, missing, bundle_context = _build_invoice_items(
+        order,
+        price_list=price_list,
+        cache=cache,
+        is_historical=is_historical,
+    )
     if missing:
         return {"status": "skipped", "reason": "unmapped_items", "details": missing, "woo_order_id": woo_id}
     if not lines:
         return {"status": "skipped", "reason": "no_lines", "woo_order_id": woo_id}
-
-    # Extract WooCommerce shipping total (preferred over territory-based delivery income)
-    woo_shipping_total = 0.0
-    try:
-        woo_shipping_total = float(order.get("shipping_total") or 0)
-    except (ValueError, TypeError):
-        pass
 
     # Check payment status for live orders
     woo_status = (order.get("status") or "").lower()
@@ -1510,6 +1683,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         if candidate_doc:
             inv = candidate_doc
             action = "updated"
+            delivery_result = None
             try:
                 current_woo_order_id = getattr(inv, "woo_order_id", None)
                 current_woo_order_number = getattr(inv, "woo_order_number", None)
@@ -1596,23 +1770,20 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                                     pass
                     except Exception:
                         pass
-                # Apply delivery charges: prefer WooCommerce shipping_total, fall back to territory
                 try:
-                    delivery_amt = woo_shipping_total
-                    delivery_desc = "Shipping Income (WooCommerce)"
-                    if not delivery_amt and territory_name:
-                        if cache:
-                            td = cache.get_territory_data(territory_name)
-                            delivery_amt = td.get("delivery_income", 0)
-                        elif frappe.db.exists("Territory", territory_name):
-                            delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
-                        if delivery_amt:
-                            delivery_desc = f"Shipping Income ({territory_name})"
-                    if delivery_amt and delivery_amt > 0:
-                        add_delivery_charges_to_taxes(inv, delivery_amt, delivery_description=delivery_desc)
+                    delivery_result = _apply_delivery_charge_policy(
+                        inv,
+                        territory_name=territory_name,
+                        has_free_shipping_bundle=bundle_context.get("has_free_shipping_bundle", False),
+                        cache=cache,
+                    )
                 except Exception:
                     pass
+                if inv.docstatus == 1 and delivery_result and delivery_result.get("changed"):
+                    inv.flags.ignore_validate_update_after_submit = True
                 inv.save(ignore_permissions=True, ignore_version=True)
+                if inv.docstatus == 1 and delivery_result and delivery_result.get("changed"):
+                    _enqueue_delivery_charge_repost(inv)
 
             try:
                 if status_map.get("custom_state"):
@@ -1723,22 +1894,15 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         pass
             except Exception:
                 pass
-            # Apply delivery charges: prefer WooCommerce shipping_total, fall back to territory
             try:
                 if not territory_name:
                     territory_name = frappe.db.get_value("Customer", customer, "territory")
-                delivery_amt = woo_shipping_total
-                delivery_desc = "Shipping Income (WooCommerce)"
-                if not delivery_amt and territory_name:
-                    if cache:
-                        td = cache.get_territory_data(territory_name)
-                        delivery_amt = td.get("delivery_income", 0)
-                    elif frappe.db.exists("Territory", territory_name):
-                        delivery_amt = float(frappe.db.get_value("Territory", territory_name, "delivery_income") or 0)
-                    if delivery_amt:
-                        delivery_desc = f"Shipping Income ({territory_name})"
-                if delivery_amt and delivery_amt > 0:
-                    add_delivery_charges_to_taxes(inv, delivery_amt, delivery_description=delivery_desc)
+                _apply_delivery_charge_policy(
+                    inv,
+                    territory_name=territory_name,
+                    has_free_shipping_bundle=bundle_context.get("has_free_shipping_bundle", False),
+                    cache=cache,
+                )
             except Exception:
                 pass
             inv.insert(ignore_permissions=True)
