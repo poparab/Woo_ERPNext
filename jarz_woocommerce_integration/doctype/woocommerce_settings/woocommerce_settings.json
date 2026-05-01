@@ -15,6 +15,20 @@
   "webhook_secret",
   "section_inbound",
   "enable_inbound_orders",
+    "live_order_overlap_minutes",
+    "live_order_max_pages",
+    "cancelled_order_overlap_minutes",
+    "cancelled_order_max_pages",
+    "order_reconcile_lookback_minutes",
+    "order_reconcile_max_pages",
+    "inbound_cursor_section",
+    "live_order_cursor_modified_gmt",
+    "live_order_cursor_order_id",
+    "live_order_cursor_synced_on",
+    "cursor_column_break",
+    "cancelled_order_cursor_modified_gmt",
+    "cancelled_order_cursor_order_id",
+    "cancelled_order_cursor_synced_on",
   "section_outbound",
   "enable_outbound_customers",
   "enable_outbound_orders",
@@ -93,6 +107,87 @@
    "fieldtype": "Check",
    "label": "Enable Inbound Order Sync"
   },
+    {
+     "default": "15",
+     "fieldname": "live_order_overlap_minutes",
+     "fieldtype": "Int",
+     "label": "Live Order Overlap Minutes"
+    },
+    {
+     "default": "6",
+     "fieldname": "live_order_max_pages",
+     "fieldtype": "Int",
+     "label": "Live Order Max Pages"
+    },
+    {
+     "default": "180",
+     "fieldname": "cancelled_order_overlap_minutes",
+     "fieldtype": "Int",
+     "label": "Cancelled Order Overlap Minutes"
+    },
+    {
+     "default": "12",
+     "fieldname": "cancelled_order_max_pages",
+     "fieldtype": "Int",
+     "label": "Cancelled Order Max Pages"
+    },
+    {
+     "default": "1440",
+     "fieldname": "order_reconcile_lookback_minutes",
+     "fieldtype": "Int",
+     "label": "Order Reconcile Lookback Minutes"
+    },
+    {
+     "default": "20",
+     "fieldname": "order_reconcile_max_pages",
+     "fieldtype": "Int",
+     "label": "Order Reconcile Max Pages"
+    },
+    {
+     "fieldname": "inbound_cursor_section",
+     "fieldtype": "Section Break",
+     "label": "Inbound Recovery State"
+    },
+    {
+     "fieldname": "live_order_cursor_modified_gmt",
+     "fieldtype": "Data",
+     "label": "Live Order Cursor Modified GMT",
+     "read_only": 1
+    },
+    {
+     "fieldname": "live_order_cursor_order_id",
+     "fieldtype": "Int",
+     "label": "Live Order Cursor Order ID",
+     "read_only": 1
+    },
+    {
+     "fieldname": "live_order_cursor_synced_on",
+     "fieldtype": "Datetime",
+     "label": "Live Order Cursor Synced On",
+     "read_only": 1
+    },
+    {
+     "fieldname": "cursor_column_break",
+     "fieldtype": "Column Break"
+    },
+    {
+     "fieldname": "cancelled_order_cursor_modified_gmt",
+     "fieldtype": "Data",
+     "label": "Cancelled Order Cursor Modified GMT",
+     "read_only": 1
+    },
+    {
+     "fieldname": "cancelled_order_cursor_order_id",
+     "fieldtype": "Int",
+     "label": "Cancelled Order Cursor Order ID",
+     "read_only": 1
+    },
+    {
+     "fieldname": "cancelled_order_cursor_synced_on",
+     "fieldtype": "Datetime",
+     "label": "Cancelled Order Cursor Synced On",
+     "read_only": 1
+    },
   {
    "fieldname": "section_outbound",
    "fieldtype": "Section Break",

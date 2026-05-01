@@ -174,6 +174,10 @@ scheduler_events = {
 		"7,22,37,52 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.sync_cancelled_orders_cron"
 		],
+		# Hourly reconciliation sweep for anything missed by webhook or the live cursor sync
+		"17 * * * *": [
+			"jarz_woocommerce_integration.services.order_sync.reconcile_recent_orders_cron"
+		],
 		"10 * * * *": [
 			"jarz_woocommerce_integration.services.outbound_sync.reconcile_outbound_state"
 		]

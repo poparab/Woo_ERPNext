@@ -1,16 +1,44 @@
 from __future__ import annotations
 
+import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Tuple
 
 from frappe.utils.background_jobs import get_redis_conn
+from frappe.utils import get_datetime
 
 import frappe
 
 from jarz_woocommerce_integration.utils.http_client import WooClient
 from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_fields
 from jarz_woocommerce_integration.services.customer_sync import ensure_customer_with_addresses
+
+
+DEFAULT_LIVE_ORDER_OVERLAP_MINUTES = 15
+DEFAULT_LIVE_ORDER_MAX_PAGES = 6
+DEFAULT_LIVE_BOOTSTRAP_LOOKBACK_MINUTES = 240
+
+DEFAULT_CANCELLED_ORDER_OVERLAP_MINUTES = 180
+DEFAULT_CANCELLED_ORDER_MAX_PAGES = 12
+DEFAULT_CANCELLED_BOOTSTRAP_LOOKBACK_MINUTES = 1440
+
+DEFAULT_RECONCILE_LOOKBACK_MINUTES = 1440
+DEFAULT_RECONCILE_MAX_PAGES = 20
+RECONCILE_ORDER_STATUSES = "processing,completed,cancelled,refunded,failed"
+
+ORDER_SYNC_CURSOR_FIELDS = {
+    "live": {
+        "modified": "live_order_cursor_modified_gmt",
+        "order_id": "live_order_cursor_order_id",
+        "synced_on": "live_order_cursor_synced_on",
+    },
+    "cancelled": {
+        "modified": "cancelled_order_cursor_modified_gmt",
+        "order_id": "cancelled_order_cursor_order_id",
+        "synced_on": "cancelled_order_cursor_synced_on",
+    },
+}
 
 
 class MigrationCache:
@@ -294,10 +322,162 @@ def _format_datetime_for_woo(dt_val: datetime) -> str:
 
 
 def _minutes_ago_for_woo(minutes: int) -> str:
-    dt_val = frappe.utils.add_to_date(
-        frappe.utils.now_datetime(), minutes=-int(minutes), as_datetime=True
-    )
-    return _format_datetime_for_woo(dt_val)
+    return _format_datetime_for_woo(datetime.now(timezone.utc) - timedelta(minutes=int(minutes)))
+
+
+def _extract_order_modified_ts(order: dict[str, Any]) -> datetime | None:
+    for key in ("date_modified_gmt", "date_modified", "date_created_gmt", "date_created"):
+        raw = order.get(key)
+        if not raw:
+            continue
+        try:
+            dt_val = get_datetime(raw)
+            if dt_val is None:
+                continue
+            if dt_val.tzinfo is None:
+                dt_val = dt_val.replace(tzinfo=timezone.utc)
+            return dt_val.astimezone(timezone.utc)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _extract_order_cursor(order: dict[str, Any]) -> tuple[datetime | None, int]:
+    modified_at = _extract_order_modified_ts(order)
+    try:
+        order_id = int(order.get("id") or 0)
+    except Exception:  # noqa: BLE001
+        order_id = 0
+    return modified_at, order_id
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return int(default)
+
+
+def _get_setting_int(settings: Any, fieldname: str, default: int) -> int:
+    return max(1, _safe_int(getattr(settings, fieldname, default) or default, default))
+
+
+def _get_order_sync_cursor(settings: Any, cursor_name: str) -> tuple[datetime | None, int]:
+    fields = ORDER_SYNC_CURSOR_FIELDS[cursor_name]
+    raw_modified = getattr(settings, fields["modified"], None)
+    modified_at = None
+    if raw_modified:
+        try:
+            modified_at = get_datetime(raw_modified)
+            if modified_at is not None and modified_at.tzinfo is None:
+                modified_at = modified_at.replace(tzinfo=timezone.utc)
+            if modified_at is not None:
+                modified_at = modified_at.astimezone(timezone.utc)
+        except Exception:  # noqa: BLE001
+            modified_at = None
+    order_id = _safe_int(getattr(settings, fields["order_id"], 0) or 0, 0)
+    return modified_at, order_id
+
+
+def _set_order_sync_cursor(
+    settings: Any,
+    cursor_name: str,
+    modified_at: datetime | None,
+    order_id: int,
+    synced_on: datetime | None = None,
+) -> None:
+    fields = ORDER_SYNC_CURSOR_FIELDS[cursor_name]
+    updates = {
+        fields["order_id"]: int(order_id or 0),
+        fields["synced_on"]: synced_on or frappe.utils.now_datetime(),
+    }
+    if modified_at is not None:
+        updates[fields["modified"]] = _format_datetime_for_woo(modified_at)
+
+    for fieldname, value in updates.items():
+        frappe.db.set_single_value("WooCommerce Settings", fieldname, value)
+        setattr(settings, fieldname, value)
+
+
+def _update_order_sync_cursor_from_metrics(settings: Any, cursor_name: str, metrics: dict[str, Any]) -> None:
+    latest_raw = metrics.get("latest_seen_modified_gmt")
+    latest_dt = None
+    if latest_raw:
+        try:
+            latest_dt = get_datetime(latest_raw)
+            if latest_dt is not None and latest_dt.tzinfo is None:
+                latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+            if latest_dt is not None:
+                latest_dt = latest_dt.astimezone(timezone.utc)
+        except Exception:  # noqa: BLE001
+            latest_dt = None
+    latest_order_id = _safe_int(metrics.get("latest_seen_order_id") or 0, 0)
+    _set_order_sync_cursor(settings, cursor_name, latest_dt, latest_order_id)
+
+
+def _serialize_sync_message(message: Any, limit: int = 1000) -> str:
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        text = message
+    else:
+        try:
+            text = json.dumps(message, ensure_ascii=False, default=str, sort_keys=True)
+        except Exception:  # noqa: BLE001
+            text = str(message)
+    return text[:limit]
+
+
+def create_sync_log_entry(
+    operation: str,
+    status: str,
+    message: Any,
+    *,
+    woo_order_id: int | None = None,
+    started_on: datetime | None = None,
+):
+    try:
+        return frappe.get_doc(
+            {
+                "doctype": "WooCommerce Sync Log",
+                "operation": operation,
+                "woo_order_id": woo_order_id,
+                "status": status,
+                "message": _serialize_sync_message(message),
+                "started_on": started_on or frappe.utils.now_datetime(),
+            }
+        ).insert(ignore_permissions=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def finish_sync_log_entry(
+    log_doc: Any,
+    status: str,
+    message: Any,
+    *,
+    traceback: str | None = None,
+    started_on: datetime | None = None,
+) -> None:
+    if not log_doc:
+        return
+    ended_on = frappe.utils.now_datetime()
+    duration = None
+    if started_on is not None:
+        duration = (ended_on - started_on).total_seconds()
+    try:
+        updates = {
+            "status": status,
+            "message": _serialize_sync_message(message),
+            "ended_on": ended_on,
+        }
+        if duration is not None:
+            updates["duration"] = duration
+        if traceback:
+            updates["traceback"] = traceback[:2000]
+        log_doc.db_set(updates, commit=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _list_orders_window(
@@ -1645,6 +1825,8 @@ def pull_recent_orders_phase1(
     status: str | None = None,
     after: str | None = None,
     before: str | None = None,
+    modified_after: str | None = None,
+    modified_before: str | None = None,
     orderby: str | None = None,
     order: str | None = None,
     max_pages: int = 1,
@@ -1661,6 +1843,8 @@ def pull_recent_orders_phase1(
         status: Optional WooCommerce status filter
         after: Optional WooCommerce lower timestamp bound (ISO 8601)
         before: Optional WooCommerce upper timestamp bound (ISO 8601)
+        modified_after: Optional WooCommerce lower modified timestamp bound (ISO 8601)
+        modified_before: Optional WooCommerce upper modified timestamp bound (ISO 8601)
         orderby: Optional WooCommerce sort field
         order: Optional WooCommerce sort direction
         max_pages: Maximum pages to scan from WooCommerce
@@ -1684,6 +1868,10 @@ def pull_recent_orders_phase1(
         params["after"] = after
     if before:
         params["before"] = before
+    if modified_after:
+        params["modified_after"] = modified_after
+    if modified_before:
+        params["modified_before"] = modified_before
     if orderby:
         params["orderby"] = orderby
     if order:
@@ -1710,12 +1898,25 @@ def pull_recent_orders_phase1(
         "status": effective_status,
         "after": after,
         "before": before,
+        "modified_after": modified_after,
+        "modified_before": modified_before,
         "orderby": orderby,
         "order": order,
         "max_pages": max_pages,
     }
+    skip_reasons: dict[str, int] = {}
+    latest_seen_modified: datetime | None = None
+    latest_seen_order_id = 0
 
     for o in orders:
+        modified_at, order_id = _extract_order_cursor(o)
+        if modified_at is not None:
+            if latest_seen_modified is None or modified_at > latest_seen_modified:
+                latest_seen_modified = modified_at
+                latest_seen_order_id = order_id
+            elif modified_at == latest_seen_modified and order_id > latest_seen_order_id:
+                latest_seen_order_id = order_id
+
         result = (
             process_order_phase1(o, settings, allow_update=allow_update, is_historical=is_historical)
             if not dry_run else {"status": "dry_run", "woo_order_id": o.get("id")}
@@ -1729,8 +1930,18 @@ def pull_recent_orders_phase1(
             metrics["errors"] += 1
         elif result["status"] in ("skipped", "dry_run"):
             metrics["skipped"] += 1
+            if result["status"] == "skipped":
+                reason = str(result.get("reason") or "unknown")
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
         if len(metrics["results_sample"]) < 10:
             metrics["results_sample"].append(result)
+
+    metrics["skip_reasons"] = skip_reasons
+    metrics["fetched_order_ids_sample"] = [o.get("id") for o in orders[:20] if o.get("id") is not None]
+    metrics["latest_seen_modified_gmt"] = (
+        _format_datetime_for_woo(latest_seen_modified) if latest_seen_modified is not None else None
+    )
+    metrics["latest_seen_order_id"] = latest_seen_order_id or None
 
     return metrics
 
@@ -1780,6 +1991,200 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
     return result
 
 
+def backfill_orders_by_ids_phase1(
+    order_ids: list[int | str] | tuple[int | str, ...] | str,
+    *,
+    dry_run: bool = False,
+    force: bool = False,
+    allow_update: bool = True,
+) -> dict[str, Any]:
+    if isinstance(order_ids, str):
+        parsed_ids = [part.strip() for part in order_ids.split(",") if part.strip()]
+    else:
+        parsed_ids = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
+
+    results: list[dict[str, Any]] = []
+    summary = {
+        "requested": len(parsed_ids),
+        "processed": 0,
+        "created": 0,
+        "updated": 0,
+        "skipped": 0,
+        "errors": 0,
+        "results": results,
+        "dry_run": dry_run,
+        "force": force,
+        "allow_update": allow_update,
+    }
+
+    for order_id in parsed_ids:
+        result = pull_single_order_phase1(
+            order_id=order_id,
+            dry_run=dry_run,
+            force=force,
+            allow_update=allow_update,
+        )
+        results.append(result)
+        summary["processed"] += 1
+        status = result.get("status")
+        if status == "created":
+            summary["created"] += 1
+        elif status == "updated":
+            summary["updated"] += 1
+        elif status == "error":
+            summary["errors"] += 1
+        else:
+            summary["skipped"] += 1
+
+    return summary
+
+
+def reconcile_recent_orders_phase1(
+    lookback_minutes: int | None = None,
+    *,
+    dry_run: bool = False,
+    statuses: str | None = None,
+    max_pages: int | None = None,
+    allow_update: bool = True,
+) -> dict[str, Any]:
+    settings = frappe.get_single("WooCommerce Settings")
+    ensure_custom_fields()
+
+    effective_lookback = max(
+        1,
+        int(
+            lookback_minutes
+            or _get_setting_int(
+                settings,
+                "order_reconcile_lookback_minutes",
+                DEFAULT_RECONCILE_LOOKBACK_MINUTES,
+            )
+        ),
+    )
+    effective_max_pages = max(
+        1,
+        int(
+            max_pages
+            or _get_setting_int(
+                settings,
+                "order_reconcile_max_pages",
+                DEFAULT_RECONCILE_MAX_PAGES,
+            )
+        ),
+    )
+    modified_after = _format_datetime_for_woo(
+        datetime.now(timezone.utc) - timedelta(minutes=effective_lookback)
+    )
+    result = pull_recent_orders_phase1(
+        limit=100,
+        dry_run=dry_run,
+        force=False,
+        allow_update=allow_update,
+        is_historical=False,
+        status=statuses or RECONCILE_ORDER_STATUSES,
+        modified_after=modified_after,
+        orderby="modified",
+        order="asc",
+        max_pages=effective_max_pages,
+    )
+    result["lookback_minutes"] = effective_lookback
+    return result
+
+
+def _run_order_cursor_sync(
+    *,
+    cursor_name: str,
+    operation: str,
+    event_name: str,
+    error_event: str,
+    status: str | None,
+    overlap_field: str,
+    default_overlap_minutes: int,
+    pages_field: str,
+    default_max_pages: int,
+    bootstrap_lookback_minutes: int,
+) -> dict[str, Any]:
+    settings = frappe.get_single("WooCommerce Settings")
+    ensure_custom_fields()
+
+    overlap_minutes = _get_setting_int(settings, overlap_field, default_overlap_minutes)
+    max_pages = _get_setting_int(settings, pages_field, default_max_pages)
+    cursor_before_dt, cursor_before_order_id = _get_order_sync_cursor(settings, cursor_name)
+
+    if cursor_before_dt is not None:
+        modified_after_dt = cursor_before_dt - timedelta(minutes=overlap_minutes)
+        cold_start = False
+    else:
+        modified_after_dt = datetime.now(timezone.utc) - timedelta(
+            minutes=max(overlap_minutes, bootstrap_lookback_minutes)
+        )
+        cold_start = True
+
+    started_on = frappe.utils.now_datetime()
+    log_doc = create_sync_log_entry(
+        operation,
+        "Started",
+        {
+            "cursor_name": cursor_name,
+            "status": status,
+            "overlap_minutes": overlap_minutes,
+            "max_pages": max_pages,
+            "cold_start": cold_start,
+            "modified_after": _format_datetime_for_woo(modified_after_dt),
+        },
+        started_on=started_on,
+    )
+
+    try:
+        result = pull_recent_orders_phase1(
+            limit=100,
+            dry_run=False,
+            force=False,
+            allow_update=True,
+            is_historical=False,
+            status=status,
+            modified_after=_format_datetime_for_woo(modified_after_dt),
+            orderby="modified",
+            order="asc",
+            max_pages=max_pages,
+        )
+        result.update(
+            {
+                "cursor_name": cursor_name,
+                "cursor_before_modified_gmt": (
+                    _format_datetime_for_woo(cursor_before_dt) if cursor_before_dt is not None else None
+                ),
+                "cursor_before_order_id": cursor_before_order_id or None,
+                "cold_start": cold_start,
+                "overlap_minutes": overlap_minutes,
+            }
+        )
+
+        _update_order_sync_cursor_from_metrics(settings, cursor_name, result)
+        frappe.db.commit()
+
+        cursor_after_dt, cursor_after_order_id = _get_order_sync_cursor(settings, cursor_name)
+        result["cursor_after_modified_gmt"] = (
+            _format_datetime_for_woo(cursor_after_dt) if cursor_after_dt is not None else None
+        )
+        result["cursor_after_order_id"] = cursor_after_order_id or None
+
+        log_status = "Partial" if result.get("errors") else "Success"
+        finish_sync_log_entry(log_doc, log_status, result, started_on=started_on)
+        frappe.logger().info({"event": event_name, "result": result})
+        return result
+    except Exception:  # noqa: BLE001
+        finish_sync_log_entry(
+            log_doc,
+            "Failed",
+            "Exception",
+            traceback=frappe.get_traceback(),
+            started_on=started_on,
+        )
+        frappe.logger().error({"event": error_event, "traceback": frappe.get_traceback()})
+        raise
+
+
 def sync_orders_cron_phase1():  # pragma: no cover - scheduler entry for live orders
     """Cron job for live order sync (every 2 minutes).
     
@@ -1789,17 +2194,20 @@ def sync_orders_cron_phase1():  # pragma: no cover - scheduler entry for live or
     if not frappe.db.get_single_value("WooCommerce Settings", "enable_inbound_orders"):
         return
     try:
-        res = pull_recent_orders_phase1(
-            limit=100,
-            is_historical=False,
-            after=_minutes_ago_for_woo(30),
-            orderby="modified",
-            order="desc",
-            max_pages=1,
+        _run_order_cursor_sync(
+            cursor_name="live",
+            operation="CronLive",
+            event_name="woo_order_sync_live",
+            error_event="woo_order_sync_live_error",
+            status=None,
+            overlap_field="live_order_overlap_minutes",
+            default_overlap_minutes=DEFAULT_LIVE_ORDER_OVERLAP_MINUTES,
+            pages_field="live_order_max_pages",
+            default_max_pages=DEFAULT_LIVE_ORDER_MAX_PAGES,
+            bootstrap_lookback_minutes=DEFAULT_LIVE_BOOTSTRAP_LOOKBACK_MINUTES,
         )
-        frappe.logger().info({"event": "woo_order_sync_live", "result": res})
     except Exception:  # noqa: BLE001
-        frappe.logger().error({"event": "woo_order_sync_live_error", "traceback": frappe.get_traceback()})
+        return
 
 
 def sync_cancelled_orders_cron():  # pragma: no cover - scheduler entry for cancelled/refunded orders
@@ -1807,18 +2215,71 @@ def sync_cancelled_orders_cron():  # pragma: no cover - scheduler entry for canc
     if not frappe.db.get_single_value("WooCommerce Settings", "enable_inbound_orders"):
         return
     try:
-        res = pull_recent_orders_phase1(
-            limit=100,
-            is_historical=False,
+        _run_order_cursor_sync(
+            cursor_name="cancelled",
+            operation="CronCancelled",
+            event_name="woo_order_sync_cancelled",
+            error_event="woo_order_sync_cancelled_error",
             status="cancelled,refunded,failed",
-            after=_minutes_ago_for_woo(120),
-            orderby="modified",
-            order="desc",
-            max_pages=6,
+            overlap_field="cancelled_order_overlap_minutes",
+            default_overlap_minutes=DEFAULT_CANCELLED_ORDER_OVERLAP_MINUTES,
+            pages_field="cancelled_order_max_pages",
+            default_max_pages=DEFAULT_CANCELLED_ORDER_MAX_PAGES,
+            bootstrap_lookback_minutes=DEFAULT_CANCELLED_BOOTSTRAP_LOOKBACK_MINUTES,
         )
-        frappe.logger().info({"event": "woo_order_sync_cancelled", "result": res})
     except Exception:  # noqa: BLE001
-        frappe.logger().error({"event": "woo_order_sync_cancelled_error", "traceback": frappe.get_traceback()})
+        return
+
+
+def reconcile_recent_orders_cron():  # pragma: no cover - scheduler entry for missed orders
+    """Hourly recovery sweep that backfills any Woo orders missed by webhook or live cron."""
+    if not frappe.db.get_single_value("WooCommerce Settings", "enable_inbound_orders"):
+        return
+
+    settings = frappe.get_single("WooCommerce Settings")
+    lookback_minutes = _get_setting_int(
+        settings,
+        "order_reconcile_lookback_minutes",
+        DEFAULT_RECONCILE_LOOKBACK_MINUTES,
+    )
+    max_pages = _get_setting_int(
+        settings,
+        "order_reconcile_max_pages",
+        DEFAULT_RECONCILE_MAX_PAGES,
+    )
+
+    started_on = frappe.utils.now_datetime()
+    log_doc = create_sync_log_entry(
+        "Reconcile",
+        "Started",
+        {
+            "lookback_minutes": lookback_minutes,
+            "max_pages": max_pages,
+            "statuses": RECONCILE_ORDER_STATUSES,
+        },
+        started_on=started_on,
+    )
+
+    try:
+        result = reconcile_recent_orders_phase1(
+            lookback_minutes=lookback_minutes,
+            dry_run=False,
+            statuses=RECONCILE_ORDER_STATUSES,
+            max_pages=max_pages,
+            allow_update=True,
+        )
+        log_status = "Partial" if result.get("errors") else "Success"
+        finish_sync_log_entry(log_doc, log_status, result, started_on=started_on)
+        frappe.logger().info({"event": "woo_order_sync_reconcile", "result": result})
+    except Exception:  # noqa: BLE001
+        finish_sync_log_entry(
+            log_doc,
+            "Failed",
+            "Exception",
+            traceback=frappe.get_traceback(),
+            started_on=started_on,
+        )
+        frappe.logger().error({"event": "woo_order_sync_reconcile_error", "traceback": frappe.get_traceback()})
 
 
 def run_pos_profile_update_cli():  # pragma: no cover

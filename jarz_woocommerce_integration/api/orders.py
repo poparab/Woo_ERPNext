@@ -6,7 +6,12 @@ from typing import Any
 
 import frappe
 from jarz_woocommerce_integration.services.order_sync import (
+    RECONCILE_ORDER_STATUSES,
+    backfill_orders_by_ids_phase1,
+    create_sync_log_entry,
+    finish_sync_log_entry,
     pull_recent_orders_phase1,
+    reconcile_recent_orders_phase1,
     pull_single_order_phase1,
     _run_full_historical_migration,
     get_migration_progress,
@@ -29,24 +34,14 @@ def _verify_signature(raw_body: bytes, provided: str | None, secret: str | None)
 
 def _process_order_webhook(order_payload: dict[str, Any]):  # background job (must be top-level for RQ pickling)
     start = frappe.utils.now_datetime()
-    log_doc = None
+    log_doc = create_sync_log_entry(
+        "WebhookProcess",
+        "Started",
+        "Processing",
+        woo_order_id=order_payload.get("id"),
+        started_on=start,
+    )
     try:
-        # Create sync log placeholder
-        try:
-            log_doc = frappe.get_doc(
-                {
-                    "doctype": "WooCommerce Sync Log",
-                    "operation": "Webhook",
-                    "woo_order_id": order_payload.get("id"),
-                    "status": "Started",
-                    "message": "Processing",
-                    "started_on": start,
-                }
-            )
-            log_doc.insert(ignore_permissions=True)
-        except Exception:  # noqa: BLE001
-            log_doc = None
-
         # Fetch full order using existing single-order pull (ensures consistency)
         res = pull_single_order_phase1(
             order_id=order_payload.get("id"),
@@ -55,16 +50,12 @@ def _process_order_webhook(order_payload: dict[str, Any]):  # background job (mu
             allow_update=True,
         )
         duration = (frappe.utils.now_datetime() - start).total_seconds()
-        if log_doc:
-            log_doc.db_set(
-                {
-                    "status": "Success" if res.get("success") else "Failed",
-                    "message": json.dumps(res)[:1000],
-                    "ended_on": frappe.utils.now_datetime(),
-                    "duration": duration,
-                },
-                commit=True,
-            )
+        finish_sync_log_entry(
+            log_doc,
+            "Success" if res.get("success") else "Failed",
+            res,
+            started_on=start,
+        )
         frappe.logger().info(
             {
                 "event": "woo_order_webhook_processed",
@@ -74,19 +65,13 @@ def _process_order_webhook(order_payload: dict[str, Any]):  # background job (mu
             }
         )
     except Exception:  # noqa: BLE001
-        if log_doc:
-            try:
-                log_doc.db_set(
-                    {
-                        "status": "Failed",
-                        "message": "Exception",
-                        "traceback": frappe.get_traceback()[:2000],
-                        "ended_on": frappe.utils.now_datetime(),
-                    },
-                    commit=True,
-                )
-            except Exception:  # noqa: BLE001
-                pass
+        finish_sync_log_entry(
+            log_doc,
+            "Failed",
+            "Exception",
+            traceback=frappe.get_traceback(),
+            started_on=start,
+        )
         frappe.logger().error(
             {
                 "event": "woo_order_webhook_error",
@@ -124,6 +109,45 @@ def pull_order_phase1(order_id: int | str = None, dry_run: int = 0, force: int =
         frappe.throw("order_id required")
     data = pull_single_order_phase1(
         order_id=order_id, dry_run=bool(int(dry_run)), force=bool(int(force))
+    )
+    return {"success": True, "data": data}
+
+
+@frappe.whitelist(allow_guest=False)
+def backfill_order_ids_phase1(
+    order_ids: str,
+    dry_run: int = 0,
+    force: int = 0,
+    allow_update: int = 1,
+):
+    """Backfill a comma-separated list of Woo order ids using the standard inbound processor."""
+    if not order_ids:
+        frappe.throw("order_ids required")
+
+    data = backfill_orders_by_ids_phase1(
+        order_ids,
+        dry_run=bool(int(dry_run)),
+        force=bool(int(force)),
+        allow_update=bool(int(allow_update)),
+    )
+    return {"success": True, "data": data}
+
+
+@frappe.whitelist(allow_guest=False)
+def reconcile_recent_phase1(
+    lookback_minutes: int = 0,
+    dry_run: int = 0,
+    statuses: str = RECONCILE_ORDER_STATUSES,
+    max_pages: int = 0,
+    allow_update: int = 1,
+):
+    """Run the broad recent-order reconciliation sweep on demand."""
+    data = reconcile_recent_orders_phase1(
+        lookback_minutes=int(lookback_minutes or 0) or None,
+        dry_run=bool(int(dry_run)),
+        statuses=statuses or RECONCILE_ORDER_STATUSES,
+        max_pages=int(max_pages or 0) or None,
+        allow_update=bool(int(allow_update)),
     )
     return {"success": True, "data": data}
 
@@ -215,7 +239,21 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
     """
     raw_body: bytes = frappe.request.data or b""
     sig_header = frappe.get_request_header("X-WC-Webhook-Signature") or ""
+    topic_header = frappe.get_request_header("X-WC-Webhook-Topic") or ""
     debug_flag = frappe.form_dict.get("d") in ("1", "true", "True")
+    payload_hash = hashlib.sha256(raw_body).hexdigest() if raw_body else ""
+    receipt_started = frappe.utils.now_datetime()
+    receipt_log = create_sync_log_entry(
+        "WebhookReceipt",
+        "Received",
+        {
+            "topic": topic_header,
+            "body_len": len(raw_body),
+            "has_sig": bool(sig_header),
+            "payload_hash": payload_hash,
+        },
+        started_on=receipt_started,
+    )
 
     # Early receipt log
     try:
@@ -268,6 +306,17 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
             "expected_prefix": exp_pref,
             "body_len": len(raw_body),
         })
+        finish_sync_log_entry(
+            receipt_log,
+            "InvalidSignature",
+            {
+                "topic": topic_header,
+                "payload_hash": payload_hash,
+                "provided_prefix": (sig_header or "")[:18],
+                "expected_prefix": exp_pref,
+            },
+            started_on=receipt_started,
+        )
         frappe.local.response.http_status_code = 403
         return {"success": False, "error": "invalid_signature"}
 
@@ -278,9 +327,20 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
 
     # Handshake when creating webhook (no order object yet)
     if not isinstance(payload, dict) or not payload.get("id"):
+        finish_sync_log_entry(
+            receipt_log,
+            "Ack",
+            {"topic": topic_header, "payload_hash": payload_hash, "reason": "handshake"},
+            started_on=receipt_started,
+        )
         return {"success": True, "ack": True}
 
     order_id = payload.get("id")
+    if receipt_log:
+        try:
+            receipt_log.db_set({"woo_order_id": order_id}, commit=True)
+        except Exception:  # noqa: BLE001
+            pass
 
     job_name = f"woo_order_{order_id}_{frappe.utils.now_datetime().isoformat()}"
     try:
@@ -296,6 +356,17 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
             "order_id": order_id,
             "job_name": job_name,
         })
+        finish_sync_log_entry(
+            receipt_log,
+            "Queued",
+            {
+                "order_id": order_id,
+                "topic": topic_header,
+                "payload_hash": payload_hash,
+                "job_name": job_name,
+            },
+            started_on=receipt_started,
+        )
         resp = {"success": True, "queued": True, "job_name": job_name}
     except Exception:  # noqa: BLE001
         # Fail open: ack the webhook but capture diagnostic so Woo keeps delivering
@@ -304,6 +375,18 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
             "order_id": order_id,
             "traceback": frappe.get_traceback(),
         })
+        finish_sync_log_entry(
+            receipt_log,
+            "EnqueueFailed",
+            {
+                "order_id": order_id,
+                "topic": topic_header,
+                "payload_hash": payload_hash,
+                "job_name": job_name,
+            },
+            traceback=frappe.get_traceback(),
+            started_on=receipt_started,
+        )
         resp = {"success": False, "queued": False, "job_name": job_name, "error": "enqueue_failed"}
     if debug_flag:
         resp["debug"] = {"body_len": len(raw_body)}
