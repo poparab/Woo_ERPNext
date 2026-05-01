@@ -26,6 +26,8 @@ DEFAULT_CANCELLED_BOOTSTRAP_LOOKBACK_MINUTES = 1440
 DEFAULT_RECONCILE_LOOKBACK_MINUTES = 1440
 DEFAULT_RECONCILE_MAX_PAGES = 20
 RECONCILE_ORDER_STATUSES = "processing,completed,cancelled,refunded,failed"
+KASHIER_AUTO_PAY_METHODS = {"Kashier Card", "Kashier Wallet"}
+NON_PAYABLE_WOO_STATUSES = {"cancelled", "refunded", "failed"}
 
 ORDER_SYNC_CURSOR_FIELDS = {
     "live": {
@@ -287,6 +289,23 @@ def _map_payment_method(woo_payment_method: str | None, woo_payment_method_title
         return "Kashier Wallet"
     else:
         return None
+
+
+def _should_treat_inbound_order_as_paid(
+    woo_status: str | None,
+    custom_payment_method: str | None,
+    status_map: dict[str, Any] | None = None,
+    is_historical: bool = False,
+) -> bool:
+    """Return whether inbound processing should settle the invoice with a Payment Entry."""
+    status = (woo_status or "").strip().lower()
+    if status in NON_PAYABLE_WOO_STATUSES:
+        return False
+    if status_map and status_map.get("is_paid"):
+        return True
+    if is_historical:
+        return False
+    return (custom_payment_method or "").strip() in KASHIER_AUTO_PAY_METHODS and status in {"processing", "completed"}
 
 
 def _add_payment_failure_comment(invoice_name: str, woo_order_id: Any) -> None:
@@ -1111,6 +1130,82 @@ def _create_payment_entry(invoice_name: str, payment_method: str | None, posting
         return None
 
 
+def _maybe_create_payment_entry_for_invoice(
+    inv,
+    order: dict[str, Any],
+    status_map: dict[str, Any],
+    custom_payment_method: str | None,
+    woo_payment_method: str | None,
+    is_historical: bool = False,
+    cache: "MigrationCache | None" = None,
+    skip_payment_entry: bool = False,
+) -> None:
+    if not inv or inv.docstatus != 1 or skip_payment_entry:
+        return
+
+    woo_status = order.get("status")
+    woo_id = order.get("id")
+    should_be_paid = _should_treat_inbound_order_as_paid(
+        woo_status,
+        custom_payment_method,
+        status_map=status_map,
+        is_historical=is_historical,
+    )
+    if not should_be_paid:
+        return
+
+    if not custom_payment_method:
+        frappe.log_error(
+            f"Paid Woo invoice {inv.name} has no mapped payment method (woo_method={woo_payment_method})",
+            "Payment Entry Mapping Missing",
+        )
+        try:
+            frappe.get_doc("Sales Invoice", inv.name).add_comment(
+                "Comment",
+                f"⚠ No mapped payment method for WooCommerce order {woo_id} (woo_method={woo_payment_method})",
+            )
+        except Exception:
+            pass
+        return
+
+    already_paid = frappe.db.exists(
+        "Payment Entry Reference",
+        {"reference_doctype": "Sales Invoice", "reference_name": inv.name},
+    )
+    if already_paid:
+        return
+
+    try:
+        pe_posting_date = _resolve_posting_date(order, is_historical)
+        payment_entry = _create_payment_entry(
+            inv.name,
+            custom_payment_method,
+            posting_date=pe_posting_date,
+            cache=cache,
+        )
+        if payment_entry:
+            frappe.logger().info(
+                {
+                    "event": "payment_entry_created",
+                    "invoice": inv.name,
+                    "payment_entry": payment_entry,
+                    "method": custom_payment_method,
+                }
+            )
+    except Exception as pe_error:
+        frappe.log_error(
+            f"Failed to create payment for {inv.name}: {str(pe_error)}",
+            "Payment Entry Creation Error",
+        )
+        try:
+            frappe.get_doc("Sales Invoice", inv.name).add_comment(
+                "Comment",
+                f"⚠ Payment Entry creation failed for WooCommerce order {woo_id}: {pe_error}",
+            )
+        except Exception:
+            pass
+
+
 def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None, skip_payment_entry: bool = False) -> dict:
     """Process a single Woo order into a Sales Invoice.
     
@@ -1676,59 +1771,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     inv.submit()
                 inv.cancel()
 
-        if inv and inv.docstatus == 1 and status_map.get("is_paid") and not skip_payment_entry:
-            if custom_payment_method:
-                # Idempotency: skip PE creation if SI is already fully reconciled in PLE.
-                # This handles webhook re-delivery and status transitions where the SI was
-                # already paid through another path.
-                already_paid = frappe.db.exists(
-                    "Payment Entry Reference",
-                    {"reference_doctype": "Sales Invoice", "reference_name": inv.name},
-                )
-                if already_paid:
-                    pass  # PE already exists — nothing to do
-                else:
-                    try:
-                        pe_posting_date = _resolve_posting_date(order, is_historical)
-                        payment_entry = _create_payment_entry(
-                            inv.name,
-                            custom_payment_method,
-                            posting_date=pe_posting_date,
-                            cache=cache,
-                        )
-                        if payment_entry:
-                            frappe.logger().info(
-                                {
-                                    "event": "payment_entry_created",
-                                    "invoice": inv.name,
-                                    "payment_entry": payment_entry,
-                                    "method": custom_payment_method,
-                                }
-                            )
-                    except Exception as pe_error:
-                        frappe.log_error(
-                            f"Failed to create payment for {inv.name}: {str(pe_error)}",
-                            "Payment Entry Creation Error",
-                        )
-                        try:
-                            frappe.get_doc("Sales Invoice", inv.name).add_comment(
-                                "Comment",
-                                f"⚠ Payment Entry creation failed for WooCommerce order {woo_id}: {pe_error}",
-                            )
-                        except Exception:
-                            pass
-            else:
-                frappe.log_error(
-                    f"Paid Woo invoice {inv.name} has no mapped payment method (woo_method={woo_payment_method})",
-                    "Payment Entry Mapping Missing",
-                )
-                try:
-                    frappe.get_doc("Sales Invoice", inv.name).add_comment(
-                        "Comment",
-                        f"⚠ No mapped payment method for WooCommerce order {woo_id} (woo_method={woo_payment_method})",
-                    )
-                except Exception:
-                    pass
+        _maybe_create_payment_entry_for_invoice(
+            inv,
+            order,
+            status_map,
+            custom_payment_method,
+            woo_payment_method,
+            is_historical=is_historical,
+            cache=cache,
+            skip_payment_entry=skip_payment_entry,
+        )
 
         try:
             if status_map.get("custom_state"):
