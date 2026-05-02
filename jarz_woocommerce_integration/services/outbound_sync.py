@@ -511,6 +511,19 @@ def _format_money(value: float | int, precision: int = 2) -> str:
     return f"{flt(value, precision):.{precision}f}"
 
 
+def _is_truthy_flag(value: Any) -> bool:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "0", "false", "no", "none", "null"}:
+            return False
+        if normalized in {"1", "true", "yes"}:
+            return True
+    try:
+        return bool(cint(value))
+    except Exception:
+        return bool(value)
+
+
 def _get_registered_bundle_product_ids(invoice: frappe.model.document.Document) -> set[str]:
     item_codes = {
         str(getattr(item, "item_code", "") or "").strip()
@@ -548,6 +561,52 @@ def _get_registered_bundle_product_ids(invoice: frappe.model.document.Document) 
     return {str(bundle_id).strip() for bundle_id in bundle_ids if bundle_id}
 
 
+def _get_item_product_row(item_code: str, *, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    key = str(item_code or "").strip()
+    if not key:
+        return {}
+    if key not in cache:
+        row = frappe.db.get_value("Item", key, ["woo_product_id", "item_name"], as_dict=True)
+        cache[key] = dict(row or {})
+    return cache[key]
+
+
+def _get_bundle_link_key(item: frappe.model.document.Document) -> str:
+    for fieldname in ("parent_bundle", "bundle_code"):
+        value = str(getattr(item, fieldname, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _is_explicit_bundle_parent_item(item: frappe.model.document.Document) -> bool:
+    return _is_truthy_flag(getattr(item, "is_bundle_parent", 0))
+
+
+def _is_explicit_bundle_child_item(item: frappe.model.document.Document) -> bool:
+    return _is_truthy_flag(getattr(item, "is_bundle_child", 0)) or bool(str(getattr(item, "parent_bundle", "") or "").strip())
+
+
+def _collect_explicit_bundle_parent_product_ids(
+    invoice: frappe.model.document.Document,
+    *,
+    item_product_rows: dict[str, dict[str, Any]],
+) -> dict[str, int]:
+    parent_product_ids: dict[str, int] = {}
+    for item in getattr(invoice, "items", []) or []:
+        if not _is_explicit_bundle_parent_item(item):
+            continue
+        bundle_key = _get_bundle_link_key(item)
+        item_code = str(getattr(item, "item_code", "") or "").strip()
+        if not bundle_key or not item_code:
+            continue
+        product_identifier = _get_item_product_row(item_code, cache=item_product_rows).get("woo_product_id")
+        product_id, variation_id = _parse_product_identifier(product_identifier)
+        if variation_id is None and product_id is not None:
+            parent_product_ids[bundle_key] = product_id
+    return parent_product_ids
+
+
 def _is_bundle_parent_item(
     item: frappe.model.document.Document,
     *,
@@ -576,22 +635,48 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
     line_items: list[dict] = []
     missing_products: list[str] = []
     registered_bundle_product_ids = _get_registered_bundle_product_ids(invoice)
+    item_product_rows: dict[str, dict[str, Any]] = {}
+    explicit_bundle_parent_product_ids = _collect_explicit_bundle_parent_product_ids(
+        invoice,
+        item_product_rows=item_product_rows,
+    )
+
     for item in invoice.items:
         qty = flt(item.qty)
         if qty <= 0:
             continue
-        product_row = frappe.db.get_value("Item", item.item_code, ["woo_product_id", "item_name"], as_dict=True)
+        product_row = _get_item_product_row(item.item_code, cache=item_product_rows)
         product_identifier = (product_row or {}).get("woo_product_id")
+        product_id, variation_id = _parse_product_identifier(product_identifier)
+
+        if not product_identifier or (product_id is None and variation_id is None):
+            missing_products.append(item.item_code)
+            continue
+
+        if _is_explicit_bundle_parent_item(item):
+            entry = {
+                "quantity": int(qty),
+                "subtotal": _format_money(0),
+                "total": _format_money(0),
+                "name": item.item_name or item.item_code,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": item.item_code},
+                ],
+            }
+            if product_id:
+                entry["product_id"] = product_id
+            if variation_id:
+                entry["variation_id"] = variation_id
+            line_items.append(entry)
+            continue
+
         if _is_bundle_parent_item(
             item,
             product_identifier=product_identifier,
             registered_bundle_product_ids=registered_bundle_product_ids,
         ):
             continue
-        product_id, variation_id = _parse_product_identifier(product_identifier)
-        if not product_identifier or (product_id is None and variation_id is None):
-            missing_products.append(item.item_code)
-            continue
+
         subtotal_base = item.price_list_rate or item.rate
         subtotal = subtotal_base * qty if subtotal_base else item.amount
         entry = {
@@ -609,6 +694,12 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
             entry["variation_id"] = variation_id
         if getattr(item, "discount_percentage", None):
             entry["meta_data"].append({"key": "discount_percentage", "value": flt(item.discount_percentage)})
+
+        if _is_explicit_bundle_child_item(item):
+            parent_product_id = explicit_bundle_parent_product_ids.get(_get_bundle_link_key(item))
+            if parent_product_id:
+                entry["meta_data"].append({"key": "_woosb_parent_id", "value": str(parent_product_id)})
+
         line_items.append(entry)
     return line_items, missing_products
 

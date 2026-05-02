@@ -198,6 +198,7 @@ fixtures = [
 				[
 					"Territory",
 					"Sales Invoice",
+					"Sales Invoice Item",
 					"WooCommerce Settings",
 					"Customer",
 					"Address",

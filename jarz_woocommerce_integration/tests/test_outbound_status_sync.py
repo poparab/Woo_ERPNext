@@ -332,6 +332,70 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(line_items[0]["subtotal"], "120.00")
         self.assertEqual(line_items[0]["total"], "60.00")
 
+    def test_collect_line_items_includes_explicit_bundle_parent_at_zero_and_links_children(self):
+        invoice = SimpleNamespace(items=[
+            SimpleNamespace(
+                item_code="BUNDLE-001",
+                item_name="Bundle Parent",
+                qty=1,
+                price_list_rate=432,
+                rate=0,
+                amount=0,
+                discount_percentage=100,
+                is_bundle_parent=1,
+                bundle_code="BUNDLE-CODE-001",
+                parent_bundle=None,
+                is_bundle_child=0,
+            ),
+            SimpleNamespace(
+                item_code="ITEM-CHILD",
+                item_name="Bundle Child",
+                qty=1,
+                price_list_rate=120,
+                rate=120,
+                amount=120,
+                discount_percentage=0,
+                is_bundle_parent=0,
+                bundle_code=None,
+                parent_bundle="BUNDLE-CODE-001",
+                is_bundle_child=1,
+            ),
+        ])
+
+        def fake_get_value(doctype, name, fields, as_dict=False):
+            if doctype != "Item":
+                raise AssertionError(f"Unexpected doctype: {doctype}")
+            if name == "BUNDLE-001":
+                return {"woo_product_id": "202", "item_name": "Bundle Parent"}
+            return {"woo_product_id": "303", "item_name": "Bundle Child"}
+
+        with unittest.mock.patch.object(outbound_sync, "_get_registered_bundle_product_ids", return_value={"202"}), \
+             unittest.mock.patch.object(outbound_sync.frappe.db, "get_value", side_effect=fake_get_value):
+            line_items, missing = outbound_sync._collect_line_items(invoice)
+
+        self.assertEqual(missing, [])
+        self.assertEqual(len(line_items), 2)
+
+        parent_entry = line_items[0]
+        self.assertEqual(parent_entry["name"], "Bundle Parent")
+        self.assertEqual(parent_entry["subtotal"], "0.00")
+        self.assertEqual(parent_entry["total"], "0.00")
+        self.assertEqual(parent_entry["product_id"], 202)
+        self.assertEqual(parent_entry["meta_data"], [{"key": "erpnext_item_code", "value": "BUNDLE-001"}])
+
+        child_entry = line_items[1]
+        self.assertEqual(child_entry["name"], "Bundle Child")
+        self.assertEqual(child_entry["subtotal"], "120.00")
+        self.assertEqual(child_entry["total"], "120.00")
+        self.assertEqual(child_entry["product_id"], 303)
+        self.assertEqual(
+            child_entry["meta_data"],
+            [
+                {"key": "erpnext_item_code", "value": "ITEM-CHILD"},
+                {"key": "_woosb_parent_id", "value": "202"},
+            ],
+        )
+
     def test_sync_sales_invoice_replaces_stale_woo_order_id_after_missing_remote_order(self):
         invoice = DummyInvoice(sales_invoice_state="Ready", woo_order_id=14500)
         client = DummyMissingOrderClient(created_order_id=16600)
