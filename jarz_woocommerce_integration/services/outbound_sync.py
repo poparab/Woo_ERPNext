@@ -511,11 +511,47 @@ def _format_money(value: float | int, precision: int = 2) -> str:
     return f"{flt(value, precision):.{precision}f}"
 
 
+def _get_registered_bundle_codes(invoice: frappe.model.document.Document) -> set[str]:
+    item_codes = {
+        str(getattr(item, "item_code", "") or "").strip()
+        for item in getattr(invoice, "items", []) or []
+        if getattr(item, "item_code", None)
+    }
+    if not item_codes:
+        return set()
+    try:
+        bundle_names = frappe.get_all(
+            "Woo Jarz Bundle",
+            filters={"name": ("in", sorted(item_codes))},
+            pluck="name",
+        )
+    except Exception:
+        return set()
+    return {str(name).strip() for name in bundle_names if name}
+
+
+def _is_bundle_parent_item(item: frappe.model.document.Document, *, registered_bundle_codes: set[str]) -> bool:
+    if getattr(item, "is_bundle_parent", 0):
+        return True
+
+    item_code = str(getattr(item, "item_code", "") or "").strip()
+    if not item_code or item_code not in registered_bundle_codes:
+        return False
+
+    return (
+        flt(getattr(item, "price_list_rate", 0)) > 0
+        and flt(getattr(item, "rate", 0)) <= 0
+        and flt(getattr(item, "amount", 0)) <= 0
+        and flt(getattr(item, "discount_percentage", 0)) >= 100
+    )
+
+
 def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[dict], list[str]]:
     line_items: list[dict] = []
     missing_products: list[str] = []
+    registered_bundle_codes = _get_registered_bundle_codes(invoice)
     for item in invoice.items:
-        if getattr(item, "is_bundle_parent", 0):
+        if _is_bundle_parent_item(item, registered_bundle_codes=registered_bundle_codes):
             continue
         qty = flt(item.qty)
         if qty <= 0:
@@ -999,7 +1035,8 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         sync_customer(customer_doc.name, reason="order_dependency", force=True)
         customer_doc = frappe.get_doc("Customer", invoice.customer)
 
-    woo_order_id = getattr(invoice, "woo_order_id", None)
+    original_woo_order_id = getattr(invoice, "woo_order_id", None)
+    woo_order_id = original_woo_order_id
     existing_order: Optional[Dict[str, Any]] = None
     if woo_order_id:
         try:
@@ -1071,7 +1108,7 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         "woo_outbound_error": "",
         "woo_outbound_synced_on": now_datetime(),
     }
-    if woo_id and not getattr(invoice, "woo_order_id", None):
+    if woo_id and str(woo_id) != str(original_woo_order_id or ""):
         updates["woo_order_id"] = woo_id
     if woo_number:
         updates["woo_order_number"] = woo_number

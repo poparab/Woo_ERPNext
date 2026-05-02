@@ -69,6 +69,20 @@ class DummyClient:
         return {"id": 14500, "number": "14500"}
 
 
+class DummyMissingOrderClient(DummyClient):
+    def __init__(self, *, created_order_id=16600):
+        super().__init__(existing_order=None)
+        self.created_order_id = created_order_id
+
+    def get(self, path):
+        self.get_calls.append(path)
+        raise outbound_sync.WooAPIError(404, path, "Invalid ID.", {"message": "Invalid ID."})
+
+    def post(self, path, payload):
+        self.post_calls.append((path, payload))
+        return {"id": self.created_order_id, "number": str(self.created_order_id)}
+
+
 def _patch_common(monkeypatch, invoice, client, *, order_map_exists=True):
     settings = SimpleNamespace()
     cfg = outbound_sync.OutboundConfig(
@@ -277,6 +291,79 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(result, {"skipped": True, "reason": "already_in_sync", "woo_order_id": 14500})
         self.assertEqual(client.put_calls, [])
         mock_mark_status.assert_called_once_with(invoice.name, status="Synced")
+
+    def test_collect_line_items_skips_registered_bundle_parent_rows_without_runtime_flag(self):
+        invoice = SimpleNamespace(items=[
+            SimpleNamespace(
+                item_code="BUNDLE-001",
+                item_name="Bundle Parent",
+                qty=1,
+                price_list_rate=432,
+                rate=0,
+                amount=0,
+                discount_percentage=100,
+            ),
+            SimpleNamespace(
+                item_code="ITEM-DISCOUNT",
+                item_name="Discounted Child",
+                qty=1,
+                price_list_rate=120,
+                rate=60,
+                amount=60,
+                discount_percentage=50,
+            ),
+        ])
+
+        def fake_get_value(doctype, name, fields, as_dict=False):
+            if doctype != "Item":
+                raise AssertionError(f"Unexpected doctype: {doctype}")
+            return {
+                "woo_product_id": "202" if name == "BUNDLE-001" else "303",
+                "item_name": "Bundle Parent" if name == "BUNDLE-001" else "Discounted Child",
+            }
+
+        with unittest.mock.patch.object(outbound_sync, "_get_registered_bundle_codes", return_value={"BUNDLE-001"}), \
+             unittest.mock.patch.object(outbound_sync.frappe.db, "get_value", side_effect=fake_get_value):
+            line_items, missing = outbound_sync._collect_line_items(invoice)
+
+        self.assertEqual(missing, [])
+        self.assertEqual(len(line_items), 1)
+        self.assertEqual(line_items[0]["name"], "Discounted Child")
+        self.assertEqual(line_items[0]["subtotal"], "120.00")
+        self.assertEqual(line_items[0]["total"], "60.00")
+
+    def test_sync_sales_invoice_replaces_stale_woo_order_id_after_missing_remote_order(self):
+        invoice = DummyInvoice(sales_invoice_state="Ready", woo_order_id=14500)
+        client = DummyMissingOrderClient(created_order_id=16600)
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings") as mock_get_settings, \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "processing"}), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
+             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
+             unittest.mock.patch.object(outbound_sync.frappe.db, "set_value") as mock_set_value, \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
+            mock_get_settings.return_value = (
+                SimpleNamespace(),
+                outbound_sync.OutboundConfig(
+                    enable_customer_push=True,
+                    enable_order_push=True,
+                    payment_cod="cod",
+                    payment_instapay="instapay",
+                    payment_wallet="wallet",
+                    shipping_method_id="flat_rate",
+                    shipping_method_title="Shipping",
+                ),
+            )
+            mock_get_doc.side_effect = lambda doctype, name: invoice if doctype == "Sales Invoice" else SimpleNamespace(name=invoice.customer, woo_customer_id="88")
+
+            result = outbound_sync.sync_sales_invoice(invoice.name, reason="test")
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 16600})
+        self.assertEqual(client.post_calls, [("orders", {"status": "processing"})])
+        _, _, updates = mock_set_value.call_args.args[:3]
+        self.assertEqual(updates["woo_order_id"], 16600)
+        self.assertEqual(updates["woo_order_number"], "16600")
 
     def test_map_status_supports_out_for_delivery(self):
         self.assertEqual(order_sync._map_status("out-for-delivery"), {
