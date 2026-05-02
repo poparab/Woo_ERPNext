@@ -22,7 +22,7 @@ class WooAPIError(Exception):
 
 
 def _should_bypass_ssl_verification(base_url: str) -> bool:
-    """Allow a temporary SSL bypass only for staging ERP talking to staging Woo."""
+    """Allow a temporary SSL bypass only for staging ERP talking to demo Woo."""
 
     try:
         import frappe
@@ -30,7 +30,7 @@ def _should_bypass_ssl_verification(base_url: str) -> bool:
         return False
 
     hostname = (urlparse(base_url).hostname or "").lower()
-    if hostname != "stage.orderjarz.com":
+    if hostname != "demo.orderjarz.com":
         return False
 
     host_name = str(getattr(frappe.conf, "host_name", "") or "").rstrip("/")
