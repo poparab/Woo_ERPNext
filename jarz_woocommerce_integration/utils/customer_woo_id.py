@@ -15,7 +15,20 @@ def _customer_has_column(fieldname: str) -> bool:
 
     result = False
     try:
-        result = fieldname in (frappe.db.get_table_columns("Customer") or [])
+        result = bool(
+            frappe.db.sql(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = DATABASE()
+                  AND table_name = 'tabCustomer'
+                  AND column_name = %s
+                LIMIT 1
+                """,
+                (fieldname,),
+                as_dict=True,
+            )
+        )
     except Exception:
         try:
             meta = frappe.get_meta("Customer")
