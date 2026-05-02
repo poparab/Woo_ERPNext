@@ -161,7 +161,7 @@ def migrate_customer_woo_ids(*, dry_run: bool = True, clear_legacy: bool = True)
                 frappe.db.set_value(
                     "Customer",
                     customer_name,
-                    {"custom_woo_customer_id": None},
+                    {"custom_woo_customer_id": 0},
                     update_modified=False,
                 )
 

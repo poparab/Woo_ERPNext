@@ -97,6 +97,6 @@ def set_customer_woo_id(
 
     updates: dict[str, Any] = {"woo_customer_id": normalized}
     if clear_legacy and has_legacy_customer_woo_id():
-        updates["custom_woo_customer_id"] = None
+        updates["custom_woo_customer_id"] = 0
     frappe.db.set_value("Customer", customer_name, updates, update_modified=update_modified)
     return normalized
