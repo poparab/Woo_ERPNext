@@ -322,7 +322,7 @@ class TestOutboundStatusSync(unittest.TestCase):
                 "item_name": "Bundle Parent" if name == "BUNDLE-001" else "Discounted Child",
             }
 
-        with unittest.mock.patch.object(outbound_sync, "_get_registered_bundle_codes", return_value={"BUNDLE-001"}), \
+        with unittest.mock.patch.object(outbound_sync, "_get_registered_bundle_product_ids", return_value={"202"}), \
              unittest.mock.patch.object(outbound_sync.frappe.db, "get_value", side_effect=fake_get_value):
             line_items, missing = outbound_sync._collect_line_items(invoice)
 

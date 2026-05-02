@@ -511,7 +511,7 @@ def _format_money(value: float | int, precision: int = 2) -> str:
     return f"{flt(value, precision):.{precision}f}"
 
 
-def _get_registered_bundle_codes(invoice: frappe.model.document.Document) -> set[str]:
+def _get_registered_bundle_product_ids(invoice: frappe.model.document.Document) -> set[str]:
     item_codes = {
         str(getattr(item, "item_code", "") or "").strip()
         for item in getattr(invoice, "items", []) or []
@@ -520,22 +520,48 @@ def _get_registered_bundle_codes(invoice: frappe.model.document.Document) -> set
     if not item_codes:
         return set()
     try:
-        bundle_names = frappe.get_all(
-            "Woo Jarz Bundle",
+        item_rows = frappe.get_all(
+            "Item",
             filters={"name": ("in", sorted(item_codes))},
-            pluck="name",
+            fields=["woo_product_id"],
         )
     except Exception:
         return set()
-    return {str(name).strip() for name in bundle_names if name}
+
+    woo_product_ids = {
+        str(row.get("woo_product_id") or "").strip()
+        for row in item_rows
+        if row.get("woo_product_id")
+    }
+    if not woo_product_ids:
+        return set()
+
+    try:
+        bundle_ids = frappe.get_all(
+            "Woo Jarz Bundle",
+            filters={"woo_bundle_id": ("in", sorted(woo_product_ids))},
+            pluck="woo_bundle_id",
+        )
+    except Exception:
+        return set()
+
+    return {str(bundle_id).strip() for bundle_id in bundle_ids if bundle_id}
 
 
-def _is_bundle_parent_item(item: frappe.model.document.Document, *, registered_bundle_codes: set[str]) -> bool:
+def _is_bundle_parent_item(
+    item: frappe.model.document.Document,
+    *,
+    product_identifier: str | None,
+    registered_bundle_product_ids: set[str],
+) -> bool:
     if getattr(item, "is_bundle_parent", 0):
         return True
 
-    item_code = str(getattr(item, "item_code", "") or "").strip()
-    if not item_code or item_code not in registered_bundle_codes:
+    product_id, variation_id = _parse_product_identifier(product_identifier)
+    if variation_id is not None or product_id is None:
+        return False
+
+    if str(product_id) not in registered_bundle_product_ids:
         return False
 
     return (
@@ -549,15 +575,19 @@ def _is_bundle_parent_item(item: frappe.model.document.Document, *, registered_b
 def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[dict], list[str]]:
     line_items: list[dict] = []
     missing_products: list[str] = []
-    registered_bundle_codes = _get_registered_bundle_codes(invoice)
+    registered_bundle_product_ids = _get_registered_bundle_product_ids(invoice)
     for item in invoice.items:
-        if _is_bundle_parent_item(item, registered_bundle_codes=registered_bundle_codes):
-            continue
         qty = flt(item.qty)
         if qty <= 0:
             continue
         product_row = frappe.db.get_value("Item", item.item_code, ["woo_product_id", "item_name"], as_dict=True)
         product_identifier = (product_row or {}).get("woo_product_id")
+        if _is_bundle_parent_item(
+            item,
+            product_identifier=product_identifier,
+            registered_bundle_product_ids=registered_bundle_product_ids,
+        ):
+            continue
         product_id, variation_id = _parse_product_identifier(product_identifier)
         if not product_identifier or (product_id is None and variation_id is None):
             missing_products.append(item.item_code)
