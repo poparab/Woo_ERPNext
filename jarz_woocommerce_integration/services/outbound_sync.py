@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass
+from datetime import date as dt_date, datetime, time as dt_time, timedelta
 import importlib
 import re
 from typing import Any, Dict, Optional
@@ -725,58 +727,7 @@ def _build_order_payload(
 
     if payload_line_items:
         payload["line_items"] = payload_line_items
-    
-    # Add delivery date and time using WooCommerce Order Delivery Date plugin fields
-    delivery_date = getattr(invoice, "custom_delivery_date", None) or getattr(invoice, "delivery_date", None)
-    delivery_time = getattr(invoice, "custom_delivery_time", None) or getattr(invoice, "delivery_time", None)
-    
-    if delivery_date:
-        from datetime import datetime, time as dt_time
-        import time
-        
-        # Format date for display (e.g., "Friday, November 22, 2025")
-        if isinstance(delivery_date, str):
-            delivery_date_obj = datetime.strptime(delivery_date, "%Y-%m-%d").date()
-        else:
-            delivery_date_obj = delivery_date
-        
-        formatted_date = delivery_date_obj.strftime("%A, %B %d, %Y")
-        
-        # Combine date and time for timestamp
-        if delivery_time:
-            # Parse time if it's a string
-            if isinstance(delivery_time, str):
-                try:
-                    time_obj = datetime.strptime(delivery_time, "%H:%M:%S").time()
-                except ValueError:
-                    try:
-                        time_obj = datetime.strptime(delivery_time, "%H:%M").time()
-                    except ValueError:
-                        time_obj = dt_time(12, 0)  # Default to noon
-            else:
-                time_obj = delivery_time
-            
-            delivery_datetime = datetime.combine(delivery_date_obj, time_obj)
-            time_slot_label = delivery_time if isinstance(delivery_time, str) else time_obj.strftime("%I:%M %p")
-        else:
-            delivery_datetime = datetime.combine(delivery_date_obj, dt_time(12, 0))
-            time_slot_label = ""
-        
-        # Convert to Unix timestamp
-        timestamp = int(time.mktime(delivery_datetime.timetuple()))
-        
-        # Add WooCommerce Order Delivery Date plugin fields
-        payload["meta_data"].extend([
-            {"key": "_orddd_timestamp", "value": str(timestamp)},
-            {"key": "_orddd_delivery_date", "value": formatted_date},
-            {"key": "Delivery Date", "value": formatted_date},
-        ])
-        
-        if time_slot_label:
-            payload["meta_data"].extend([
-                {"key": "_orddd_time_slot", "value": time_slot_label},
-                {"key": "Time Slot", "value": time_slot_label},
-            ])
+    payload["meta_data"].extend(_build_delivery_metadata(invoice))
     
     woo_customer_id = get_customer_woo_id(customer_doc)
     if woo_customer_id:
@@ -808,14 +759,112 @@ def _build_order_payload(
             "invoice": invoice.name,
             "unmatched": codes,
         })
-        if not payload.get("line_items"):
-            LOGGER.info({
-                "event": "woo_outbound_status_only_update",
-                "invoice": invoice.name,
-                "woo_order_id": getattr(invoice, "woo_order_id", None),
-                "reason": "no_line_item_matches",
-            })
+
+    if not payload.get("line_items"):
+        LOGGER.info({
+            "event": "woo_outbound_status_only_update",
+            "invoice": invoice.name,
+            "woo_order_id": getattr(invoice, "woo_order_id", None),
+            "reason": "no_line_item_matches",
+        })
     return payload
+
+
+def _coerce_delivery_date(raw: Any) -> dt_date | None:
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, dt_date):
+        return raw
+    if isinstance(raw, str):
+        value = raw.strip()
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def _coerce_delivery_time(raw: Any) -> dt_time | None:
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw.time().replace(microsecond=0)
+    if isinstance(raw, dt_time):
+        return raw.replace(microsecond=0)
+    if isinstance(raw, str):
+        value = raw.strip()
+        for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(value, fmt).time().replace(microsecond=0)
+            except ValueError:
+                continue
+    return None
+
+
+def _coerce_delivery_duration_seconds(raw: Any) -> int | None:
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, str):
+        value = raw.strip()
+        if not value:
+            return None
+        if ":" in value:
+            parts = value.split(":")
+            if len(parts) == 3:
+                try:
+                    hours, minutes, seconds = [int(float(part)) for part in parts]
+                    return max(0, hours * 3600 + minutes * 60 + seconds)
+                except ValueError:
+                    return None
+        try:
+            return max(0, int(float(value)))
+        except ValueError:
+            return None
+    try:
+        return max(0, int(float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[dict[str, str]]:
+    delivery_date = _coerce_delivery_date(
+        getattr(invoice, "custom_delivery_date", None) or getattr(invoice, "delivery_date", None)
+    )
+    if not delivery_date:
+        return []
+
+    formatted_date = delivery_date.strftime("%A, %B %d, %Y")
+    midnight_timestamp = calendar.timegm(datetime.combine(delivery_date, dt_time(0, 0)).timetuple())
+    metadata = [
+        {"key": "_orddd_timestamp", "value": str(midnight_timestamp)},
+        {"key": "_orddd_delivery_date", "value": formatted_date},
+        {"key": "Delivery Date", "value": formatted_date},
+    ]
+
+    delivery_time_from = _coerce_delivery_time(getattr(invoice, "custom_delivery_time_from", None))
+    delivery_duration_seconds = _coerce_delivery_duration_seconds(getattr(invoice, "custom_delivery_duration", None))
+
+    time_slot_label = None
+    if delivery_time_from and delivery_duration_seconds and delivery_duration_seconds > 0:
+        end_datetime = datetime.combine(delivery_date, delivery_time_from) + timedelta(seconds=delivery_duration_seconds)
+        time_slot_label = f"{delivery_time_from.strftime('%H:%M')} - {end_datetime.strftime('%H:%M')}"
+    else:
+        legacy_delivery_time = _coerce_delivery_time(
+            getattr(invoice, "custom_delivery_time", None) or getattr(invoice, "delivery_time", None)
+        )
+        if legacy_delivery_time:
+            time_slot_label = legacy_delivery_time.strftime("%H:%M")
+
+    if time_slot_label:
+        metadata.extend([
+            {"key": "_orddd_time_slot", "value": time_slot_label},
+            {"key": "Time Slot", "value": time_slot_label},
+        ])
+
+    return metadata
 
 
 def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: bool = False, force: bool = False) -> dict:

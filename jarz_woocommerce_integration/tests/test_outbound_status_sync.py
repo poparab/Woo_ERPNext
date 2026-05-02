@@ -16,6 +16,14 @@ class DummyInvoice:
         self.woo_order_number = None
         self.outstanding_amount = 10
         self.flags = SimpleNamespace(ignore_woo_outbound=False)
+        self.custom_delivery_date = None
+        self.custom_delivery_time_from = None
+        self.custom_delivery_duration = None
+        self.custom_delivery_time = None
+        self.delivery_date = None
+        self.delivery_time = None
+        self.customer_address = None
+        self.shipping_address_name = None
 
     def get(self, fieldname, default=None):
         return getattr(self, fieldname, default)
@@ -79,6 +87,41 @@ def _patch_common(monkeypatch, invoice, client, *, order_map_exists=True):
     )
     monkeypatch.setattr(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))
     return db_updates
+
+
+def _build_payload_for_delivery_test(invoice):
+    cfg = outbound_sync.OutboundConfig(
+        enable_customer_push=True,
+        enable_order_push=True,
+        payment_cod="cod",
+        payment_instapay="instapay",
+        payment_wallet="wallet",
+        shipping_method_id="flat_rate",
+        shipping_method_title="Shipping",
+    )
+    customer = SimpleNamespace(
+        customer_name="Test Customer",
+        woo_customer_id="88",
+        email_id="test@example.com",
+        mobile_no="01000000000",
+        phone=None,
+    )
+    line_items = [{
+        "product_id": 101,
+        "variation_id": None,
+        "quantity": 1,
+        "meta_data": [{"key": "erpnext_item_code", "value": "ITEM-001"}],
+        "name": "ITEM-001",
+    }]
+
+    with unittest.mock.patch.object(outbound_sync, "_collect_line_items", return_value=(line_items, [])), \
+         unittest.mock.patch.object(outbound_sync, "_compute_shipping_total", return_value=0), \
+         unittest.mock.patch.object(outbound_sync, "_build_customer_payload", return_value={
+             "billing": {"address_1": "Street 1", "email": "test@example.com", "phone": "01000000000"},
+             "shipping": {"address_1": "Street 1", "email": "test@example.com", "phone": "01000000000"},
+         }), \
+         unittest.mock.patch.object(outbound_sync.frappe, "get_doc", return_value=customer):
+        return outbound_sync._build_order_payload(invoice, cfg)
 
 
 class TestOutboundStatusSync(unittest.TestCase):
@@ -166,8 +209,6 @@ class TestOutboundStatusSync(unittest.TestCase):
 
     def test_build_order_payload_allows_status_only_update_when_existing_line_items_do_not_match(self):
         invoice = DummyInvoice(sales_invoice_state="Delivered")
-        invoice.customer_address = None
-        invoice.shipping_address_name = None
         cfg = outbound_sync.OutboundConfig(
             enable_customer_push=True,
             enable_order_push=True,
@@ -214,3 +255,52 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(payload["status"], "completed")
         self.assertNotIn("line_items", payload)
         self.assertIn({"key": "unmapped_line_items", "value": "ITEM-001"}, payload["meta_data"])
+
+    def test_build_order_payload_formats_delivery_slot_from_start_time_and_duration(self):
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.custom_delivery_date = "2026-05-02"
+        invoice.custom_delivery_time_from = "19:00:00"
+        invoice.custom_delivery_duration = 5400
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["_orddd_timestamp"], "1777680000")
+        self.assertEqual(metadata["Delivery Date"], "Saturday, May 02, 2026")
+        self.assertEqual(metadata["_orddd_time_slot"], "19:00 - 20:30")
+        self.assertEqual(metadata["Time Slot"], "19:00 - 20:30")
+
+    def test_build_order_payload_formats_delivery_slot_from_two_hour_duration(self):
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.custom_delivery_date = "2026-05-02"
+        invoice.custom_delivery_time_from = "19:00:00"
+        invoice.custom_delivery_duration = 7200
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["_orddd_time_slot"], "19:00 - 21:00")
+        self.assertEqual(metadata["Time Slot"], "19:00 - 21:00")
+
+    def test_build_order_payload_uses_date_only_timestamp_without_fake_noon(self):
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.custom_delivery_date = "2026-05-02"
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["_orddd_timestamp"], "1777680000")
+        self.assertNotIn("_orddd_time_slot", metadata)
+        self.assertNotIn("Time Slot", metadata)
+
+    def test_build_order_payload_preserves_legacy_single_time_fallback(self):
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.custom_delivery_date = "2026-05-02"
+        invoice.custom_delivery_time = "19:00:00"
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["_orddd_timestamp"], "1777680000")
+        self.assertEqual(metadata["_orddd_time_slot"], "19:00")
+        self.assertEqual(metadata["Time Slot"], "19:00")
