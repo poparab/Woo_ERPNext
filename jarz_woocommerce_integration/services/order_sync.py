@@ -258,6 +258,8 @@ def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str
     if s == "processing":
         # Processing = payment received, not shipped yet. Submit but never mark as paid.
         return {"docstatus": 1, "custom_state": "Processing", "is_paid": False}
+    if s == "out-for-delivery":
+        return {"docstatus": 1, "custom_state": "Out for Delivery", "is_paid": False}
     if s in {"cancelled", "refunded", "failed"}:
         if is_historical:
             # Historical: keep as Draft to avoid GL entry pollution from submit+cancel cycle
@@ -1796,6 +1798,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 if woo_status == "completed":
                     inv.db_set("custom_acceptance_status", "Accepted", commit=False)
                     inv.db_set("custom_sales_invoice_state", "Delivered", commit=False)
+                elif woo_status == "out-for-delivery":
+                    inv.db_set("custom_acceptance_status", "Accepted", commit=False)
+                    inv.db_set("custom_sales_invoice_state", "Out for Delivery", commit=False)
                 elif woo_status in ("cancelled", "refunded", "failed"):
                     inv.db_set("custom_acceptance_status", "Accepted", commit=False)
                     inv.db_set("custom_sales_invoice_state", "Cancelled", commit=False)
@@ -1869,6 +1874,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             if woo_status == "completed":
                 inv_data["custom_acceptance_status"] = "Accepted"
                 inv_data["custom_sales_invoice_state"] = "Delivered"
+            elif woo_status == "out-for-delivery":
+                inv_data["custom_acceptance_status"] = "Accepted"
+                inv_data["custom_sales_invoice_state"] = "Out for Delivery"
             elif woo_status in ("cancelled", "refunded", "failed"):
                 inv_data["custom_acceptance_status"] = "Accepted"
                 inv_data["custom_sales_invoice_state"] = "Cancelled"

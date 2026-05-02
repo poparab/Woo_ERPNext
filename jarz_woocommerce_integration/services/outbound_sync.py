@@ -534,15 +534,18 @@ def _map_payment_method(invoice: frappe.model.document.Document, cfg: OutboundCo
 
 
 def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool = False) -> str:
-    state = (getattr(invoice, "sales_invoice_state", None) or getattr(invoice, "custom_sales_invoice_state", None) or "").strip().lower()
+    raw_state = getattr(invoice, "sales_invoice_state", None) or getattr(invoice, "custom_sales_invoice_state", None) or ""
+    state = re.sub(r"[\s_]+", "-", str(raw_state).strip().lower())
 
     if cancel:
         return "cancelled"
-    if state == "cancelled":
+    if state in {"cancelled", "canceled"}:
         return "cancelled"
     if invoice.docstatus == 2:
         return "cancelled"
-    if state == "delivered":
+    if state == "out-for-delivery":
+        return "out-for-delivery"
+    if state in {"delivered", "completed"}:
         return "completed"
     return "processing"
 
@@ -798,11 +801,8 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     if getattr(invoice.flags, "ignore_woo_outbound", False) or getattr(frappe.flags, "ignore_woo_outbound", False):
         return {"skipped": True, "reason": "inbound"}
 
-    # Permanent guard: invoices that originated from WooCommerce (inbound)
-    # must never be pushed back.  Only inbound sync creates Order Map entries.
     _woo_id = invoice.get("woo_order_id")
-    if _woo_id and frappe.db.exists("WooCommerce Order Map", {"woo_order_id": _woo_id}):
-        return {"skipped": True, "reason": "inbound_order"}
+    order_map_exists = bool(_woo_id and frappe.db.exists("WooCommerce Order Map", {"woo_order_id": _woo_id}))
 
     if invoice.docstatus == 0 and not cancel:
         return {"skipped": True, "reason": "draft"}
@@ -853,6 +853,19 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         })
         _mark_invoice_status(invoice_name, status="error", error=str(exc))
         return {"status": "error", "detail": str(exc)}
+
+    current_woo_status = str((existing_order or {}).get("status") or "").strip().lower()
+    desired_woo_status = str(payload.get("status") or "").strip().lower()
+    if order_map_exists and woo_order_id and existing_order and current_woo_status == desired_woo_status:
+        _mark_invoice_status(invoice_name, status="Synced")
+        LOGGER.info({
+            "event": "woo_outbound_invoice_already_in_sync",
+            "invoice": invoice_name,
+            "woo_order_id": woo_order_id,
+            "status": desired_woo_status,
+            "reason": reason,
+        })
+        return {"skipped": True, "reason": "already_in_sync", "woo_order_id": woo_order_id}
 
     response: Dict[str, Any]
     try:
