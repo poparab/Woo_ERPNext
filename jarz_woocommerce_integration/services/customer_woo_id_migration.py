@@ -23,7 +23,6 @@ def _load_customer_rows() -> list[dict[str, Any]]:
             name,
             email_id,
             mobile_no,
-            phone,
             woo_customer_id
             {legacy_select}
         FROM `tabCustomer`
