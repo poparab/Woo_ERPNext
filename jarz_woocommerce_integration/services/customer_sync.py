@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -8,6 +9,11 @@ from frappe.utils import get_datetime  # type: ignore[import]
 
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
+)
+from jarz_woocommerce_integration.utils.customer_woo_id import (
+    find_customer_by_woo_id,
+    get_customer_woo_id,
+    normalize_woo_customer_id,
 )
 from jarz_woocommerce_integration.utils.http_client import WooClient
 
@@ -48,7 +54,71 @@ def _normalize_phone(p: Optional[str]) -> Optional[str]:
     return s or None
 
 
-def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None, custom_woo_customer_id: Optional[int] = None, customer_cache: dict | None = None) -> str:
+@contextmanager
+def _suppress_woo_outbound():
+    previous = getattr(frappe.flags, "ignore_woo_outbound", None)
+    setattr(frappe.flags, "ignore_woo_outbound", True)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(frappe.flags, "ignore_woo_outbound")
+            except Exception:
+                setattr(frappe.flags, "ignore_woo_outbound", False)
+        else:
+            setattr(frappe.flags, "ignore_woo_outbound", previous)
+
+
+def _update_customer_identity(
+    name: str,
+    *,
+    woo_customer_id: Optional[int | str],
+    username: Optional[str],
+    phone_norm: Optional[str],
+    email: Optional[str],
+    customer_cache: dict | None,
+) -> None:
+    normalized_woo_customer_id = normalize_woo_customer_id(woo_customer_id)
+
+    try:
+        if customer_cache is not None:
+            updates: dict[str, Any] = {}
+            if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and not get_customer_woo_id(name):
+                updates["woo_customer_id"] = normalized_woo_customer_id
+            if username and _field_exists("Customer", "woo_username") and not frappe.db.get_value("Customer", name, "woo_username"):
+                updates["woo_username"] = username
+            if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
+                updates["mobile_no"] = phone_norm
+            if email and not frappe.db.get_value("Customer", name, "email_id"):
+                updates["email_id"] = email
+            if updates:
+                frappe.db.set_value("Customer", name, updates, update_modified=False)
+            return
+
+        cust = frappe.get_doc("Customer", name)
+        changed = False
+        if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and not get_customer_woo_id(cust):
+            cust.woo_customer_id = normalized_woo_customer_id
+            changed = True
+        if username and _field_exists("Customer", "woo_username") and not getattr(cust, "woo_username", None):
+            cust.woo_username = username
+            changed = True
+        if phone_norm and not getattr(cust, "mobile_no", None):
+            cust.mobile_no = phone_norm
+            changed = True
+        if email and not getattr(cust, "email_id", None):
+            cust.email_id = email
+            changed = True
+        if changed:
+            cust.flags.ignore_woo_outbound = True
+            with _suppress_woo_outbound():
+                cust.save(ignore_permissions=True)
+    except Exception:
+        pass
+
+
+def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None, woo_customer_id: Optional[int] = None, customer_cache: dict | None = None) -> str:
     """Find or create a Customer, preferring uniqueness by username, then phone, then email.
 
     Priority:
@@ -66,7 +136,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     # Fast path: check in-memory cache first (historical migration)
     if customer_cache is not None:
         for cache_key in (
-            f"woo_cid:{custom_woo_customer_id}" if custom_woo_customer_id else None,
+            f"woo_cid:{woo_customer_id}" if woo_customer_id else None,
             f"user:{username}" if username else None,
             f"phone:{phone_norm}" if phone_norm else None,
             f"email:{email}" if email else None,
@@ -75,65 +145,33 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                 return customer_cache[cache_key]
 
     # 0) woo_customer_id-based (most reliable, unique WooCommerce identifier)
-    if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
-        name = frappe.db.get_value("Customer", {"custom_woo_customer_id": custom_woo_customer_id}, "name")
+    if woo_customer_id and _field_exists("Customer", "woo_customer_id"):
+        name = find_customer_by_woo_id(woo_customer_id)
         if name:
-            try:
-                if customer_cache is not None:
-                    # Historical migration: lightweight field-level updates (no hooks)
-                    if username and _field_exists("Customer", "woo_username"):
-                        if not frappe.db.get_value("Customer", name, "woo_username"):
-                            frappe.db.set_value("Customer", name, "woo_username", username, update_modified=False)
-                    if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
-                        frappe.db.set_value("Customer", name, "mobile_no", phone_norm, update_modified=False)
-                    if email and not frappe.db.get_value("Customer", name, "email_id"):
-                        frappe.db.set_value("Customer", name, "email_id", email, update_modified=False)
-                else:
-                    # Live sync: full save() to trigger hooks (outbound push, validations)
-                    cust = frappe.get_doc("Customer", name)
-                    changed = False
-                    if username and _field_exists("Customer", "woo_username") and not getattr(cust, "woo_username", None):
-                        cust.woo_username = username
-                        changed = True
-                    if phone_norm and not getattr(cust, "mobile_no", None):
-                        cust.mobile_no = phone_norm
-                        changed = True
-                    if email and not getattr(cust, "email_id", None):
-                        cust.email_id = email
-                        changed = True
-                    if changed:
-                        cust.save(ignore_permissions=True)
-            except Exception:
-                pass
-            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
+            _update_customer_identity(
+                name,
+                woo_customer_id=woo_customer_id,
+                username=username,
+                phone_norm=phone_norm,
+                email=email,
+                customer_cache=customer_cache,
+            )
+            _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
     # 1) username-based
     if username and _field_exists("Customer", "woo_username"):
         name = frappe.db.get_value("Customer", {"woo_username": username}, "name")
         if name:
-            try:
-                if customer_cache is not None:
-                    # Historical migration: lightweight field-level updates
-                    if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
-                        frappe.db.set_value("Customer", name, "mobile_no", phone_norm, update_modified=False)
-                    if email and not frappe.db.get_value("Customer", name, "email_id"):
-                        frappe.db.set_value("Customer", name, "email_id", email, update_modified=False)
-                else:
-                    # Live sync: full save() to trigger hooks
-                    cust = frappe.get_doc("Customer", name)
-                    changed = False
-                    if phone_norm and not getattr(cust, "mobile_no", None):
-                        cust.mobile_no = phone_norm
-                        changed = True
-                    if email and not getattr(cust, "email_id", None):
-                        cust.email_id = email
-                        changed = True
-                    if changed:
-                        cust.save(ignore_permissions=True)
-            except Exception:
-                pass
-            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
+            _update_customer_identity(
+                name,
+                woo_customer_id=woo_customer_id,
+                username=username,
+                phone_norm=phone_norm,
+                email=email,
+                customer_cache=customer_cache,
+            )
+            _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
     # 2) phone-based
@@ -142,53 +180,45 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         if not name and _field_exists("Customer", "phone"):
             name = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
         if name:
-            if username and _field_exists("Customer", "woo_username"):
-                try:
-                    cur_uname = frappe.db.get_value("Customer", name, "woo_username")
-                    if not cur_uname:
-                        frappe.db.set_value("Customer", name, "woo_username", username, update_modified=False)
-                except Exception:
-                    pass
-            try:
-                if email:
-                    cur_email = frappe.db.get_value("Customer", name, "email_id")
-                    if not cur_email:
-                        frappe.db.set_value("Customer", name, "email_id", email, update_modified=False)
-            except Exception:
-                pass
-            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
+            _update_customer_identity(
+                name,
+                woo_customer_id=woo_customer_id,
+                username=username,
+                phone_norm=phone_norm,
+                email=email,
+                customer_cache=customer_cache,
+            )
+            _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
     # 3) email-based
     if email:
         name = frappe.db.get_value("Customer", {"email_id": email}, "name")
         if name:
-            try:
-                if username and _field_exists("Customer", "woo_username") and not frappe.db.get_value("Customer", name, "woo_username"):
-                    frappe.db.set_value("Customer", name, "woo_username", username, update_modified=False)
-                if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
-                    frappe.db.set_value("Customer", name, "mobile_no", phone_norm, update_modified=False)
-            except Exception:
-                pass
-            _cache_customer(customer_cache, name, custom_woo_customer_id, username, phone_norm, email)
+            _update_customer_identity(
+                name,
+                woo_customer_id=woo_customer_id,
+                username=username,
+                phone_norm=phone_norm,
+                email=email,
+                customer_cache=customer_cache,
+            )
+            _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
     # 4) display name fallback
     display_name = _normalize_name(first_name, last_name, email, order_id)
     existing_by_name = frappe.db.get_value("Customer", {"customer_name": display_name}, "name")
     if existing_by_name:
-        # backfill username/phone/email if missing
-        try:
-            cur = frappe.get_doc("Customer", existing_by_name)
-            if username and _field_exists("Customer", "woo_username") and not getattr(cur, "woo_username", None):
-                cur.db_set("woo_username", username, commit=False)
-            if phone_norm and not getattr(cur, "mobile_no", None):
-                cur.db_set("mobile_no", phone_norm, commit=False)
-            if email and not getattr(cur, "email_id", None):
-                cur.db_set("email_id", email, commit=False)
-        except Exception:
-            pass
-        _cache_customer(customer_cache, existing_by_name, custom_woo_customer_id, username, phone_norm, email)
+        _update_customer_identity(
+            existing_by_name,
+            woo_customer_id=woo_customer_id,
+            username=username,
+            phone_norm=phone_norm,
+            email=email,
+            customer_cache=customer_cache,
+        )
+        _cache_customer(customer_cache, existing_by_name, woo_customer_id, username, phone_norm, email)
         return existing_by_name
 
     # Create new — use a per-customer Redis lock to prevent parallel worker races.
@@ -196,7 +226,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     # different page ranges may hit the same customer simultaneously; without this lock
     # they would both fall through all lookup checks and insert duplicates.
     _lock_id = (
-        f"woo_cid:{custom_woo_customer_id}" if custom_woo_customer_id
+        f"woo_cid:{woo_customer_id}" if woo_customer_id
         else f"user:{username}" if username
         else f"phone:{phone_norm}" if phone_norm
         else f"email:{email}" if email
@@ -218,7 +248,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             # Re-check under the lock: another worker may have created the customer
             # while we were waiting for it
             for cache_key in (
-                f"woo_cid:{custom_woo_customer_id}" if custom_woo_customer_id else None,
+                f"woo_cid:{woo_customer_id}" if woo_customer_id else None,
                 f"user:{username}" if username else None,
                 f"phone:{phone_norm}" if phone_norm else None,
                 f"email:{email}" if email else None,
@@ -227,25 +257,49 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     return customer_cache[cache_key]
 
             # Re-query DB under lock for the most reliable identifiers
-            if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
-                _recheck = frappe.db.get_value("Customer", {"custom_woo_customer_id": custom_woo_customer_id}, "name")
+            if woo_customer_id and _field_exists("Customer", "woo_customer_id"):
+                _recheck = find_customer_by_woo_id(woo_customer_id)
                 if _recheck:
-                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
             if username and _field_exists("Customer", "woo_username"):
                 _recheck = frappe.db.get_value("Customer", {"woo_username": username}, "name")
                 if _recheck:
-                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    _update_customer_identity(
+                        _recheck,
+                        woo_customer_id=woo_customer_id,
+                        username=username,
+                        phone_norm=phone_norm,
+                        email=email,
+                        customer_cache=customer_cache,
+                    )
+                    _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
             if phone_norm:
                 _recheck = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
                 if _recheck:
-                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    _update_customer_identity(
+                        _recheck,
+                        woo_customer_id=woo_customer_id,
+                        username=username,
+                        phone_norm=phone_norm,
+                        email=email,
+                        customer_cache=customer_cache,
+                    )
+                    _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
             if email:
                 _recheck = frappe.db.get_value("Customer", {"email_id": email}, "name")
                 if _recheck:
-                    _cache_customer(customer_cache, _recheck, custom_woo_customer_id, username, phone_norm, email)
+                    _update_customer_identity(
+                        _recheck,
+                        woo_customer_id=woo_customer_id,
+                        username=username,
+                        phone_norm=phone_norm,
+                        email=email,
+                        customer_cache=customer_cache,
+                    )
+                    _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
 
         # All rechecks exhausted under lock — safe to create
@@ -260,11 +314,13 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             fields["mobile_no"] = phone_norm
         if username and _field_exists("Customer", "woo_username"):
             fields["woo_username"] = username
-        if custom_woo_customer_id and _field_exists("Customer", "custom_woo_customer_id"):
-            fields["custom_woo_customer_id"] = custom_woo_customer_id
+        if woo_customer_id and _field_exists("Customer", "woo_customer_id"):
+            fields["woo_customer_id"] = str(woo_customer_id)
         doc = frappe.get_doc(fields)
-        doc.insert(ignore_permissions=True)
-        _cache_customer(customer_cache, doc.name, custom_woo_customer_id, username, phone_norm, email)
+        doc.flags.ignore_woo_outbound = True
+        with _suppress_woo_outbound():
+            doc.insert(ignore_permissions=True)
+        _cache_customer(customer_cache, doc.name, woo_customer_id, username, phone_norm, email)
         return doc.name
 
     finally:
@@ -555,7 +611,7 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     # Extract WooCommerce customer ID from order for idempotent lookups
     woo_customer_id = order.get("customer_id") if isinstance(order.get("customer_id"), int) and order.get("customer_id") > 0 else None
     
-    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone, custom_woo_customer_id=woo_customer_id, customer_cache=customer_cache)
+    customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone, woo_customer_id=woo_customer_id, customer_cache=customer_cache)
 
     billing_addr_name = None
     shipping_addr_name = None
@@ -673,7 +729,7 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
         None,  # order_id not applicable for direct customer sync
         username=username,
         phone=phone,
-        custom_woo_customer_id=woo_cust_id,
+        woo_customer_id=woo_cust_id,
     )
 
     def _upsert_address(kind: str, data: dict) -> Optional[str]:

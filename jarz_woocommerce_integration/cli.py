@@ -1,6 +1,39 @@
 from __future__ import annotations
 
 
+def audit_customer_woo_id_migration_cli(limit: int = 20):  # pragma: no cover
+    """Inspect customer Woo ID migration status.
+
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.jarz_woocommerce_integration.cli.audit_customer_woo_id_migration_cli
+    """
+    from .services.customer_woo_id_migration import audit_customer_woo_id_migration
+
+    return audit_customer_woo_id_migration(limit=limit)
+
+
+def migrate_customer_woo_ids_cli(dry_run: bool = True, clear_legacy: bool = True):  # pragma: no cover
+    """Backfill canonical Woo customer IDs from legacy data.
+
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.jarz_woocommerce_integration.cli.migrate_customer_woo_ids_cli --kwargs '{"dry_run": true}'
+    """
+    from .services.customer_woo_id_migration import migrate_customer_woo_ids
+
+    return migrate_customer_woo_ids(dry_run=dry_run, clear_legacy=clear_legacy)
+
+
+def drop_legacy_customer_woo_id_field_cli(force: bool = False):  # pragma: no cover
+    """Drop the legacy custom_woo_customer_id field once audit is clean.
+
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.jarz_woocommerce_integration.cli.drop_legacy_customer_woo_id_field_cli
+    """
+    from .services.customer_woo_id_migration import drop_legacy_customer_woo_id_field
+
+    return drop_legacy_customer_woo_id_field(force=force)
+
+
 def run_pos_profile_update_cli():  # pragma: no cover
     """Pull latest 10 Woo orders with updates and force to populate pos_profile on invoices.
 

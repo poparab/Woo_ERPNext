@@ -18,6 +18,12 @@ now_datetime = getattr(_frappe_utils, "now_datetime")
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
 )
+from jarz_woocommerce_integration.utils.customer_woo_id import (
+    get_customer_woo_id,
+    get_legacy_customer_woo_id,
+    has_unmigrated_legacy_customer_woo_id,
+    set_customer_woo_id,
+)
 from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient
 
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
@@ -303,7 +309,21 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
         return {"skipped": True, "reason": "inbound"}
 
     # Check if this is a new customer (no woo_customer_id)
-    woo_id = getattr(customer, "woo_customer_id", None)
+    woo_id = get_customer_woo_id(customer)
+    if not woo_id and has_unmigrated_legacy_customer_woo_id(customer):
+        legacy_woo_id = get_legacy_customer_woo_id(customer)
+        detail = (
+            f"Customer {customer_name} still has legacy Woo ID {legacy_woo_id}; "
+            "run the customer Woo ID migration before outbound sync"
+        )
+        LOGGER.warning({
+            "event": "woo_outbound_customer_legacy_id_blocked",
+            "customer": customer_name,
+            "legacy_woo_id": legacy_woo_id,
+            "reason": reason,
+        })
+        _mark_customer_status(customer_name, status="error", error=detail)
+        return {"status": "error", "detail": detail}
     is_new_customer = not woo_id
     
     try:
@@ -355,7 +375,7 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
                         "email": email,
                     })
                     # Store the ID and retry as UPDATE (no password, no username)
-                    frappe.db.set_value("Customer", customer_name, "woo_customer_id", str(woo_customer_id), update_modified=False)
+                    set_customer_woo_id(customer_name, woo_customer_id, update_modified=False)
                     frappe.db.commit()
                     # Rebuild payload for UPDATE (no password, no username)
                     update_payload = _build_customer_payload(customer, include_password=True, include_username=False)
@@ -758,7 +778,7 @@ def _build_order_payload(
                 {"key": "Time Slot", "value": time_slot_label},
             ])
     
-    woo_customer_id = getattr(customer_doc, "woo_customer_id", None)
+    woo_customer_id = get_customer_woo_id(customer_doc)
     if woo_customer_id:
         payload["customer_id"] = cint(woo_customer_id)
 
@@ -828,7 +848,23 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
 
     # Ensure customer exists on Woo first
     customer_doc = frappe.get_doc("Customer", invoice.customer)
-    if not getattr(customer_doc, "woo_customer_id", None) and cfg.enable_customer_push:
+    if not get_customer_woo_id(customer_doc) and has_unmigrated_legacy_customer_woo_id(customer_doc):
+        legacy_woo_id = get_legacy_customer_woo_id(customer_doc)
+        detail = (
+            f"Customer {customer_doc.name} still has legacy Woo ID {legacy_woo_id}; "
+            "run the customer Woo ID migration before outbound order sync"
+        )
+        LOGGER.warning({
+            "event": "woo_outbound_invoice_legacy_customer_id_blocked",
+            "invoice": invoice_name,
+            "customer": customer_doc.name,
+            "legacy_woo_id": legacy_woo_id,
+            "reason": reason,
+        })
+        _mark_invoice_status(invoice_name, status="error", error=detail)
+        return {"status": "error", "detail": detail}
+
+    if not get_customer_woo_id(customer_doc) and cfg.enable_customer_push:
         sync_customer(customer_doc.name, reason="order_dependency", force=True)
         customer_doc = frappe.get_doc("Customer", invoice.customer)
 

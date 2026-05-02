@@ -49,7 +49,7 @@ Single ERPNext app located at `apps/jarz_woocommerce_integration`. It ingests Wo
 ## Implementation Patterns
 - Place new long-running jobs in `services/` and expose via thin wrappers in `api/` (keep HTTP handlers light).
 - Use `frappe.logger()` with context dicts; avoid `print`.
-- Keep Woo identifiers (`woo_order_id`, `woo_product_id`, `custom_woo_customer_id`) for deduplication.
+- Keep Woo identifiers (`woo_order_id`, `woo_product_id`, `woo_customer_id`) for deduplication.
 - When adding Custom Fields or fixtures, update `hooks.py` fixtures list and regenerate fixtures.
 
 ## Common Pitfalls
