@@ -30,6 +30,32 @@ from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClien
 
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
 
+_ACCEPTANCE_ONLY_FIELDS = frozenset({
+    "custom_acceptance_status",
+    "custom_accepted_by",
+    "custom_accepted_on",
+})
+
+_OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
+    "custom_sales_invoice_state",
+    "sales_invoice_state",
+    "docstatus",
+    "customer",
+    "currency",
+    "outstanding_amount",
+    "custom_payment_method",
+    "mode_of_payment",
+    "customer_address",
+    "shipping_address_name",
+    "custom_delivery_date",
+    "delivery_date",
+    "custom_delivery_time_from",
+    "custom_delivery_duration",
+    "custom_delivery_time",
+    "delivery_time",
+    "woo_order_id",
+})
+
 
 def _normalize_outbound_status(status: str | None) -> str:
     """Normalize outbound status values to the allowed title-case options."""
@@ -435,6 +461,8 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
     if not isinstance(invoice, str):
         reason = reason if reason != "event" else (method or "event")
         cancel = cancel or method == "on_cancel"
+        if _should_skip_acceptance_only_update(invoice, method=method, cancel=cancel):
+            return
         invoice_name = invoice.name
     else:
         invoice_name = invoice
@@ -555,21 +583,75 @@ def _map_payment_method(invoice: frappe.model.document.Document, cfg: OutboundCo
     return cfg.payment_cod or "cod", str(raw_method or "Cash on Delivery")
 
 
+def _normalize_invoice_state(raw_state: Any) -> str:
+    return re.sub(r"[\s_]+", "-", str(raw_state or "").strip().lower())
+
+
+def _collect_invoice_states(invoice: frappe.model.document.Document) -> list[str]:
+    states: list[str] = []
+    seen: set[str] = set()
+    for fieldname in ("custom_sales_invoice_state", "sales_invoice_state"):
+        state = _normalize_invoice_state(getattr(invoice, fieldname, None))
+        if state and state not in seen:
+            seen.add(state)
+            states.append(state)
+    return states
+
+
 def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool = False) -> str:
-    raw_state = getattr(invoice, "sales_invoice_state", None) or getattr(invoice, "custom_sales_invoice_state", None) or ""
-    state = re.sub(r"[\s_]+", "-", str(raw_state).strip().lower())
+    states = _collect_invoice_states(invoice)
 
     if cancel:
         return "cancelled"
-    if state in {"cancelled", "canceled"}:
-        return "cancelled"
     if invoice.docstatus == 2:
         return "cancelled"
-    if state == "out-for-delivery":
-        return "out-for-delivery"
-    if state in {"delivered", "completed"}:
+    if any(state in {"cancelled", "canceled"} for state in states):
+        return "cancelled"
+    if any(state in {"delivered", "completed"} for state in states):
         return "completed"
+    if any(state == "out-for-delivery" for state in states):
+        return "out-for-delivery"
     return "processing"
+
+
+def _safe_has_value_changed(invoice: frappe.model.document.Document, fieldname: str) -> bool:
+    try:
+        return bool(invoice.has_value_changed(fieldname))
+    except Exception:
+        previous = getattr(invoice, "get_doc_before_save", lambda: None)()
+        if not previous:
+            return False
+        return previous.get(fieldname) != invoice.get(fieldname)
+
+
+def _should_skip_acceptance_only_update(
+    invoice: frappe.model.document.Document,
+    *,
+    method: str | None = None,
+    cancel: bool = False,
+) -> bool:
+    if cancel or method != "on_update_after_submit":
+        return False
+
+    previous = getattr(invoice, "get_doc_before_save", lambda: None)()
+    if not previous:
+        return False
+
+    if not any(_safe_has_value_changed(invoice, fieldname) for fieldname in _ACCEPTANCE_ONLY_FIELDS):
+        return False
+
+    if any(_safe_has_value_changed(invoice, fieldname) for fieldname in _OUTBOUND_RELEVANT_UPDATE_FIELDS):
+        return False
+
+    if _determine_status(previous, cancel=cancel) != _determine_status(invoice, cancel=cancel):
+        return False
+
+    LOGGER.info({
+        "event": "woo_outbound_invoice_acceptance_only_skipped",
+        "invoice": invoice.name,
+        "method": method,
+    })
+    return True
 
 
 def _extract_item_code(entry: dict) -> Optional[str]:

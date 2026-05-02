@@ -5,17 +5,27 @@ from jarz_woocommerce_integration.services import order_sync, outbound_sync
 
 
 class DummyInvoice:
-    def __init__(self, *, sales_invoice_state: str, woo_order_id: int = 14500, docstatus: int = 1):
+    def __init__(
+        self,
+        *,
+        sales_invoice_state: str,
+        custom_sales_invoice_state: str | None = None,
+        woo_order_id: int = 14500,
+        docstatus: int = 1,
+    ):
         self.name = "ACC-SINV-TEST-001"
         self.customer = "CUST-TEST-001"
         self.currency = "EGP"
         self.docstatus = docstatus
         self.sales_invoice_state = sales_invoice_state
-        self.custom_sales_invoice_state = sales_invoice_state
+        self.custom_sales_invoice_state = custom_sales_invoice_state if custom_sales_invoice_state is not None else sales_invoice_state
         self.woo_order_id = woo_order_id
         self.woo_order_number = None
         self.outstanding_amount = 10
         self.flags = SimpleNamespace(ignore_woo_outbound=False)
+        self.custom_acceptance_status = "Pending"
+        self.custom_accepted_by = None
+        self.custom_accepted_on = None
         self.custom_delivery_date = None
         self.custom_delivery_time_from = None
         self.custom_delivery_duration = None
@@ -24,9 +34,19 @@ class DummyInvoice:
         self.delivery_time = None
         self.customer_address = None
         self.shipping_address_name = None
+        self._before_save = None
 
     def get(self, fieldname, default=None):
         return getattr(self, fieldname, default)
+
+    def get_doc_before_save(self):
+        return self._before_save
+
+    def has_value_changed(self, fieldname):
+        previous = self.get_doc_before_save()
+        if not previous:
+            return False
+        return previous.get(fieldname) != self.get(fieldname)
 
 
 class DummyClient:
@@ -133,6 +153,64 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(outbound_sync._determine_status(DummyInvoice(sales_invoice_state="Delivered")), "completed")
         self.assertEqual(outbound_sync._determine_status(DummyInvoice(sales_invoice_state="Completed")), "completed")
         self.assertEqual(outbound_sync._determine_status(DummyInvoice(sales_invoice_state="Cancelled", docstatus=2)), "cancelled")
+
+    def test_determine_status_prefers_later_custom_state_over_stale_legacy_state(self):
+        invoice = DummyInvoice(sales_invoice_state="Ready", custom_sales_invoice_state="Delivered")
+
+        self.assertEqual(outbound_sync._determine_status(invoice), "completed")
+
+    def test_enqueue_invoice_sync_skips_acceptance_only_updates_when_status_is_unchanged(self):
+        previous = DummyInvoice(sales_invoice_state="Recieved")
+        current = DummyInvoice(sales_invoice_state="Recieved")
+        current.custom_acceptance_status = "Accepted"
+        current.custom_accepted_by = "user@example.com"
+        current.custom_accepted_on = "2026-05-02 15:14:07"
+        current._before_save = previous
+
+        settings = SimpleNamespace()
+        cfg = outbound_sync.OutboundConfig(
+            enable_customer_push=True,
+            enable_order_push=True,
+            payment_cod="cod",
+            payment_instapay="instapay",
+            payment_wallet="wallet",
+            shipping_method_id="flat_rate",
+            shipping_method_title="Shipping",
+        )
+        enqueue_calls = []
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(settings, cfg)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
+
+        self.assertEqual(enqueue_calls, [])
+
+    def test_enqueue_invoice_sync_keeps_status_updates_when_status_changes(self):
+        previous = DummyInvoice(sales_invoice_state="Out for Delivery")
+        current = DummyInvoice(sales_invoice_state="Delivered")
+        current.custom_acceptance_status = "Accepted"
+        current.custom_accepted_by = "user@example.com"
+        current.custom_accepted_on = "2026-05-02 15:14:07"
+        current._before_save = previous
+
+        settings = SimpleNamespace()
+        cfg = outbound_sync.OutboundConfig(
+            enable_customer_push=True,
+            enable_order_push=True,
+            payment_cod="cod",
+            payment_instapay="instapay",
+            payment_wallet="wallet",
+            shipping_method_id="flat_rate",
+            shipping_method_title="Shipping",
+        )
+        enqueue_calls = []
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(settings, cfg)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
+
+        self.assertEqual(len(enqueue_calls), 1)
+        self.assertEqual(enqueue_calls[0][1]["invoice_name"], current.name)
 
     def test_sync_sales_invoice_allows_mapped_woo_order_status_updates(self):
         invoice = DummyInvoice(sales_invoice_state="Out for Delivery")
