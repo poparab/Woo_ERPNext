@@ -163,3 +163,54 @@ class TestOutboundStatusSync(unittest.TestCase):
             "custom_state": "Out for Delivery",
             "is_paid": False,
         })
+
+    def test_build_order_payload_allows_status_only_update_when_existing_line_items_do_not_match(self):
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.customer_address = None
+        invoice.shipping_address_name = None
+        cfg = outbound_sync.OutboundConfig(
+            enable_customer_push=True,
+            enable_order_push=True,
+            payment_cod="cod",
+            payment_instapay="instapay",
+            payment_wallet="wallet",
+            shipping_method_id="flat_rate",
+            shipping_method_title="Shipping",
+        )
+        customer = SimpleNamespace(
+            customer_name="Test Customer",
+            woo_customer_id="88",
+            email_id="test@example.com",
+            mobile_no="01000000000",
+            phone=None,
+        )
+        line_items = [{
+            "product_id": 101,
+            "variation_id": None,
+            "quantity": 1,
+            "meta_data": [{"key": "erpnext_item_code", "value": "ITEM-001"}],
+            "name": "ITEM-001",
+        }]
+        existing_order = {
+            "id": 14500,
+            "status": "processing",
+            "line_items": [{
+                "id": 55,
+                "product_id": 202,
+                "variation_id": 0,
+                "meta_data": [],
+            }],
+        }
+
+        with unittest.mock.patch.object(outbound_sync, "_collect_line_items", return_value=(line_items, [])), \
+             unittest.mock.patch.object(outbound_sync, "_compute_shipping_total", return_value=0), \
+             unittest.mock.patch.object(outbound_sync, "_build_customer_payload", return_value={
+                 "billing": {"address_1": "Street 1", "email": "test@example.com", "phone": "01000000000"},
+                 "shipping": {"address_1": "Street 1", "email": "test@example.com", "phone": "01000000000"},
+             }), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc", return_value=customer):
+            payload = outbound_sync._build_order_payload(invoice, cfg, existing_order=existing_order)
+
+        self.assertEqual(payload["status"], "completed")
+        self.assertNotIn("line_items", payload)
+        self.assertIn({"key": "unmapped_line_items", "value": "ITEM-001"}, payload["meta_data"])

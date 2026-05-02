@@ -612,12 +612,13 @@ def _build_order_payload(
     existing_order: Optional[dict] = None,
 ) -> dict:
     line_items, missing_products = _collect_line_items(invoice)
+    payload_line_items = list(line_items)
     unmapped_line_items: list[dict] = []
     if existing_order:
         matched, unmapped_line_items = _attach_existing_line_ids(line_items, existing_order.get("line_items") or [])
-        line_items = matched
+        payload_line_items = matched
 
-    if not line_items:
+    if not payload_line_items and not existing_order:
         raise ValueError("No line items available for Woo order payload")
 
     shipping_total = _compute_shipping_total(invoice)
@@ -695,13 +696,15 @@ def _build_order_payload(
         "payment_method": payment_method,
         "payment_method_title": payment_title,
         "set_paid": bool(set_paid),
-        "line_items": line_items,
         "billing": billing_address,
         "shipping": shipping_address,
         "meta_data": [
             {"key": "erpnext_sales_invoice", "value": invoice.name},
         ],
     }
+
+    if payload_line_items:
+        payload["line_items"] = payload_line_items
     
     # Add delivery date and time using WooCommerce Order Delivery Date plugin fields
     delivery_date = getattr(invoice, "custom_delivery_date", None) or getattr(invoice, "delivery_date", None)
@@ -785,6 +788,13 @@ def _build_order_payload(
             "invoice": invoice.name,
             "unmatched": codes,
         })
+        if not payload.get("line_items"):
+            LOGGER.info({
+                "event": "woo_outbound_status_only_update",
+                "invoice": invoice.name,
+                "woo_order_id": getattr(invoice, "woo_order_id", None),
+                "reason": "no_line_item_matches",
+            })
     return payload
 
 
