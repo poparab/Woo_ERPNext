@@ -126,6 +126,17 @@ def _outbound_cfg():
     )
 
 
+def _db_stub(*, exists=None, get_value=None, set_value=None):
+    stub = SimpleNamespace()
+    if exists is not None:
+        stub.exists = exists if callable(exists) else (lambda *args, **kwargs: exists)
+    if get_value is not None:
+        stub.get_value = get_value
+    if set_value is not None:
+        stub.set_value = set_value
+    return stub
+
+
 def _patch_common(monkeypatch, invoice, client, *, order_map_exists=True):
     settings = SimpleNamespace()
     cfg = outbound_sync.OutboundConfig(
@@ -344,7 +355,7 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True)), \
              unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
             outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
 
@@ -360,7 +371,7 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True)), \
              unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
             outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
 
@@ -376,7 +387,7 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True)), \
              unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
             outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
 
@@ -419,7 +430,7 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True)), \
              unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
             outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
 
@@ -434,7 +445,7 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=False), \
+                         unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=False)), \
              unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
             outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
 
@@ -444,13 +455,13 @@ class TestOutboundStatusSync(unittest.TestCase):
     def test_sync_sales_invoice_allows_mapped_woo_order_status_updates(self):
         invoice = DummyInvoice(sales_invoice_state="Out for Delivery")
         client = DummyClient(existing_order={"id": 14500, "status": "processing"})
+        mock_set_value = unittest.mock.MagicMock()
 
         with unittest.mock.patch.object(outbound_sync, "_get_settings") as mock_get_settings, \
              unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
              unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "out-for-delivery"}), \
              unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "set_value") as mock_set_value, \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True, set_value=mock_set_value)), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
             mock_get_settings.return_value = (
                 SimpleNamespace(),
@@ -485,7 +496,7 @@ class TestOutboundStatusSync(unittest.TestCase):
              unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "completed"}), \
              unittest.mock.patch.object(outbound_sync, "_mark_invoice_status") as mock_mark_status, \
              unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True)), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
             mock_get_settings.return_value = (
                 SimpleNamespace(),
@@ -538,7 +549,7 @@ class TestOutboundStatusSync(unittest.TestCase):
             }
 
         with unittest.mock.patch.object(outbound_sync, "_get_registered_bundle_product_ids", return_value={"202"}), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "get_value", side_effect=fake_get_value):
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(get_value=fake_get_value)):
             line_items, missing = outbound_sync._collect_line_items(invoice)
 
         self.assertEqual(missing, [])
@@ -585,7 +596,7 @@ class TestOutboundStatusSync(unittest.TestCase):
             return {"woo_product_id": "303", "item_name": "Bundle Child"}
 
         with unittest.mock.patch.object(outbound_sync, "_get_registered_bundle_product_ids", return_value={"202"}), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "get_value", side_effect=fake_get_value):
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(get_value=fake_get_value)):
             line_items, missing = outbound_sync._collect_line_items(invoice)
 
         self.assertEqual(missing, [])
@@ -614,13 +625,13 @@ class TestOutboundStatusSync(unittest.TestCase):
     def test_sync_sales_invoice_replaces_stale_woo_order_id_after_missing_remote_order(self):
         invoice = DummyInvoice(sales_invoice_state="Ready", woo_order_id=14500)
         client = DummyMissingOrderClient(created_order_id=16600)
+        mock_set_value = unittest.mock.MagicMock()
 
         with unittest.mock.patch.object(outbound_sync, "_get_settings") as mock_get_settings, \
              unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
              unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "processing"}), \
              unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "exists", return_value=True), \
-             unittest.mock.patch.object(outbound_sync.frappe.db, "set_value") as mock_set_value, \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True, set_value=mock_set_value)), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
             mock_get_settings.return_value = (
                 SimpleNamespace(),

@@ -235,7 +235,11 @@ def _get_doc_before_save(document: Any) -> Any:
 def _is_outbound_suppressed(document: Any | None = None) -> bool:
     if getattr(getattr(document, "flags", None), "ignore_woo_outbound", False):
         return True
-    return bool(getattr(getattr(frappe, "flags", None), "ignore_woo_outbound", False))
+    try:
+        frappe_flags = getattr(frappe, "flags", None)
+    except Exception:
+        frappe_flags = None
+    return bool(getattr(frappe_flags, "ignore_woo_outbound", False))
 
 
 # ---------------------------------------------------------------------------
