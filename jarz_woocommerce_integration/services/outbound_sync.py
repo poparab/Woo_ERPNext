@@ -45,6 +45,43 @@ _CUSTOMER_OUTBOUND_UPDATE_FIELDS = frozenset({
     "territory",
 })
 
+_CUSTOMER_CORE_OUTBOUND_UPDATE_FIELDS = frozenset({
+    "customer_name",
+    "email_id",
+    "mobile_no",
+    "phone",
+})
+
+_CUSTOMER_SHIPPING_OUTBOUND_UPDATE_FIELDS = frozenset({
+    "customer_shipping_address",
+})
+
+_CUSTOMER_TERRITORY_OUTBOUND_UPDATE_FIELDS = frozenset({
+    "territory",
+})
+
+_CUSTOMER_ADDRESS_OUTBOUND_UPDATE_FIELDS = frozenset({
+    "address_line1",
+    "address_line2",
+    "city",
+    "state",
+    "pincode",
+    "country",
+    "phone",
+    "email_id",
+    "address_type",
+    "is_shipping_address",
+})
+
+_ORDER_SYNC_META_KEYS_TO_COMPARE = frozenset({
+    "_orddd_timestamp",
+    "_orddd_delivery_date",
+    "Delivery Date",
+    "_orddd_time_slot",
+    "Time Slot",
+    "unmapped_line_items",
+})
+
 _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
     "custom_sales_invoice_state",
     "sales_invoice_state",
@@ -211,6 +248,90 @@ def _get_any_address_for_customer(customer_name: str) -> dict:
         return {}
 
 
+def _get_linked_customer_addresses(customer_name: str) -> list[dict[str, Any]]:
+    try:
+        links = frappe.get_all(
+            "Dynamic Link",
+            filters={"link_doctype": "Customer", "link_name": customer_name, "parenttype": "Address"},
+            fields=["parent"],
+            order_by="modified desc",
+        )
+    except Exception:
+        return []
+
+    address_names = []
+    for link in links or []:
+        address_name = _get_doc_value(link, "parent")
+        if address_name and address_name not in address_names:
+            address_names.append(address_name)
+
+    if not address_names:
+        return []
+
+    try:
+        rows = frappe.get_all(
+            "Address",
+            filters={"name": ["in", address_names]},
+            fields=["name", "address_type", "is_primary_address", "is_shipping_address"],
+            order_by="modified desc",
+        )
+    except Exception:
+        return []
+
+    rows_by_name = {
+        _get_doc_value(row, "name"): row
+        for row in rows or []
+        if _get_doc_value(row, "name")
+    }
+    ordered_rows = []
+    for address_name in address_names:
+        row = rows_by_name.get(address_name)
+        if row:
+            ordered_rows.append(row)
+    return ordered_rows
+
+
+def _resolve_customer_billing_address_name(customer: frappe.model.document.Document) -> str | None:
+    explicit = getattr(customer, "customer_primary_address", None)
+    if explicit:
+        return explicit
+
+    linked_addresses = _get_linked_customer_addresses(customer.name)
+    for row in linked_addresses:
+        if cint(_get_doc_value(row, "is_primary_address", 0)):
+            return _get_doc_value(row, "name")
+    for row in linked_addresses:
+        if str(_get_doc_value(row, "address_type", "") or "").strip().lower() == "billing":
+            return _get_doc_value(row, "name")
+    for row in linked_addresses:
+        address_name = _get_doc_value(row, "name")
+        if address_name:
+            return address_name
+    return None
+
+
+def _resolve_customer_shipping_address_name(customer: frappe.model.document.Document) -> str | None:
+    explicit = getattr(customer, "customer_shipping_address", None)
+    if explicit:
+        return explicit
+
+    linked_addresses = _get_linked_customer_addresses(customer.name)
+    for row in linked_addresses:
+        if cint(_get_doc_value(row, "is_shipping_address", 0)):
+            return _get_doc_value(row, "name")
+    for row in linked_addresses:
+        if str(_get_doc_value(row, "address_type", "") or "").strip().lower() == "shipping":
+            return _get_doc_value(row, "name")
+    return None
+
+
+def _build_customer_metadata(customer: frappe.model.document.Document) -> list[dict[str, str]]:
+    territory = str(getattr(customer, "territory", "") or "").strip()
+    if not territory:
+        return []
+    return [{"key": "erpnext_territory", "value": territory}]
+
+
 def _get_doc_value(document: Any, fieldname: str, default: Any = None) -> Any:
     if document is None:
         return default
@@ -232,6 +353,10 @@ def _get_doc_before_save(document: Any) -> Any:
     return getattr(document, "get_doc_before_save", lambda: None)()
 
 
+def _get_changed_fields(document: Any, fieldnames: frozenset[str]) -> set[str]:
+    return {fieldname for fieldname in fieldnames if _safe_has_value_changed(document, fieldname)}
+
+
 def _is_outbound_suppressed(document: Any | None = None) -> bool:
     if getattr(getattr(document, "flags", None), "ignore_woo_outbound", False):
         return True
@@ -245,7 +370,149 @@ def _is_outbound_suppressed(document: Any | None = None) -> bool:
 # Customer outbound sync
 # ---------------------------------------------------------------------------
 
-def enqueue_customer_sync(customer: frappe.model.document.Document | str, method: str | None = None, *, reason: str = "event", force: bool = False) -> None:
+def _serialize_customer_sync_scope(scopes: set[str]) -> str | None:
+    normalized = sorted(scope for scope in scopes if scope)
+    if not normalized:
+        return None
+    return ",".join(normalized)
+
+
+def _derive_customer_sync_scope(
+    customer: frappe.model.document.Document,
+    *,
+    method: str | None = None,
+    force: bool = False,
+) -> str | None:
+    if force or method != "on_update":
+        return None
+
+    changed_fields = _get_changed_fields(customer, _CUSTOMER_OUTBOUND_UPDATE_FIELDS)
+    scopes: set[str] = set()
+    if changed_fields & _CUSTOMER_CORE_OUTBOUND_UPDATE_FIELDS:
+        scopes.add("core")
+    if changed_fields & _CUSTOMER_SHIPPING_OUTBOUND_UPDATE_FIELDS:
+        scopes.add("shipping")
+    if changed_fields & _CUSTOMER_TERRITORY_OUTBOUND_UPDATE_FIELDS:
+        scopes.add("territory")
+    return _serialize_customer_sync_scope(scopes)
+
+
+def _address_is_shipping_relevant(address: Any) -> bool:
+    if not address:
+        return False
+    if cint(_get_doc_value(address, "is_shipping_address", 0)):
+        return True
+    return str(_get_doc_value(address, "address_type", "") or "").strip().lower() == "shipping"
+
+
+def _get_linked_customer_names_from_address(address: Any) -> list[str]:
+    customer_names: set[str] = set()
+    for candidate in (address, _get_doc_before_save(address)):
+        for link in getattr(candidate, "links", []) or []:
+            if _get_doc_value(link, "link_doctype") == "Customer":
+                link_name = _get_doc_value(link, "link_name")
+                if link_name:
+                    customer_names.add(link_name)
+
+    if customer_names:
+        return sorted(customer_names)
+
+    address_name = _get_doc_value(address, "name")
+    if not address_name:
+        return []
+
+    try:
+        links = frappe.get_all(
+            "Dynamic Link",
+            filters={"parenttype": "Address", "parent": address_name, "link_doctype": "Customer"},
+            fields=["link_name"],
+        )
+    except Exception:
+        return []
+
+    for link in links or []:
+        link_name = _get_doc_value(link, "link_name")
+        if link_name:
+            customer_names.add(link_name)
+    return sorted(customer_names)
+
+
+def _should_enqueue_customer_address_event(
+    address: frappe.model.document.Document,
+    *,
+    method: str | None = None,
+    force: bool = False,
+) -> bool:
+    if _is_outbound_suppressed(address):
+        return False
+    if force:
+        return True
+
+    previous = _get_doc_before_save(address)
+    shipping_relevant_now = _address_is_shipping_relevant(address)
+    shipping_relevant_before = _address_is_shipping_relevant(previous)
+
+    if method == "after_insert":
+        return shipping_relevant_now
+
+    if not (shipping_relevant_now or shipping_relevant_before):
+        return False
+
+    if method != "on_update":
+        return True
+
+    if shipping_relevant_now != shipping_relevant_before:
+        return True
+
+    if _get_changed_fields(address, _CUSTOMER_ADDRESS_OUTBOUND_UPDATE_FIELDS):
+        return True
+
+    LOGGER.info({
+        "event": "woo_outbound_customer_address_update_skipped",
+        "address": getattr(address, "name", None),
+        "method": method,
+    })
+    return False
+
+
+def enqueue_linked_customer_sync_for_address(
+    address: frappe.model.document.Document,
+    method: str | None = None,
+    *,
+    reason: str = "event",
+    force: bool = False,
+) -> None:
+    settings, cfg = _get_settings()
+    if not cfg.enable_customer_push and not force:
+        return
+    if not _should_enqueue_customer_address_event(address, method=method, force=force):
+        return
+
+    customer_names = _get_linked_customer_names_from_address(address)
+    if not customer_names:
+        return
+
+    enqueue_reason = reason if reason != "event" else (method or "address_event")
+    for customer_name in customer_names:
+        frappe.enqueue(
+            "jarz_woocommerce_integration.services.outbound_sync.sync_customer",
+            queue="short",
+            timeout=300,
+            now=force,
+            customer_name=customer_name,
+            reason=enqueue_reason,
+            scope="shipping",
+        )
+
+
+def enqueue_customer_sync(
+    customer: frappe.model.document.Document | str,
+    method: str | None = None,
+    *,
+    reason: str = "event",
+    force: bool = False,
+    scope: str | None = None,
+) -> None:
     settings, cfg = _get_settings()
     if not cfg.enable_customer_push and not force:
         return
@@ -253,6 +520,7 @@ def enqueue_customer_sync(customer: frappe.model.document.Document | str, method
         reason = reason if reason != "event" else (method or "event")
         if not _should_enqueue_customer_event(customer, method=method, force=force):
             return
+        scope = scope or _derive_customer_sync_scope(customer, method=method, force=force)
         customer_name = customer.name
     else:
         if _is_outbound_suppressed():
@@ -265,6 +533,7 @@ def enqueue_customer_sync(customer: frappe.model.document.Document | str, method
         now=force,
         customer_name=customer_name,
         reason=reason,
+        scope=scope,
     )
 
 
@@ -280,12 +549,30 @@ def _mark_customer_status(customer_name: str, *, status: str, error: str | None 
     frappe.db.set_value("Customer", customer_name, updates, update_modified=False)
 
 
-def _build_customer_payload(customer: frappe.model.document.Document, *, include_password: bool = False, include_username: bool = True) -> dict:
+def _normalize_customer_sync_scopes(scope: str | None) -> set[str]:
+    if not scope:
+        return {"full"}
+    scopes = {part.strip().lower() for part in str(scope).split(",") if part.strip()}
+    if not scopes or "full" in scopes:
+        return {"full"}
+    return scopes
+
+
+def _build_customer_payload(
+    customer: frappe.model.document.Document,
+    *,
+    include_password: bool = False,
+    include_username: bool = True,
+    scope: str | None = None,
+) -> dict:
     # Mobile number is mandatory for WooCommerce
     phone_val = (getattr(customer, "mobile_no", "") or getattr(customer, "phone", "") or "").strip()
     if not phone_val:
         # Try pulling phone from linked addresses
-        addr_candidates = [getattr(customer, "customer_primary_address", None), getattr(customer, "customer_shipping_address", None)]
+        addr_candidates = [
+            _resolve_customer_billing_address_name(customer),
+            _resolve_customer_shipping_address_name(customer),
+        ]
         for addr_name in addr_candidates:
             if not addr_name:
                 continue
@@ -318,70 +605,101 @@ def _build_customer_payload(customer: frappe.model.document.Document, *, include
             "generated_email": email,
         })
 
+    billing_address_name = _resolve_customer_billing_address_name(customer)
+    shipping_address_name = _resolve_customer_shipping_address_name(customer)
     first, last = _split_contact_name(customer.customer_name)
     billing = _get_address_payload(
-        getattr(customer, "customer_primary_address", None),
+        billing_address_name,
         fallback_name=customer.customer_name,
         phone=phone_val,
         email=email,
     )
     shipping = _get_address_payload(
-        getattr(customer, "customer_shipping_address", None),
+        shipping_address_name,
         fallback_name=customer.customer_name,
         phone=phone_val,
         email=email,
     )
-    payload = {
-        "email": email,
-        "first_name": first,
-        "last_name": last,
-        "billing": billing,
-        "shipping": shipping,
-    }
-    
-    # Only include username for NEW customer creation (WooCommerce doesn't allow editing username)
-    if include_username:
-        username_field = getattr(customer, "woo_username", None) or email
-        if username_field:
-            payload["username"] = username_field
-    
-    # Always include phone in billing and shipping
-    payload.setdefault("billing", {})["phone"] = phone_val
-    payload.setdefault("shipping", {})["phone"] = phone_val
+    metadata = _build_customer_metadata(customer)
+    scopes = _normalize_customer_sync_scopes(scope)
 
-    # Fallback: if both billing/shipping lack address lines, try any linked address
-    billing_line1 = (payload.get("billing", {}).get("address_1") or "").strip()
-    shipping_line1 = (payload.get("shipping", {}).get("address_1") or "").strip()
-    if not billing_line1 and not shipping_line1:
-        fallback_addr = _get_any_address_for_customer(customer.name)
-        if fallback_addr:
-            payload["billing"] = {**payload.get("billing", {}), **fallback_addr}
-            payload["shipping"] = {**payload.get("shipping", {}), **fallback_addr}
-            billing_line1 = fallback_addr.get("address_1", "").strip()
-            shipping_line1 = fallback_addr.get("address_1", "").strip()
+    if scopes == {"full"}:
+        payload = {
+            "email": email,
+            "first_name": first,
+            "last_name": last,
+            "billing": billing,
+            "shipping": shipping,
+        }
 
-    if not billing_line1 and not shipping_line1:
-        LOGGER.error({
-            "event": "woo_outbound_customer_missing_address",
-            "customer": customer.name,
-            "message": "Customer has no billing or shipping address",
-        })
-        raise ValueError("Customer has no billing or shipping address for WooCommerce")
-    
-    # Only include password for NEW customer creation
-    if include_password:
-        # Derive a deterministic password from the customer's phone number
-        password_seed = re.sub(r"[^0-9A-Za-z]", "", phone_val)
-        if not password_seed:
-            password_seed = "OrderJarz123"
-        if len(password_seed) < 8:
-            password_seed = (password_seed + "12345678")[:12]
-        payload["password"] = password_seed
-    
+        if include_username:
+            username_field = getattr(customer, "woo_username", None) or email
+            if username_field:
+                payload["username"] = username_field
+
+        payload.setdefault("billing", {})["phone"] = phone_val
+        payload.setdefault("shipping", {})["phone"] = phone_val
+        if metadata:
+            payload["meta_data"] = metadata
+
+        billing_line1 = (payload.get("billing", {}).get("address_1") or "").strip()
+        shipping_line1 = (payload.get("shipping", {}).get("address_1") or "").strip()
+        if not billing_line1 and not shipping_line1:
+            fallback_addr = _get_any_address_for_customer(customer.name)
+            if fallback_addr:
+                payload["billing"] = {**payload.get("billing", {}), **fallback_addr}
+                payload["shipping"] = {**payload.get("shipping", {}), **fallback_addr}
+                billing_line1 = fallback_addr.get("address_1", "").strip()
+                shipping_line1 = fallback_addr.get("address_1", "").strip()
+
+        if not billing_line1 and not shipping_line1:
+            LOGGER.error({
+                "event": "woo_outbound_customer_missing_address",
+                "customer": customer.name,
+                "message": "Customer has no billing or shipping address",
+            })
+            raise ValueError("Customer has no billing or shipping address for WooCommerce")
+
+        if include_password:
+            password_seed = re.sub(r"[^0-9A-Za-z]", "", phone_val)
+            if not password_seed:
+                password_seed = "OrderJarz123"
+            if len(password_seed) < 8:
+                password_seed = (password_seed + "12345678")[:12]
+            payload["password"] = password_seed
+
+        return payload
+
+    payload: dict[str, Any] = {}
+    if "core" in scopes:
+        payload["email"] = email
+        payload["first_name"] = first
+        payload["last_name"] = last
+        if phone_val:
+            payload.setdefault("billing", {})["phone"] = phone_val
+            payload.setdefault("shipping", {})["phone"] = phone_val
+
+    if "shipping" in scopes:
+        shipping_payload = dict(shipping)
+        if phone_val:
+            shipping_payload.setdefault("phone", phone_val)
+        if email:
+            shipping_payload.setdefault("email", email)
+        payload["shipping"] = shipping_payload
+
+    if "territory" in scopes and metadata:
+        payload["meta_data"] = metadata
+
     return payload
 
 
-def sync_customer(customer_name: str, *, reason: str | None = None, force: bool = False) -> dict:
+def sync_customer(
+    customer_name: str,
+    *,
+    reason: str | None = None,
+    force: bool = False,
+    scope: str | None = None,
+) -> dict:
     settings, cfg = _get_settings()
     if not cfg.enable_customer_push and not force:
         return {"skipped": True, "reason": "disabled"}
@@ -411,9 +729,15 @@ def sync_customer(customer_name: str, *, reason: str | None = None, force: bool 
         _mark_customer_status(customer_name, status="error", error=detail)
         return {"status": "error", "detail": detail}
     is_new_customer = not woo_id
+    effective_scope = None if is_new_customer else scope
     
     try:
-        payload = _build_customer_payload(customer, include_password=True, include_username=is_new_customer)
+        payload = _build_customer_payload(
+            customer,
+            include_password=is_new_customer,
+            include_username=is_new_customer,
+            scope=effective_scope,
+        )
     except ValueError as exc:
         LOGGER.warning({
             "event": "woo_outbound_customer_skipped",
@@ -1038,6 +1362,88 @@ def _attach_existing_line_ids(line_items: list[dict], existing_line_items: list[
     return mapped, unmapped
 
 
+def _meta_entries_to_map(entries: list[dict] | None) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for entry in entries or []:
+        key = str(entry.get("key") or "").strip()
+        if key:
+            result[key] = entry.get("value")
+    return result
+
+
+def _normalize_order_line_items(entries: list[dict] | None) -> list[tuple[Any, ...]]:
+    normalized: list[tuple[Any, ...]] = []
+    for entry in entries or []:
+        variation_id = entry.get("variation_id")
+        if variation_id == 0:
+            variation_id = None
+        metadata = tuple(sorted(
+            (
+                str(meta.get("key") or ""),
+                str(meta.get("value") or ""),
+            )
+            for meta in entry.get("meta_data", []) or []
+            if meta.get("key")
+        ))
+        normalized.append((
+            cint(entry.get("id") or 0),
+            cint(entry.get("product_id") or 0),
+            cint(variation_id or 0),
+            flt(entry.get("quantity") or 0),
+            str(entry.get("subtotal") or ""),
+            str(entry.get("total") or ""),
+            metadata,
+        ))
+    return sorted(normalized)
+
+
+def _normalize_order_shipping_lines(entries: list[dict] | None) -> list[tuple[str, str, str]]:
+    normalized = []
+    for entry in entries or []:
+        normalized.append((
+            str(entry.get("method_id") or ""),
+            str(entry.get("method_title") or ""),
+            str(entry.get("total") or ""),
+        ))
+    return sorted(normalized)
+
+
+def _order_payload_requires_update(existing_order: dict, payload: dict) -> bool:
+    current_status = str(existing_order.get("status") or "").strip().lower()
+    desired_status = str(payload.get("status") or "").strip().lower()
+    if current_status != desired_status:
+        return True
+
+    payload_customer_id = payload.get("customer_id")
+    if payload_customer_id and str(existing_order.get("customer_id") or "") != str(payload_customer_id):
+        return True
+
+    desired_meta = {
+        key: value
+        for key, value in _meta_entries_to_map(payload.get("meta_data") or []).items()
+        if key in _ORDER_SYNC_META_KEYS_TO_COMPARE
+    }
+    if desired_meta:
+        existing_meta = _meta_entries_to_map(existing_order.get("meta_data") or [])
+        for key, value in desired_meta.items():
+            if str(existing_meta.get(key) or "") != str(value or ""):
+                return True
+
+    payload_line_items = payload.get("line_items") or []
+    if payload_line_items:
+        existing_line_items = existing_order.get("line_items") or []
+        if _normalize_order_line_items(payload_line_items) != _normalize_order_line_items(existing_line_items):
+            return True
+
+    payload_shipping_lines = payload.get("shipping_lines") or []
+    if payload_shipping_lines:
+        existing_shipping_lines = existing_order.get("shipping_lines") or []
+        if _normalize_order_shipping_lines(payload_shipping_lines) != _normalize_order_shipping_lines(existing_shipping_lines):
+            return True
+
+    return False
+
+
 def _build_order_payload(
     invoice: frappe.model.document.Document,
     cfg: OutboundConfig,
@@ -1362,15 +1768,13 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         _mark_invoice_status(invoice_name, status="error", error=str(exc))
         return {"status": "error", "detail": str(exc)}
 
-    current_woo_status = str((existing_order or {}).get("status") or "").strip().lower()
-    desired_woo_status = str(payload.get("status") or "").strip().lower()
-    if order_map_exists and woo_order_id and existing_order and current_woo_status == desired_woo_status:
+    if order_map_exists and woo_order_id and existing_order and not _order_payload_requires_update(existing_order, payload):
         _mark_invoice_status(invoice_name, status="Synced")
         LOGGER.info({
             "event": "woo_outbound_invoice_already_in_sync",
             "invoice": invoice_name,
             "woo_order_id": woo_order_id,
-            "status": desired_woo_status,
+            "status": payload.get("status"),
             "reason": reason,
         })
         return {"skipped": True, "reason": "already_in_sync", "woo_order_id": woo_order_id}

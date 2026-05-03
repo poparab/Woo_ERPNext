@@ -114,6 +114,44 @@ class DummyCustomer:
         return previous.get(fieldname) != self.get(fieldname)
 
 
+class DummyAddress:
+    def __init__(
+        self,
+        *,
+        name: str = "ADDR-SHIP-002",
+        address_type: str = "Shipping",
+        is_shipping_address: int = 1,
+        address_line1: str = "Street 2",
+        customer_name: str = "CUST-TEST-001",
+    ):
+        self.name = name
+        self.address_type = address_type
+        self.is_shipping_address = is_shipping_address
+        self.address_line1 = address_line1
+        self.address_line2 = None
+        self.city = "Cairo"
+        self.state = None
+        self.pincode = None
+        self.country = "Egypt"
+        self.phone = "01000000000"
+        self.email_id = "test@example.com"
+        self.links = [SimpleNamespace(link_doctype="Customer", link_name=customer_name)]
+        self.flags = SimpleNamespace(ignore_woo_outbound=False)
+        self._before_save = None
+
+    def get(self, fieldname, default=None):
+        return getattr(self, fieldname, default)
+
+    def get_doc_before_save(self):
+        return self._before_save
+
+    def has_value_changed(self, fieldname):
+        previous = self.get_doc_before_save()
+        if not previous:
+            return False
+        return previous.get(fieldname) != self.get(fieldname)
+
+
 def _outbound_cfg():
     return outbound_sync.OutboundConfig(
         enable_customer_push=True,
@@ -271,6 +309,34 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         self.assertEqual(len(enqueue_calls), 1)
         self.assertEqual(enqueue_calls[0][1]["customer_name"], current.name)
+
+    def test_enqueue_linked_customer_sync_for_address_keeps_shipping_updates(self):
+        previous = DummyAddress(address_line1="Old Shipping Line")
+        current = DummyAddress(address_line1="New Shipping Line")
+        current._before_save = previous
+        enqueue_calls = []
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_linked_customer_sync_for_address(current, method="on_update")
+
+        self.assertEqual(len(enqueue_calls), 1)
+        self.assertEqual(enqueue_calls[0][1]["customer_name"], "CUST-TEST-001")
+        self.assertEqual(enqueue_calls[0][1]["scope"], "shipping")
+
+    def test_enqueue_linked_customer_sync_for_address_skips_billing_only_updates(self):
+        previous = DummyAddress(address_type="Billing", is_shipping_address=0, address_line1="Old Billing Line")
+        current = DummyAddress(address_type="Billing", is_shipping_address=0, address_line1="New Billing Line")
+        current._before_save = previous
+        enqueue_calls = []
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_linked_customer_sync_for_address(current, method="on_update")
+
+        self.assertEqual(enqueue_calls, [])
 
     def test_determine_status_maps_invoice_states_to_woo_status(self):
         self.assertEqual(outbound_sync._determine_status(DummyInvoice(sales_invoice_state="Out for Delivery")), "out-for-delivery")
@@ -518,6 +584,124 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(result, {"skipped": True, "reason": "already_in_sync", "woo_order_id": 14500})
         self.assertEqual(client.put_calls, [])
         mock_mark_status.assert_called_once_with(invoice.name, status="Synced")
+
+    def test_sync_sales_invoice_updates_delivery_metadata_even_when_status_matches(self):
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        client = DummyClient(existing_order={
+            "id": 14500,
+            "status": "completed",
+            "meta_data": [{"key": "_orddd_delivery_date", "value": "Sunday, May 03, 2026"}],
+        })
+        mock_set_value = unittest.mock.MagicMock()
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings") as mock_get_settings, \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={
+                 "status": "completed",
+                 "meta_data": [{"key": "_orddd_delivery_date", "value": "Wednesday, May 06, 2026"}],
+             }), \
+             unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True, set_value=mock_set_value)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
+            mock_get_settings.return_value = (SimpleNamespace(), _outbound_cfg())
+            mock_get_doc.side_effect = lambda doctype, name: invoice if doctype == "Sales Invoice" else SimpleNamespace(name=invoice.customer, woo_customer_id="88")
+
+            result = outbound_sync.sync_sales_invoice(invoice.name, reason="test")
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 14500})
+        self.assertEqual(client.put_calls, [("orders/14500", {
+            "status": "completed",
+            "meta_data": [{"key": "_orddd_delivery_date", "value": "Wednesday, May 06, 2026"}],
+        })])
+
+    def test_resolve_customer_shipping_address_name_prefers_linked_shipping_address(self):
+        customer = SimpleNamespace(name="CUST-TEST-001", customer_primary_address="ADDR-BILL-001")
+
+        with unittest.mock.patch.object(outbound_sync, "_get_linked_customer_addresses", return_value=[
+            {"name": "ADDR-BILL-001", "address_type": "Billing", "is_primary_address": 1, "is_shipping_address": 0},
+            {"name": "ADDR-SHIP-001", "address_type": "Billing", "is_primary_address": 0, "is_shipping_address": 1},
+        ]):
+            resolved = outbound_sync._resolve_customer_shipping_address_name(customer)
+
+        self.assertEqual(resolved, "ADDR-SHIP-001")
+
+    def test_sync_customer_shipping_scope_updates_shipping_without_billing(self):
+        customer = SimpleNamespace(
+            name="CUST-TEST-001",
+            customer_name="Test Customer",
+            woo_customer_id="3095",
+            email_id="test@example.com",
+            mobile_no="01000000000",
+            phone=None,
+            customer_primary_address="ADDR-BILL-001",
+            territory="Nasr City",
+            flags=SimpleNamespace(ignore_woo_outbound=False),
+        )
+        client = DummyClient()
+        mock_set_value = unittest.mock.MagicMock()
+
+        def fake_get_address_payload(address_name, **kwargs):
+            if address_name == "ADDR-BILL-001":
+                return {"address_1": "Billing Line", "email": "test@example.com", "phone": "01000000000"}
+            if address_name == "ADDR-SHIP-001":
+                return {"address_1": "Shipping Line", "email": "test@example.com", "phone": "01000000000"}
+            return {}
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_resolve_customer_billing_address_name", return_value="ADDR-BILL-001"), \
+             unittest.mock.patch.object(outbound_sync, "_resolve_customer_shipping_address_name", return_value="ADDR-SHIP-001"), \
+             unittest.mock.patch.object(outbound_sync, "_get_address_payload", side_effect=fake_get_address_payload), \
+             unittest.mock.patch.object(outbound_sync, "get_customer_woo_id", return_value="3095"), \
+             unittest.mock.patch.object(outbound_sync, "has_unmigrated_legacy_customer_woo_id", return_value=False), \
+             unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc", return_value=customer), \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(set_value=mock_set_value)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
+            result = outbound_sync.sync_customer(customer.name, reason="test", scope="shipping")
+
+        self.assertEqual(result, {"status": "ok", "woo_customer_id": 14500})
+        self.assertEqual(client.put_calls, [("customers/3095", {
+            "shipping": {
+                "address_1": "Shipping Line",
+                "email": "test@example.com",
+                "phone": "01000000000",
+            },
+        })])
+
+    def test_sync_customer_territory_scope_updates_metadata_only(self):
+        customer = SimpleNamespace(
+            name="CUST-TEST-001",
+            customer_name="Test Customer",
+            woo_customer_id="3095",
+            email_id="test@example.com",
+            mobile_no="01000000000",
+            phone=None,
+            customer_primary_address="ADDR-BILL-001",
+            territory="Nasr City",
+            flags=SimpleNamespace(ignore_woo_outbound=False),
+        )
+        client = DummyClient()
+        mock_set_value = unittest.mock.MagicMock()
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_resolve_customer_billing_address_name", return_value="ADDR-BILL-001"), \
+             unittest.mock.patch.object(outbound_sync, "_resolve_customer_shipping_address_name", return_value=None), \
+             unittest.mock.patch.object(outbound_sync, "_get_address_payload", return_value={}), \
+             unittest.mock.patch.object(outbound_sync, "get_customer_woo_id", return_value="3095"), \
+             unittest.mock.patch.object(outbound_sync, "has_unmigrated_legacy_customer_woo_id", return_value=False), \
+             unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc", return_value=customer), \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(set_value=mock_set_value)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
+            result = outbound_sync.sync_customer(customer.name, reason="test", scope="territory")
+
+        self.assertEqual(result, {"status": "ok", "woo_customer_id": 14500})
+        self.assertEqual(client.put_calls, [("customers/3095", {
+            "meta_data": [{"key": "erpnext_territory", "value": "Nasr City"}],
+        })])
 
     def test_collect_line_items_skips_registered_bundle_parent_rows_without_runtime_flag(self):
         invoice = SimpleNamespace(items=[

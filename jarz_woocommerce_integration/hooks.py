@@ -146,6 +146,10 @@ doc_events = {
 		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_customer_sync",
 		"on_update": "jarz_woocommerce_integration.services.outbound_sync.enqueue_customer_sync",
 	},
+	"Address": {
+		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
+		"on_update": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
+	},
 	"Sales Invoice": {
 		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
 		"on_update_after_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
