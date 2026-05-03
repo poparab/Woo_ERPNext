@@ -190,6 +190,14 @@ def _split_contact_name(raw: str | None) -> tuple[str, str]:
     return pieces[0], pieces[1]
 
 
+def _normalize_woo_address_lines(address_line1: str | None, address_line2: str | None) -> tuple[str, str]:
+    line1 = (address_line1 or "").strip()
+    line2 = (address_line2 or "").strip()
+    if not line1 and line2:
+        return line2, ""
+    return line1, line2
+
+
 def _get_address_payload(address_name: str | None, *, fallback_name: str, phone: str | None, email: str | None) -> dict:
     if not address_name:
         return {}
@@ -206,13 +214,14 @@ def _get_address_payload(address_name: str | None, *, fallback_name: str, phone:
     address = frappe.db.get_value("Address", address_name, fields, as_dict=True)
     if not address:
         return {}
+    line1, line2 = _normalize_woo_address_lines(address.get("address_line1"), address.get("address_line2"))
     first, last = _split_contact_name(fallback_name)
     return {
         "first_name": first,
         "last_name": last,
         "company": fallback_name,
-        "address_1": address.get("address_line1") or "",
-        "address_2": address.get("address_line2") or "",
+        "address_1": line1,
+        "address_2": line2,
         "city": address.get("city") or "",
         "state": address.get("state") or "",
         "postcode": address.get("pincode") or "",
@@ -234,9 +243,10 @@ def _get_any_address_for_customer(customer_name: str) -> dict:
         if not link:
             return {}
         addr = frappe.get_doc("Address", link[0].parent)
+        line1, line2 = _normalize_woo_address_lines(addr.address_line1, addr.address_line2)
         return {
-            "address_1": addr.address_line1 or "",
-            "address_2": addr.address_line2 or "",
+            "address_1": line1,
+            "address_2": line2,
             "city": addr.city or "",
             "state": addr.state or "",
             "postcode": addr.pincode or "",

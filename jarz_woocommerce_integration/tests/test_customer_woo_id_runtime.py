@@ -99,6 +99,56 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
         self.assertIsNone(customer_woo_id.normalize_woo_customer_id("0"))
         self.assertEqual(customer_woo_id.normalize_woo_customer_id("003095"), "3095")
 
+    def test_build_customer_payload_uses_line2_when_line1_missing(self):
+        customer = SimpleNamespace(
+            name="CUST-0001",
+            customer_name="Test Customer",
+            email_id="test@example.com",
+            mobile_no="01000000000",
+            phone=None,
+            customer_primary_address="ADDR-BILL-001",
+            customer_shipping_address="ADDR-SHIP-001",
+            territory="",
+            flags=SimpleNamespace(ignore_woo_outbound=False),
+        )
+        address_rows = {
+            "ADDR-BILL-001": {
+                "address_line1": "",
+                "address_line2": "Apartment 4",
+                "city": "Cairo",
+                "state": "Cairo Governorate",
+                "pincode": "11511",
+                "country": "EG",
+                "phone": None,
+                "email_id": None,
+            },
+            "ADDR-SHIP-001": {
+                "address_line1": "",
+                "address_line2": "Villa 8",
+                "city": "Giza",
+                "state": "Giza Governorate",
+                "pincode": "12557",
+                "country": "EG",
+                "phone": None,
+                "email_id": None,
+            },
+        }
+
+        def fake_get_value(doctype, name, fields, as_dict=False):
+            self.assertEqual(doctype, "Address")
+            self.assertTrue(as_dict)
+            return address_rows.get(name)
+
+        with unittest.mock.patch.object(outbound_sync.frappe, "db", SimpleNamespace(get_value=fake_get_value)):
+            payload = outbound_sync._build_customer_payload(customer)
+
+        self.assertEqual(payload["billing"]["address_1"], "Apartment 4")
+        self.assertEqual(payload["billing"]["address_2"], "")
+        self.assertEqual(payload["billing"]["city"], "Cairo")
+        self.assertEqual(payload["shipping"]["address_1"], "Villa 8")
+        self.assertEqual(payload["shipping"]["address_2"], "")
+        self.assertEqual(payload["shipping"]["state"], "Giza Governorate")
+
     def test_ensure_customer_backfills_canonical_woo_customer_id_on_email_match(self):
         updates = []
 
