@@ -460,6 +460,7 @@ class TestOutboundStatusSync(unittest.TestCase):
         with unittest.mock.patch.object(outbound_sync, "_get_settings") as mock_get_settings, \
              unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
              unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "out-for-delivery"}), \
+               unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
              unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
              unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True, set_value=mock_set_value)), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
@@ -630,6 +631,7 @@ class TestOutboundStatusSync(unittest.TestCase):
         with unittest.mock.patch.object(outbound_sync, "_get_settings") as mock_get_settings, \
              unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
              unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "processing"}), \
+               unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
              unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
              unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True, set_value=mock_set_value)), \
              unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
