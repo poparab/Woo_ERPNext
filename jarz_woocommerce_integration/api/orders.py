@@ -33,6 +33,7 @@ def _verify_signature(raw_body: bytes, provided: str | None, secret: str | None)
 
 
 def _process_order_webhook(order_payload: dict[str, Any]):  # background job (must be top-level for RQ pickling)
+    frappe.set_user("Administrator")
     start = frappe.utils.now_datetime()
     log_doc = create_sync_log_entry(
         "WebhookProcess",

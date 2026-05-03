@@ -84,6 +84,8 @@ def _update_customer_identity(
     try:
         if customer_cache is not None:
             updates: dict[str, Any] = {}
+            if frappe.db.get_value("Customer", name, "disabled"):
+                updates["disabled"] = 0
             if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and not get_customer_woo_id(name):
                 updates["woo_customer_id"] = normalized_woo_customer_id
             if username and _field_exists("Customer", "woo_username") and not frappe.db.get_value("Customer", name, "woo_username"):
@@ -98,6 +100,9 @@ def _update_customer_identity(
 
         cust = frappe.get_doc("Customer", name)
         changed = False
+        if getattr(cust, "disabled", 0):
+            cust.disabled = 0
+            changed = True
         if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and not get_customer_woo_id(cust):
             cust.woo_customer_id = normalized_woo_customer_id
             changed = True
@@ -307,6 +312,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             "doctype": "Customer",
             "customer_name": display_name if display_name else (username or "Woo Customer"),
             "customer_type": "Individual",
+            "disabled": 0,
         }
         if email:
             fields["email_id"] = email

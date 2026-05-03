@@ -41,6 +41,7 @@ def _verify_signature(raw_body: bytes, provided: str | None, secret: str | None)
 
 
 def _enqueue_customer_process(payload: dict[str, Any], headers: dict[str, Any]):  # background job
+    frappe.set_user("Administrator")
     settings = WooCommerceSettings.get_settings()
     start = now_datetime()
     try:
