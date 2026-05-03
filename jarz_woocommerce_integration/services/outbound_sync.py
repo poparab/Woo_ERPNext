@@ -36,6 +36,15 @@ _ACCEPTANCE_ONLY_FIELDS = frozenset({
     "custom_accepted_on",
 })
 
+_CUSTOMER_OUTBOUND_UPDATE_FIELDS = frozenset({
+    "customer_name",
+    "email_id",
+    "mobile_no",
+    "phone",
+    "customer_shipping_address",
+    "territory",
+})
+
 _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
     "custom_sales_invoice_state",
     "sales_invoice_state",
@@ -54,6 +63,21 @@ _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
     "custom_delivery_time",
     "delivery_time",
     "woo_order_id",
+})
+
+_INVOICE_OUTBOUND_DELIVERY_FIELDS = frozenset({
+    "custom_delivery_date",
+    "delivery_date",
+    "custom_delivery_time_from",
+    "custom_delivery_duration",
+    "custom_delivery_time",
+    "delivery_time",
+})
+
+_APPROVED_INVOICE_OUTBOUND_STATUSES = frozenset({
+    "out-for-delivery",
+    "completed",
+    "cancelled",
 })
 
 
@@ -187,6 +211,33 @@ def _get_any_address_for_customer(customer_name: str) -> dict:
         return {}
 
 
+def _get_doc_value(document: Any, fieldname: str, default: Any = None) -> Any:
+    if document is None:
+        return default
+    getter = getattr(document, "get", None)
+    if callable(getter):
+        try:
+            return getter(fieldname, default)
+        except TypeError:
+            try:
+                return getter(fieldname)
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return getattr(document, fieldname, default)
+
+
+def _get_doc_before_save(document: Any) -> Any:
+    return getattr(document, "get_doc_before_save", lambda: None)()
+
+
+def _is_outbound_suppressed(document: Any | None = None) -> bool:
+    if getattr(getattr(document, "flags", None), "ignore_woo_outbound", False):
+        return True
+    return bool(getattr(getattr(frappe, "flags", None), "ignore_woo_outbound", False))
+
+
 # ---------------------------------------------------------------------------
 # Customer outbound sync
 # ---------------------------------------------------------------------------
@@ -197,8 +248,12 @@ def enqueue_customer_sync(customer: frappe.model.document.Document | str, method
         return
     if not isinstance(customer, str):
         reason = reason if reason != "event" else (method or "event")
+        if not _should_enqueue_customer_event(customer, method=method, force=force):
+            return
         customer_name = customer.name
     else:
+        if _is_outbound_suppressed():
+            return
         customer_name = customer
     frappe.enqueue(
         "jarz_woocommerce_integration.services.outbound_sync.sync_customer",
@@ -461,10 +516,12 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
     if not isinstance(invoice, str):
         reason = reason if reason != "event" else (method or "event")
         cancel = cancel or method == "on_cancel"
-        if _should_skip_acceptance_only_update(invoice, method=method, cancel=cancel):
+        if not _should_enqueue_invoice_event(invoice, method=method, cancel=cancel, force=force):
             return
         invoice_name = invoice.name
     else:
+        if _is_outbound_suppressed():
+            return
         invoice_name = invoice
     frappe.enqueue(
         "jarz_woocommerce_integration.services.outbound_sync.sync_sales_invoice",
@@ -775,10 +832,120 @@ def _safe_has_value_changed(invoice: frappe.model.document.Document, fieldname: 
     try:
         return bool(invoice.has_value_changed(fieldname))
     except Exception:
-        previous = getattr(invoice, "get_doc_before_save", lambda: None)()
+        previous = _get_doc_before_save(invoice)
         if not previous:
             return False
-        return previous.get(fieldname) != invoice.get(fieldname)
+        return _get_doc_value(previous, fieldname) != _get_doc_value(invoice, fieldname)
+
+
+def _has_any_value_changed(document: frappe.model.document.Document, fieldnames: frozenset[str]) -> bool:
+    return any(_safe_has_value_changed(document, fieldname) for fieldname in fieldnames)
+
+
+def _serialize_invoice_item_rows(invoice: frappe.model.document.Document) -> list[tuple[Any, ...]]:
+    rows: list[tuple[Any, ...]] = []
+    for item in getattr(invoice, "items", []) or []:
+        rows.append((
+            str(_get_doc_value(item, "item_code", "") or "").strip(),
+            flt(_get_doc_value(item, "qty", 0)),
+            flt(_get_doc_value(item, "rate", 0)),
+            flt(_get_doc_value(item, "amount", 0)),
+            flt(_get_doc_value(item, "price_list_rate", 0)),
+            flt(_get_doc_value(item, "discount_percentage", 0)),
+            cint(_get_doc_value(item, "is_bundle_parent", 0)),
+            cint(_get_doc_value(item, "is_bundle_child", 0)),
+            str(_get_doc_value(item, "parent_bundle", "") or "").strip(),
+            str(_get_doc_value(item, "bundle_code", "") or "").strip(),
+        ))
+    return sorted(rows)
+
+
+def _invoice_items_changed(invoice: frappe.model.document.Document) -> bool:
+    previous = _get_doc_before_save(invoice)
+    if not previous:
+        return False
+    return _serialize_invoice_item_rows(previous) != _serialize_invoice_item_rows(invoice)
+
+
+def _has_missing_or_stale_woo_order_mapping(invoice: frappe.model.document.Document) -> bool:
+    woo_order_id = _get_doc_value(invoice, "woo_order_id")
+    if not woo_order_id:
+        return True
+    try:
+        return not bool(frappe.db.exists("WooCommerce Order Map", {"woo_order_id": woo_order_id}))
+    except Exception:
+        return False
+
+
+def _has_approved_invoice_status_change(
+    invoice: frappe.model.document.Document,
+    *,
+    cancel: bool = False,
+) -> bool:
+    previous = _get_doc_before_save(invoice)
+    if not previous:
+        return False
+
+    current_status = _determine_status(invoice, cancel=cancel)
+    previous_status = _determine_status(previous, cancel=False)
+    return current_status in _APPROVED_INVOICE_OUTBOUND_STATUSES and current_status != previous_status
+
+
+def _should_enqueue_customer_event(
+    customer: frappe.model.document.Document,
+    *,
+    method: str | None = None,
+    force: bool = False,
+) -> bool:
+    if _is_outbound_suppressed(customer):
+        return False
+    if force:
+        return True
+    if method != "on_update":
+        return True
+    if _has_any_value_changed(customer, _CUSTOMER_OUTBOUND_UPDATE_FIELDS):
+        return True
+
+    LOGGER.info({
+        "event": "woo_outbound_customer_update_skipped",
+        "customer": getattr(customer, "name", None),
+        "method": method,
+    })
+    return False
+
+
+def _should_enqueue_invoice_event(
+    invoice: frappe.model.document.Document,
+    *,
+    method: str | None = None,
+    cancel: bool = False,
+    force: bool = False,
+) -> bool:
+    if _is_outbound_suppressed(invoice):
+        return False
+    if force:
+        return True
+    if cancel or method in {None, "on_submit", "on_cancel"}:
+        return True
+    if method != "on_update_after_submit":
+        return True
+    if _has_missing_or_stale_woo_order_mapping(invoice):
+        return True
+    if _should_skip_acceptance_only_update(invoice, method=method, cancel=cancel):
+        return False
+    if _has_approved_invoice_status_change(invoice, cancel=cancel):
+        return True
+    if _has_any_value_changed(invoice, _INVOICE_OUTBOUND_DELIVERY_FIELDS):
+        return True
+    if _invoice_items_changed(invoice):
+        return True
+
+    LOGGER.info({
+        "event": "woo_outbound_invoice_update_skipped",
+        "invoice": getattr(invoice, "name", None),
+        "method": method,
+    })
+    return False
 
 
 def _should_skip_acceptance_only_update(
@@ -790,14 +957,17 @@ def _should_skip_acceptance_only_update(
     if cancel or method != "on_update_after_submit":
         return False
 
-    previous = getattr(invoice, "get_doc_before_save", lambda: None)()
+    previous = _get_doc_before_save(invoice)
     if not previous:
         return False
 
-    if not any(_safe_has_value_changed(invoice, fieldname) for fieldname in _ACCEPTANCE_ONLY_FIELDS):
+    if not _has_any_value_changed(invoice, _ACCEPTANCE_ONLY_FIELDS):
         return False
 
-    if any(_safe_has_value_changed(invoice, fieldname) for fieldname in _OUTBOUND_RELEVANT_UPDATE_FIELDS):
+    if _has_any_value_changed(invoice, _OUTBOUND_RELEVANT_UPDATE_FIELDS):
+        return False
+
+    if _invoice_items_changed(invoice):
         return False
 
     if _determine_status(previous, cancel=cancel) != _determine_status(invoice, cancel=cancel):
