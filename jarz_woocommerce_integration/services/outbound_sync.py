@@ -118,6 +118,18 @@ _APPROVED_INVOICE_OUTBOUND_STATUSES = frozenset({
 })
 
 
+def _resolve_order_map_link_field() -> str:
+    try:
+        cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
+    except Exception:
+        cols = []
+    if "erpnext_sales_invoice" in cols:
+        return "erpnext_sales_invoice"
+    if "sales_invoice" in cols:
+        return "sales_invoice"
+    return "erpnext_sales_invoice"
+
+
 def _normalize_outbound_status(status: str | None) -> str:
     """Normalize outbound status values to the allowed title-case options."""
     if not status:
@@ -1318,6 +1330,60 @@ def _should_skip_acceptance_only_update(
     return True
 
 
+def _recover_amended_invoice_woo_order_id(invoice: frappe.model.document.Document) -> Optional[int]:
+    amended_from = str(getattr(invoice, "amended_from", "") or invoice.get("amended_from") or "").strip()
+    if not amended_from:
+        return None
+
+    try:
+        source_woo_order_id = frappe.db.get_value("Sales Invoice", amended_from, "woo_order_id")
+        if source_woo_order_id:
+            return cint(source_woo_order_id) or None
+    except Exception:
+        pass
+
+    link_field = _resolve_order_map_link_field()
+    try:
+        map_row = frappe.db.get_value(
+            "WooCommerce Order Map",
+            {link_field: amended_from},
+            ["woo_order_id"],
+            as_dict=True,
+        )
+        recovered = (map_row or {}).get("woo_order_id") if isinstance(map_row, dict) else None
+        return cint(recovered) or None
+    except Exception:
+        return None
+
+
+def _relink_order_map_to_invoice(woo_order_id: int | str | None, invoice_name: str) -> None:
+    if not woo_order_id or not invoice_name:
+        return
+
+    link_field = _resolve_order_map_link_field()
+    try:
+        map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_order_id}, "name")
+    except Exception:
+        map_name = None
+    if not map_name:
+        return
+
+    try:
+        frappe.db.set_value(
+            "WooCommerce Order Map",
+            map_name,
+            {link_field: invoice_name},
+            update_modified=False,
+        )
+    except Exception:
+        LOGGER.warning({
+            "event": "woo_outbound_order_map_relink_failed",
+            "invoice": invoice_name,
+            "woo_order_id": woo_order_id,
+            "link_field": link_field,
+        })
+
+
 def _extract_item_code(entry: dict) -> Optional[str]:
     for meta in entry.get("meta_data", []) or []:
         if meta.get("key") == "erpnext_item_code":
@@ -1708,7 +1774,7 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     if getattr(invoice.flags, "ignore_woo_outbound", False) or getattr(frappe.flags, "ignore_woo_outbound", False):
         return {"skipped": True, "reason": "inbound"}
 
-    _woo_id = invoice.get("woo_order_id")
+    _woo_id = invoice.get("woo_order_id") or _recover_amended_invoice_woo_order_id(invoice)
     order_map_exists = bool(_woo_id and frappe.db.exists("WooCommerce Order Map", {"woo_order_id": _woo_id}))
 
     if invoice.docstatus == 0 and not cancel:
@@ -1746,7 +1812,7 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         customer_doc = frappe.get_doc("Customer", invoice.customer)
 
     original_woo_order_id = getattr(invoice, "woo_order_id", None)
-    woo_order_id = original_woo_order_id
+    woo_order_id = original_woo_order_id or _recover_amended_invoice_woo_order_id(invoice)
     existing_order: Optional[Dict[str, Any]] = None
     if woo_order_id:
         try:
@@ -1821,6 +1887,7 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     if woo_number:
         updates["woo_order_number"] = woo_number
     frappe.db.set_value("Sales Invoice", invoice_name, updates, update_modified=False)
+    _relink_order_map_to_invoice(woo_id or woo_order_id, invoice_name)
 
     LOGGER.info({
         "event": "woo_outbound_invoice_synced",
