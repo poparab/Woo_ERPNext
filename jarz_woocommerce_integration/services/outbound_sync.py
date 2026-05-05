@@ -1391,47 +1391,82 @@ def _extract_item_code(entry: dict) -> Optional[str]:
     return None
 
 
+def _extract_meta_value(entry: dict, key: str) -> Optional[str]:
+    for meta in entry.get("meta_data", []) or []:
+        if meta.get("key") == key:
+            value = meta.get("value")
+            if value in (None, ""):
+                return None
+            return str(value)
+    return None
+
+
+def _line_product_key(entry: dict) -> tuple[Optional[int], Optional[int]]:
+    product_id = cint(entry.get("product_id") or 0) or None
+    variation_id = cint(entry.get("variation_id") or 0) or None
+    return product_id, variation_id
+
+
+def _consume_matching_existing_line(
+    entry: dict,
+    remaining: list[dict],
+    predicate,
+) -> Optional[dict]:
+    for index, candidate in enumerate(remaining):
+        if predicate(candidate):
+            return remaining.pop(index)
+    return None
+
+
 def _attach_existing_line_ids(line_items: list[dict], existing_line_items: list[dict]) -> tuple[list[dict], list[dict]]:
     if not existing_line_items:
         return line_items, []
 
-    by_meta: dict[str, list[dict]] = {}
-    by_product: dict[tuple[Optional[int], Optional[int]], list[dict]] = {}
+    remaining: list[dict] = []
     for existing in existing_line_items:
-        code = None
-        for md in existing.get("meta_data", []) or []:
-            if md.get("key") == "erpnext_item_code":
-                code = md.get("value")
-                break
-        if code:
-            by_meta.setdefault(code, []).append(existing)
-        
-        pid = existing.get("product_id")
-        vid = existing.get("variation_id")
-        if vid == 0:
-            vid = None
-        key = (pid, vid)
-        by_product.setdefault(key, []).append(existing)
+        remaining.append({
+            "entry": existing,
+            "item_code": _extract_item_code(existing),
+            "product_key": _line_product_key(existing),
+            "bundle_parent_id": _extract_meta_value(existing, "_woosb_parent_id"),
+            "quantity": flt(existing.get("quantity") or 0),
+        })
 
     mapped: list[dict] = []
     unmapped: list[dict] = []
     for entry in line_items:
         match: Optional[dict] = None
         code = _extract_item_code(entry)
-        if code and by_meta.get(code):
-            match = by_meta[code].pop(0)
-        else:
-            pid = entry.get("product_id")
-            vid = entry.get("variation_id")
-            if vid == 0:
-                vid = None
-            key = (pid, vid)
-            bucket = by_product.get(key) or []
-            if bucket:
-                match = bucket.pop(0)
+        if code:
+            match = _consume_matching_existing_line(
+                entry,
+                remaining,
+                lambda candidate: candidate.get("item_code") == code,
+            )
 
-        if match and match.get("id"):
-            entry["id"] = match["id"]
+        if not match:
+            desired_product_key = _line_product_key(entry)
+            match = _consume_matching_existing_line(
+                entry,
+                remaining,
+                lambda candidate: candidate.get("product_key") == desired_product_key,
+            )
+
+        if not match:
+            desired_bundle_parent_id = _extract_meta_value(entry, "_woosb_parent_id")
+            desired_quantity = flt(entry.get("quantity") or 0)
+            if desired_bundle_parent_id:
+                match = _consume_matching_existing_line(
+                    entry,
+                    remaining,
+                    lambda candidate: (
+                        candidate.get("bundle_parent_id") == desired_bundle_parent_id
+                        and candidate.get("quantity") == desired_quantity
+                    ),
+                )
+
+        if match and match.get("entry", {}).get("id"):
+            entry["id"] = match["entry"]["id"]
             mapped.append(entry)
         else:
             unmapped.append(entry)

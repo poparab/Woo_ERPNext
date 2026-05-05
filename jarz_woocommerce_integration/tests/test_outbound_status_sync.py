@@ -939,6 +939,121 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertNotIn("line_items", payload)
         self.assertIn({"key": "unmapped_line_items", "value": "ITEM-001"}, payload["meta_data"])
 
+    def test_attach_existing_line_ids_reuses_remaining_bundle_child_slot_for_amended_swap(self):
+        desired_line_items = [
+            {
+                "product_id": 12438,
+                "variation_id": None,
+                "quantity": 1,
+                "meta_data": [{"key": "erpnext_item_code", "value": "Jarz Gathering Box"}],
+                "name": "Jarz Gathering Box",
+            },
+            {
+                "product_id": 371,
+                "variation_id": None,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Strawberry Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+                "name": "Strawberry Medium",
+            },
+            {
+                "product_id": 369,
+                "variation_id": None,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Blueberry Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+                "name": "Blueberry Medium",
+            },
+            {
+                "product_id": 217,
+                "variation_id": None,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Lotus Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+                "name": "Lotus Medium",
+            },
+            {
+                "product_id": 2284,
+                "variation_id": None,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Mango Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+                "name": "Mango Medium",
+            },
+        ]
+        existing_line_items = [
+            {
+                "id": 47733,
+                "product_id": 12438,
+                "variation_id": 0,
+                "quantity": 1,
+                "meta_data": [{"key": "erpnext_item_code", "value": "Jarz Gathering Box"}],
+            },
+            {
+                "id": 47734,
+                "product_id": 371,
+                "variation_id": 0,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Strawberry Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+            },
+            {
+                "id": 47735,
+                "product_id": 369,
+                "variation_id": 0,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Blueberry Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+            },
+            {
+                "id": 47736,
+                "product_id": 367,
+                "variation_id": 0,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Chocolate Hazelnut Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+            },
+            {
+                "id": 47737,
+                "product_id": 2284,
+                "variation_id": 0,
+                "quantity": 1,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": "Mango Medium"},
+                    {"key": "_woosb_parent_id", "value": "12438"},
+                ],
+            },
+        ]
+
+        matched, unmapped = outbound_sync._attach_existing_line_ids(desired_line_items, existing_line_items)
+
+        self.assertEqual(unmapped, [])
+        self.assertEqual(len(matched), 5)
+        lotus_entry = next(
+            entry
+            for entry in matched
+            if any(
+                meta.get("key") == "erpnext_item_code" and meta.get("value") == "Lotus Medium"
+                for meta in entry.get("meta_data", [])
+            )
+        )
+        self.assertEqual(lotus_entry["id"], 47736)
+        self.assertEqual(lotus_entry["product_id"], 217)
+
     def test_build_order_payload_formats_delivery_slot_from_start_time_and_duration(self):
         invoice = DummyInvoice(sales_invoice_state="Delivered")
         invoice.custom_delivery_date = "2026-05-02"
