@@ -299,3 +299,33 @@ class TestCustomerCleanupPlanning(unittest.TestCase):
         source = next(iter(desired["signatures"].values()))
 
         self.assertEqual(source["phone"], "+201006709577")
+
+    def test_collect_desired_sources_normalizes_blank_city_and_country_like_stored_address(self):
+        payload = {
+            "email": "amr14elsaadany@gmail.com",
+            "billing": {
+                "address_1": "١٤٥ د - الدور الثالث - شقة رقم ٣٠٥",
+                "address_2": "",
+                "city": "",
+                "postcode": "",
+                "country": "EG",
+                "state": "",
+                "phone": "01003469466",
+            },
+            "shipping": {
+                "address_1": "١٤٥ د - الدور الثالث - شقة رقم ٣٠٥",
+                "address_2": "",
+                "city": "",
+                "postcode": "",
+                "country": "",
+                "state": "",
+                "phone": "01003469466",
+            },
+        }
+
+        desired = customer_cleanup._collect_desired_sources(payload)
+
+        self.assertEqual(len(desired["signatures"]), 1)
+        signature = next(iter(desired["signatures"].keys()))
+        self.assertEqual(signature[2], "unknown")
+        self.assertEqual(signature[5], "egypt")

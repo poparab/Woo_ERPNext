@@ -401,11 +401,17 @@ def _address_signature_parts(
 
 def _source_address_signature(data: dict) -> tuple[str, str, str, str, str, str]:
     address_line1, address_line2 = _coerce_source_address_lines(data)
-    country_value = _resolve_country(data.get("country")) or str(data.get("country") or "")
+    country_value = _resolve_country(data.get("country"))
+    if not country_value:
+        try:
+            country_value = frappe.defaults.get_global_default("country") or ""
+        except Exception:
+            country_value = str(data.get("country") or "")
+    city_value = (data.get("city") or "").strip() or (data.get("state") or "").strip() or "Unknown"
     return _address_signature_parts(
         address_line1,
         address_line2,
-        data.get("city"),
+        city_value,
         data.get("state"),
         data.get("postcode"),
         country_value,
