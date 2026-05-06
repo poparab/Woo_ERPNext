@@ -73,6 +73,88 @@ class TestCustomerCleanupResolution(unittest.TestCase):
 
 
 class TestCustomerCleanupPlanning(unittest.TestCase):
+    def test_window_cleanup_uses_full_desired_state_for_phone_merged_customer(self):
+        original_fetch = customer_cleanup._fetch_all_woo_customers
+        original_load_customers = customer_cleanup._load_customer_rows
+        original_load_addresses = customer_cleanup._load_address_rows
+
+        try:
+            customer_cleanup._fetch_all_woo_customers = lambda **kwargs: (
+                [
+                    {
+                        "id": 100,
+                        "email": "cust-a@example.com",
+                        "username": "cust-a",
+                        "billing": {"phone": "01000000000", "address_1": "12 Road", "city": "Cairo", "country": "EG"},
+                        "shipping": {},
+                    },
+                    {
+                        "id": 200,
+                        "email": "cust-b@example.com",
+                        "username": "cust-b",
+                        "billing": {"phone": "01000000000", "address_1": "20 Ave", "city": "Giza", "country": "EG"},
+                        "shipping": {},
+                    },
+                ],
+                2,
+                2,
+            )
+            customer_cleanup._load_customer_rows = lambda: [
+                {
+                    "name": "CUST-PHONE",
+                    "disabled": 0,
+                    "woo_customer_id": "100",
+                    "mobile_no": "01000000000",
+                    "custom_woo_customer_id": None,
+                    "phone": None,
+                    "email_id": "cust-a@example.com",
+                    "woo_username": "cust-a",
+                }
+            ]
+            customer_cleanup._load_address_rows = lambda: [
+                {
+                    "customer_name": "CUST-PHONE",
+                    "name": "ADDR-1",
+                    "address_line1": "12 Road",
+                    "address_line2": "",
+                    "city": "Cairo",
+                    "state": "",
+                    "pincode": "",
+                    "country": "Egypt",
+                    "is_primary_address": 1,
+                    "is_shipping_address": 0,
+                },
+                {
+                    "customer_name": "CUST-PHONE",
+                    "name": "ADDR-2",
+                    "address_line1": "20 Ave",
+                    "address_line2": "",
+                    "city": "Giza",
+                    "state": "",
+                    "pincode": "",
+                    "country": "Egypt",
+                    "is_primary_address": 0,
+                    "is_shipping_address": 1,
+                },
+            ]
+
+            result = customer_cleanup.run_customer_cleanup(
+                dry_run=True,
+                per_page=1,
+                start_page=1,
+                max_pages=1,
+            )
+
+            self.assertEqual(result["customers_planned_for_cleanup"], 1)
+            self.assertEqual(result["addresses_created"], 0)
+            self.assertEqual(result["extra_rows_retired"], 0)
+            self.assertEqual(result["duplicate_rows_retired"], 0)
+            self.assertEqual(result["customers_with_address_changes"], 0)
+        finally:
+            customer_cleanup._fetch_all_woo_customers = original_fetch
+            customer_cleanup._load_customer_rows = original_load_customers
+            customer_cleanup._load_address_rows = original_load_addresses
+
     def test_fetch_customer_page_window_respects_start_and_max_pages(self):
         class DummyClient:
             def __init__(self):

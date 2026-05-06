@@ -80,6 +80,15 @@ def _fetch_all_woo_customers(
     )
 
 
+def _window_bounds(*, per_page: int, start_page: int, max_pages: int | None, total_items: int) -> tuple[int, int]:
+    start_index = max(0, (max(1, int(start_page or 1)) - 1) * per_page)
+    if max_pages is None:
+        end_index = total_items
+    else:
+        end_index = min(total_items, start_index + (max_pages * per_page))
+    return start_index, end_index
+
+
 def _load_customer_rows() -> list[dict[str, Any]]:
     select_fields = [
         "name",
@@ -415,14 +424,29 @@ def run_customer_cleanup(
     hard_delete_orphans: bool = False,
     sample_limit: int = 20,
 ) -> dict[str, Any]:
-    woo_customers, pages_fetched, last_page_fetched = _fetch_all_woo_customers(
+    all_woo_customers, _all_pages_fetched, _all_last_page_fetched = _fetch_all_woo_customers(
+        per_page=per_page,
+        start_page=1,
+        max_pages=None,
+    )
+    start_index, end_index = _window_bounds(
         per_page=per_page,
         start_page=start_page,
         max_pages=max_pages,
+        total_items=len(all_woo_customers),
     )
+    window_woo_customers = all_woo_customers[start_index:end_index]
+    if window_woo_customers:
+        pages_fetched = ((len(window_woo_customers) - 1) // per_page) + 1
+        last_page_fetched = start_page + pages_fetched - 1
+    else:
+        pages_fetched = 0
+        last_page_fetched = max(0, start_page - 1)
+
     indexes = _build_customer_indexes(_load_customer_rows())
 
     desired_by_customer: dict[str, dict[str, Any]] = {}
+    customers_in_window: set[str] = set()
     summary = {
         "dry_run": dry_run,
         "start_page": start_page,
@@ -452,15 +476,17 @@ def run_customer_cleanup(
 
     mutation_count = 0
 
-    for cust in woo_customers:
+    for index, cust in enumerate(all_woo_customers):
+        in_window = start_index <= index < end_index
         resolution = _resolve_woo_customer(cust, indexes)
         bucket = resolution["bucket"]
         woo_id = normalize_woo_customer_id(cust.get("id"))
         desired_sources = _collect_desired_sources(cust)
 
         if bucket.startswith("blocked_"):
-            summary[bucket] += 1
-            if len(summary["blocked_samples"]) < sample_limit:
+            if in_window:
+                summary[bucket] += 1
+            if in_window and len(summary["blocked_samples"]) < sample_limit:
                 billing = cust.get("billing") or {}
                 shipping = cust.get("shipping") or {}
                 summary["blocked_samples"].append(
@@ -478,10 +504,12 @@ def run_customer_cleanup(
                 )
             continue
 
-        summary[bucket] += 1
         target_customer = resolution.get("customer")
 
-        if not dry_run:
+        if in_window:
+            summary[bucket] += 1
+
+        if not dry_run and in_window:
             sync_result = _sync_single_customer(cust)
             target_customer = sync_result["customer"]
             mutation_count += 1
@@ -501,6 +529,9 @@ def run_customer_cleanup(
 
         if not target_customer:
             continue
+
+        if in_window:
+            customers_in_window.add(target_customer)
 
         state = desired_by_customer.setdefault(
             target_customer,
@@ -524,7 +555,10 @@ def run_customer_cleanup(
     for row in address_rows:
         addresses_by_customer[row["customer_name"]].append(row)
 
-    for customer_name, desired_state in desired_by_customer.items():
+    customers_to_process = list(desired_by_customer.keys()) if max_pages is None and start_page == 1 else sorted(customers_in_window)
+
+    for customer_name in customers_to_process:
+        desired_state = desired_by_customer[customer_name]
         current_rows = addresses_by_customer.get(customer_name, [])
         plan = _plan_address_cleanup(current_rows, desired_state["signatures"])
         has_changes = bool(
@@ -604,5 +638,5 @@ def run_customer_cleanup(
     if not dry_run:
         frappe.db.commit()
 
-    summary["customers_planned_for_cleanup"] = len(desired_by_customer)
+    summary["customers_planned_for_cleanup"] = len(customers_to_process)
     return summary
