@@ -462,7 +462,7 @@ def run_customer_cleanup(
         "max_pages": max_pages,
         "pages_fetched": pages_fetched,
         "last_page_fetched": last_page_fetched,
-        "woo_customers_scanned": len(woo_customers),
+        "woo_customers_scanned": len(window_woo_customers),
         "exact_woo_id": 0,
         "phone_merge": 0,
         "safe_create": 0,
