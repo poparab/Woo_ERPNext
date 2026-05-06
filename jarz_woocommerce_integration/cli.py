@@ -34,6 +34,29 @@ def drop_legacy_customer_woo_id_field_cli(force: bool = False):  # pragma: no co
     return drop_legacy_customer_woo_id_field(force=force)
 
 
+def run_customer_cleanup_cli(
+    dry_run: bool = True,
+    per_page: int = 100,
+    max_pages: int | None = None,
+    commit_every: int = 100,
+    hard_delete_orphans: bool = False,
+):  # pragma: no cover
+    """Run the one-time customer and address cleanup.
+
+    Usage:
+        bench --site <site> execute jarz_woocommerce_integration.cli.run_customer_cleanup_cli --kwargs '{"dry_run": true}'
+    """
+    from .services.customer_cleanup import run_customer_cleanup
+
+    return run_customer_cleanup(
+        dry_run=dry_run,
+        per_page=per_page,
+        max_pages=max_pages,
+        commit_every=commit_every,
+        hard_delete_orphans=hard_delete_orphans,
+    )
+
+
 def run_pos_profile_update_cli():  # pragma: no cover
     """Pull latest 10 Woo orders with updates and force to populate pos_profile on invoices.
 
