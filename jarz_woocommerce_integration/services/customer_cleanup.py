@@ -89,6 +89,14 @@ def _window_bounds(*, per_page: int, start_page: int, max_pages: int | None, tot
     return start_index, end_index
 
 
+def _refresh_db_connection() -> None:
+    try:
+        frappe.db.close()
+    except Exception:
+        pass
+    frappe.db.connect()
+
+
 def _load_customer_rows() -> list[dict[str, Any]]:
     select_fields = [
         "name",
@@ -429,6 +437,7 @@ def run_customer_cleanup(
         start_page=1,
         max_pages=None,
     )
+    _refresh_db_connection()
     start_index, end_index = _window_bounds(
         per_page=per_page,
         start_page=start_page,

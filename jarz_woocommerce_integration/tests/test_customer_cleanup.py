@@ -73,6 +73,30 @@ class TestCustomerCleanupResolution(unittest.TestCase):
 
 
 class TestCustomerCleanupPlanning(unittest.TestCase):
+    def test_run_customer_cleanup_refreshes_db_after_full_woo_fetch(self):
+        original_fetch = customer_cleanup._fetch_all_woo_customers
+        original_refresh = customer_cleanup._refresh_db_connection
+        original_load_customers = customer_cleanup._load_customer_rows
+        original_load_addresses = customer_cleanup._load_address_rows
+
+        refresh_calls = []
+
+        try:
+            customer_cleanup._fetch_all_woo_customers = lambda **kwargs: ([], 0, 0)
+            customer_cleanup._refresh_db_connection = lambda: refresh_calls.append("refresh")
+            customer_cleanup._load_customer_rows = lambda: []
+            customer_cleanup._load_address_rows = lambda: []
+
+            result = customer_cleanup.run_customer_cleanup(dry_run=True)
+
+            self.assertEqual(refresh_calls, ["refresh"])
+            self.assertEqual(result["woo_customers_scanned"], 0)
+        finally:
+            customer_cleanup._fetch_all_woo_customers = original_fetch
+            customer_cleanup._refresh_db_connection = original_refresh
+            customer_cleanup._load_customer_rows = original_load_customers
+            customer_cleanup._load_address_rows = original_load_addresses
+
     def test_window_cleanup_uses_full_desired_state_for_phone_merged_customer(self):
         original_fetch = customer_cleanup._fetch_all_woo_customers
         original_load_customers = customer_cleanup._load_customer_rows
