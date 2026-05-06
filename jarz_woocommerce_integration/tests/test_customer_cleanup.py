@@ -73,6 +73,35 @@ class TestCustomerCleanupResolution(unittest.TestCase):
 
 
 class TestCustomerCleanupPlanning(unittest.TestCase):
+    def test_fetch_customer_page_window_respects_start_and_max_pages(self):
+        class DummyClient:
+            def __init__(self):
+                self.requested_pages = []
+
+            def list_customers(self, params):
+                page = params["page"]
+                self.requested_pages.append(page)
+                batches = {
+                    3: [{"id": 301}, {"id": 302}],
+                    4: [{"id": 401}],
+                    5: [],
+                }
+                return batches.get(page, [])
+
+        client = DummyClient()
+
+        customers, pages_fetched, last_page_fetched = customer_cleanup._fetch_customer_page_window(
+            client,
+            per_page=2,
+            start_page=3,
+            max_pages=2,
+        )
+
+        self.assertEqual(client.requested_pages, [3, 4])
+        self.assertEqual(customers, [{"id": 301}, {"id": 302}, {"id": 401}])
+        self.assertEqual(pages_fetched, 2)
+        self.assertEqual(last_page_fetched, 4)
+
     def test_plan_address_cleanup_keeps_one_row_per_signature_and_removes_stale(self):
         current_rows = [
             {

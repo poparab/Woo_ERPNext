@@ -35,14 +35,19 @@ def _init_client(settings: WooCommerceSettings) -> WooClient:
     )
 
 
-def _fetch_all_woo_customers(*, per_page: int = 100, max_pages: int | None = None) -> list[dict[str, Any]]:
-    settings = WooCommerceSettings.get_settings()
-    client = _init_client(settings)
-
-    page = 1
+def _fetch_customer_page_window(
+    client: WooClient,
+    *,
+    per_page: int = 100,
+    start_page: int = 1,
+    max_pages: int | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    page = max(1, int(start_page or 1))
+    first_page = page
+    fetched_pages = 0
     customers: list[dict[str, Any]] = []
     while True:
-        if max_pages and page > max_pages:
+        if max_pages is not None and fetched_pages >= max_pages:
             break
         batch = client.list_customers(
             params={"per_page": per_page, "page": page, "orderby": "id", "order": "asc"}
@@ -50,10 +55,29 @@ def _fetch_all_woo_customers(*, per_page: int = 100, max_pages: int | None = Non
         if not batch:
             break
         customers.extend(batch)
+        fetched_pages += 1
         if len(batch) < per_page:
             break
         page += 1
-    return customers
+
+    last_page = page if fetched_pages else max(0, first_page - 1)
+    return customers, fetched_pages, last_page
+
+
+def _fetch_all_woo_customers(
+    *,
+    per_page: int = 100,
+    start_page: int = 1,
+    max_pages: int | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    settings = WooCommerceSettings.get_settings()
+    client = _init_client(settings)
+    return _fetch_customer_page_window(
+        client,
+        per_page=per_page,
+        start_page=start_page,
+        max_pages=max_pages,
+    )
 
 
 def _load_customer_rows() -> list[dict[str, Any]]:
@@ -385,17 +409,26 @@ def run_customer_cleanup(
     *,
     dry_run: bool = True,
     per_page: int = 100,
+    start_page: int = 1,
     max_pages: int | None = None,
     commit_every: int = 100,
     hard_delete_orphans: bool = False,
     sample_limit: int = 20,
 ) -> dict[str, Any]:
-    woo_customers = _fetch_all_woo_customers(per_page=per_page, max_pages=max_pages)
+    woo_customers, pages_fetched, last_page_fetched = _fetch_all_woo_customers(
+        per_page=per_page,
+        start_page=start_page,
+        max_pages=max_pages,
+    )
     indexes = _build_customer_indexes(_load_customer_rows())
 
     desired_by_customer: dict[str, dict[str, Any]] = {}
     summary = {
         "dry_run": dry_run,
+        "start_page": start_page,
+        "max_pages": max_pages,
+        "pages_fetched": pages_fetched,
+        "last_page_fetched": last_page_fetched,
         "woo_customers_scanned": len(woo_customers),
         "exact_woo_id": 0,
         "phone_merge": 0,

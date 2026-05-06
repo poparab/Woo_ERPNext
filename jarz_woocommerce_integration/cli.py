@@ -37,6 +37,7 @@ def drop_legacy_customer_woo_id_field_cli(force: bool = False):  # pragma: no co
 def run_customer_cleanup_cli(
     dry_run: bool = True,
     per_page: int = 100,
+    start_page: int = 1,
     max_pages: int | None = None,
     commit_every: int = 100,
     hard_delete_orphans: bool = False,
@@ -51,6 +52,7 @@ def run_customer_cleanup_cli(
     return run_customer_cleanup(
         dry_run=dry_run,
         per_page=per_page,
+        start_page=start_page,
         max_pages=max_pages,
         commit_every=commit_every,
         hard_delete_orphans=hard_delete_orphans,
