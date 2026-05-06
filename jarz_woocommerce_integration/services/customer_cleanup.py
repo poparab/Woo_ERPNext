@@ -221,7 +221,7 @@ def _collect_desired_sources(cust: dict[str, Any]) -> dict[str, Any]:
     billing = cust.get("billing") or {}
     shipping = cust.get("shipping") or {}
     email = str(cust.get("email") or billing.get("email") or "").strip().lower() or None
-    phone = billing.get("phone") or shipping.get("phone")
+    phone = _normalize_phone(billing.get("phone") or shipping.get("phone"))
 
     signatures: dict[tuple[str, str, str, str, str, str], dict[str, Any]] = {}
     default_billing_signature = None
@@ -237,7 +237,7 @@ def _collect_desired_sources(cust: dict[str, Any]) -> dict[str, Any]:
                 "address_type": address_type,
                 "data": data,
                 "email": email,
-                "phone": data.get("phone") or phone,
+                "phone": _normalize_phone(data.get("phone")) or phone,
             },
         )
         if address_type == "Billing" and default_billing_signature is None:

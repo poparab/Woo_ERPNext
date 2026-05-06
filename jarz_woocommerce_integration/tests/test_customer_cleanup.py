@@ -147,3 +147,20 @@ class TestCustomerCleanupPlanning(unittest.TestCase):
 
         self.assertEqual(len(desired["signatures"]), 1)
         self.assertEqual(desired["default_billing_signature"], desired["default_shipping_signature"])
+
+    def test_collect_desired_sources_normalizes_phone_values(self):
+        payload = {
+            "email": "test@example.com",
+            "billing": {
+                "address_1": "12 Road",
+                "city": "Cairo",
+                "country": "EG",
+                "phone": "+20\u00a0100\u00a0670\u00a09577",
+            },
+            "shipping": {},
+        }
+
+        desired = customer_cleanup._collect_desired_sources(payload)
+        source = next(iter(desired["signatures"].values()))
+
+        self.assertEqual(source["phone"], "+201006709577")
