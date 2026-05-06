@@ -13,6 +13,8 @@ from jarz_woocommerce_integration.services.customer_sync import (
     _ensure_customer,
     _create_address,
     _find_existing_address_for_customer,
+    _has_usable_source_address,
+    _same_source_address,
 )
 
 
@@ -31,8 +33,17 @@ def _sync_single_customer(cust: Dict[str, Any]) -> dict:
     first_name = cust.get("first_name") or ""
     last_name = cust.get("last_name") or ""
     phone = (cust.get("billing") or {}).get("phone") or (cust.get("shipping") or {}).get("phone")
+    woo_customer_id = cust.get("id") if isinstance(cust.get("id"), int) and cust.get("id") > 0 else None
     # Ensure customer
-    customer_name = _ensure_customer(email, first_name, last_name, cust.get("id"), username=username, phone=phone)  # type: ignore[arg-type]
+    customer_name = _ensure_customer(
+        email,
+        first_name,
+        last_name,
+        cust.get("id"),
+        username=username,
+        phone=phone,
+        woo_customer_id=woo_customer_id,
+    )  # type: ignore[arg-type]
 
     # Addresses from Woo: billing + shipping aggregated under 'billing' & 'shipping'
     # Woo customer object: may include 'billing' and 'shipping' with address fields
@@ -41,21 +52,14 @@ def _sync_single_customer(cust: Dict[str, Any]) -> dict:
     shipping = cust.get("shipping") or {}
 
     def _upsert_address(kind: str, data: dict):
-        line1 = (data.get("address_1") or "").strip()
-        if not line1:
+        if not _has_usable_source_address(data):
             return None
-        existing = _find_existing_address_for_customer(customer_name, kind.capitalize(), line1)
+        existing = _find_existing_address_for_customer(customer_name, kind.capitalize(), data)
         if existing:
             return existing
         return _create_address(customer_name, kind.capitalize(), data, data.get("phone"), email)
 
-    billing_line1 = (billing.get("address_1") or "").strip()
-    shipping_line1 = (shipping.get("address_1") or "").strip()
-    same_address = (
-        billing_line1
-        and shipping_line1
-        and billing_line1.lower() == shipping_line1.lower()
-    )
+    same_address = _same_source_address(billing, shipping)
 
     try:
         billing_addr = _upsert_address("billing", billing)

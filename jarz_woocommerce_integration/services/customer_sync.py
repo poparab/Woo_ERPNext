@@ -12,6 +12,7 @@ from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_setti
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
     find_customer_by_woo_id,
+    get_legacy_customer_woo_id,
     get_customer_woo_id,
     normalize_woo_customer_id,
 )
@@ -52,6 +53,15 @@ def _normalize_phone(p: Optional[str]) -> Optional[str]:
         return None
     s = ''.join(ch for ch in str(p) if ch.isdigit() or ch == '+').strip()
     return s or None
+
+
+def _candidate_conflicts_with_woo_customer(name: Optional[str], woo_customer_id: Optional[int | str]) -> bool:
+    normalized_woo_customer_id = normalize_woo_customer_id(woo_customer_id)
+    if not name or not normalized_woo_customer_id:
+        return False
+
+    existing_woo_customer_id = get_customer_woo_id(name) or get_legacy_customer_woo_id(name)
+    return bool(existing_woo_customer_id and existing_woo_customer_id != normalized_woo_customer_id)
 
 
 @contextmanager
@@ -124,13 +134,15 @@ def _update_customer_identity(
 
 
 def _ensure_customer(email: Optional[str], first_name: str | None, last_name: str | None, order_id: Optional[int], *, username: Optional[str] = None, phone: Optional[str] = None, woo_customer_id: Optional[int] = None, customer_cache: dict | None = None) -> str:
-    """Find or create a Customer, preferring uniqueness by username, then phone, then email.
+    """Find or create a Customer, preferring phone identity after exact Woo ID.
 
     Priority:
-    1) Customer.woo_username (custom field) == username
+    1) Customer.woo_customer_id == woo_customer_id
     2) Customer.mobile_no or Customer.phone == normalized(phone)
+    3) Customer.woo_username (custom field) == username
     3) Customer.email_id == email
-    4) Customer.customer_name == normalized name
+    4) Create a new ERP customer
+    Automated sync does not reuse existing customers by display name.
     On create, set woo_username (if field exists), mobile_no, email_id.
 
     When *customer_cache* is provided (historical migration), resolved
@@ -147,7 +159,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             f"email:{email}" if email else None,
         ):
             if cache_key and cache_key in customer_cache:
-                return customer_cache[cache_key]
+                cached_name = customer_cache[cache_key]
+                if cache_key.startswith(("user:", "email:")) and _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id):
+                    continue
+                return cached_name
 
     # 0) woo_customer_id-based (most reliable, unique WooCommerce identifier)
     if woo_customer_id and _field_exists("Customer", "woo_customer_id"):
@@ -164,22 +179,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
-    # 1) username-based
-    if username and _field_exists("Customer", "woo_username"):
-        name = frappe.db.get_value("Customer", {"woo_username": username}, "name")
-        if name:
-            _update_customer_identity(
-                name,
-                woo_customer_id=woo_customer_id,
-                username=username,
-                phone_norm=phone_norm,
-                email=email,
-                customer_cache=customer_cache,
-            )
-            _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
-            return name
-
-    # 2) phone-based
+    # 1) phone-based
     if phone_norm:
         name = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
         if not name and _field_exists("Customer", "phone"):
@@ -196,9 +196,11 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
-    # 3) email-based
-    if email:
-        name = frappe.db.get_value("Customer", {"email_id": email}, "name")
+    # 2) username-based
+    if username and _field_exists("Customer", "woo_username"):
+        name = frappe.db.get_value("Customer", {"woo_username": username}, "name")
+        if _candidate_conflicts_with_woo_customer(name, woo_customer_id):
+            name = None
         if name:
             _update_customer_identity(
                 name,
@@ -211,20 +213,25 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
-    # 4) display name fallback
+    # 3) email-based
+    if email:
+        name = frappe.db.get_value("Customer", {"email_id": email}, "name")
+        if _candidate_conflicts_with_woo_customer(name, woo_customer_id):
+            name = None
+        if name:
+            _update_customer_identity(
+                name,
+                woo_customer_id=woo_customer_id,
+                username=username,
+                phone_norm=phone_norm,
+                email=email,
+                customer_cache=customer_cache,
+            )
+            _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
+            return name
+
+    # 4) automated display-name reuse is unsafe; only use the normalized name on create
     display_name = _normalize_name(first_name, last_name, email, order_id)
-    existing_by_name = frappe.db.get_value("Customer", {"customer_name": display_name}, "name")
-    if existing_by_name:
-        _update_customer_identity(
-            existing_by_name,
-            woo_customer_id=woo_customer_id,
-            username=username,
-            phone_norm=phone_norm,
-            email=email,
-            customer_cache=customer_cache,
-        )
-        _cache_customer(customer_cache, existing_by_name, woo_customer_id, username, phone_norm, email)
-        return existing_by_name
 
     # Create new — use a per-customer Redis lock to prevent parallel worker races.
     # Lock key is scoped to the most reliable identifier available.  Workers processing
@@ -259,7 +266,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                 f"email:{email}" if email else None,
             ):
                 if cache_key and customer_cache is not None and cache_key in customer_cache:
-                    return customer_cache[cache_key]
+                    cached_name = customer_cache[cache_key]
+                    if cache_key.startswith(("user:", "email:")) and _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id):
+                        continue
+                    return cached_name
 
             # Re-query DB under lock for the most reliable identifiers
             if woo_customer_id and _field_exists("Customer", "woo_customer_id"):
@@ -267,8 +277,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                 if _recheck:
                     _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
-            if username and _field_exists("Customer", "woo_username"):
-                _recheck = frappe.db.get_value("Customer", {"woo_username": username}, "name")
+            if phone_norm:
+                _recheck = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
+                if not _recheck and _field_exists("Customer", "phone"):
+                    _recheck = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
                 if _recheck:
                     _update_customer_identity(
                         _recheck,
@@ -280,8 +292,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     )
                     _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
-            if phone_norm:
-                _recheck = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
+            if username and _field_exists("Customer", "woo_username"):
+                _recheck = frappe.db.get_value("Customer", {"woo_username": username}, "name")
+                if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id):
+                    _recheck = None
                 if _recheck:
                     _update_customer_identity(
                         _recheck,
@@ -295,6 +309,8 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     return _recheck
             if email:
                 _recheck = frappe.db.get_value("Customer", {"email_id": email}, "name")
+                if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id):
+                    _recheck = None
                 if _recheck:
                     _update_customer_identity(
                         _recheck,
@@ -351,14 +367,81 @@ def _cache_customer(cache: dict | None, name: str, woo_cid, username, phone, ema
         cache[f"email:{email}"] = name
 
 
-def _find_existing_address_for_customer(customer: str, address_type: str, address_line1: str, address_cache: dict | None = None) -> Optional[str]:
-    normalized_search = address_line1.strip()
-    if not normalized_search:
+def _normalize_address_text(value: Any) -> str:
+    return " ".join(str(value or "").replace(",", " ").split()).strip().lower()
+
+
+def _coerce_source_address_lines(data: dict) -> tuple[str, str]:
+    address_line1 = str(data.get("address_1") or "").strip()[:240]
+    address_line2 = str(data.get("address_2") or "").strip()[:240]
+    if address_line1:
+        return address_line1, address_line2
+    if address_line2:
+        return address_line2, ""
+    return "", ""
+
+
+def _address_signature_parts(
+    address_line1: Any,
+    address_line2: Any,
+    city: Any,
+    state: Any,
+    postcode: Any,
+    country: Any,
+) -> tuple[str, str, str, str, str, str]:
+    return (
+        _normalize_address_text(address_line1),
+        _normalize_address_text(address_line2),
+        _normalize_address_text(city),
+        _normalize_address_text(state),
+        _normalize_address_text(postcode),
+        _normalize_address_text(country),
+    )
+
+
+def _source_address_signature(data: dict) -> tuple[str, str, str, str, str, str]:
+    address_line1, address_line2 = _coerce_source_address_lines(data)
+    country_value = _resolve_country(data.get("country")) or str(data.get("country") or "")
+    return _address_signature_parts(
+        address_line1,
+        address_line2,
+        data.get("city"),
+        data.get("state"),
+        data.get("postcode"),
+        country_value,
+    )
+
+
+def _stored_address_signature(address_row: Dict[str, Any]) -> tuple[str, str, str, str, str, str]:
+    return _address_signature_parts(
+        address_row.get("address_line1"),
+        address_row.get("address_line2"),
+        address_row.get("city"),
+        address_row.get("state"),
+        address_row.get("pincode"),
+        address_row.get("country"),
+    )
+
+
+def _has_usable_source_address(data: dict) -> bool:
+    address_line1, _address_line2 = _coerce_source_address_lines(data)
+    return bool(address_line1)
+
+
+def _same_source_address(left: dict, right: dict) -> bool:
+    return _has_usable_source_address(left) and _has_usable_source_address(right) and _source_address_signature(left) == _source_address_signature(right)
+
+
+def _find_existing_address_for_customer(customer: str, address_type: str, address_data: dict | str, address_cache: dict | None = None) -> Optional[str]:
+    del address_type
+    source_data = address_data if isinstance(address_data, dict) else {"address_1": address_data}
+    signature = _source_address_signature(source_data)
+    if not any(signature):
         return None
 
     # Check in-memory cache first (historical migration)
     if address_cache is not None:
-        cache_key = (customer, address_type, normalized_search.lower())
+        cache_key = (customer, signature)
         cached = address_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -366,24 +449,28 @@ def _find_existing_address_for_customer(customer: str, address_type: str, addres
     try:
         result = frappe.db.sql(
             """
-            SELECT a.name
+            SELECT a.name, a.address_line1, a.address_line2, a.city, a.state, a.pincode, a.country
             FROM `tabAddress` a
             JOIN `tabDynamic Link` dl ON dl.parent = a.name
             WHERE dl.link_doctype = 'Customer'
               AND dl.link_name = %s
               AND dl.parenttype = 'Address'
-              AND a.address_type = %s
-              AND LOWER(TRIM(a.address_line1)) = LOWER(%s)
               AND IFNULL(a.disabled, 0) = 0
-            LIMIT 1
             """,
-            (customer, address_type, normalized_search),
+            (customer,),
             as_dict=True,
         )
-        found = result[0].name if result else None
+        found = next(
+            (
+                row.get("name") if isinstance(row, dict) else row.name
+                for row in result
+                if _stored_address_signature(row) == signature
+            ),
+            None,
+        )
         # Populate cache for future lookups
         if address_cache is not None and found:
-            cache_key = (customer, address_type, normalized_search.lower())
+            cache_key = (customer, signature)
             address_cache[cache_key] = found
         return found
     except Exception:
@@ -559,9 +646,8 @@ def _resolve_territory_from_state(state_value: str | None, territory_state_cache
 def _create_address(customer: str, address_type: str, data: dict, phone: str | None, email: str | None) -> str:
     country_val = _resolve_country(data.get("country"))
     city_val = (data.get("city") or "").strip() or (data.get("state") or "").strip() or "Unknown"
-    # Truncate address fields to ERPNext's 240-char limit (WC sometimes has junk HTML)
-    addr_line1 = (data.get("address_1") or "")[:240]
-    addr_line2 = (data.get("address_2") or "")[:240]
+    # Truncate address fields to ERPNext's 240-char limit and accept line2-only source addresses.
+    addr_line1, addr_line2 = _coerce_source_address_lines(data)
     addr = frappe.get_doc({
         "doctype": "Address",
         "address_title": customer,
@@ -589,7 +675,7 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     """Create or get Customer and their Billing/Shipping addresses from Woo order.
 
     Requirements:
-    - At least one of billing.address_1 or shipping.address_1 must be non-empty.
+    - At least one of billing/shipping address_1 or address_2 must be non-empty.
     - Email must be present (validated by caller typically).
 
     Args:
@@ -608,9 +694,7 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     # Prefer billing phone; else shipping
     phone = billing.get("phone") or shipping.get("phone")
 
-    billing_line1 = (billing.get("address_1") or "").strip()
-    shipping_line1 = (shipping.get("address_1") or "").strip()
-    if not billing_line1 and not shipping_line1:
+    if not _has_usable_source_address(billing) and not _has_usable_source_address(shipping):
         # Explicitly enforce address presence
         raise ValueError("no_address")
 
@@ -623,37 +707,33 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     shipping_addr_name = None
 
     # Check if billing and shipping are the same physical address
-    same_address = (
-        billing_line1
-        and shipping_line1
-        and billing_line1.strip().lower() == shipping_line1.strip().lower()
-    )
+    same_address = _same_source_address(billing, shipping)
 
     # Ensure billing address if present
-    if billing_line1:
-        existing = _find_existing_address_for_customer(customer, "Billing", billing_line1, address_cache=address_cache)
+    if _has_usable_source_address(billing):
+        existing = _find_existing_address_for_customer(customer, "Billing", billing, address_cache=address_cache)
         billing_addr_name = existing or _create_address(customer, "Billing", billing, billing.get("phone"), email)
         # Set as default billing address for this customer
         if billing_addr_name:
             _set_address_as_default(billing_addr_name, customer, "Billing")
             # Cache newly created address too
             if address_cache is not None and not existing:
-                address_cache[(customer, "Billing", billing_line1.lower())] = billing_addr_name
+                address_cache[(customer, _source_address_signature(billing))] = billing_addr_name
 
     if same_address and billing_addr_name:
         # Reuse billing address for shipping — same physical address
         shipping_addr_name = billing_addr_name
         _set_address_as_default(billing_addr_name, customer, "Shipping")
-    elif shipping_line1:
+    elif _has_usable_source_address(shipping):
         # Different address — create/find shipping separately
-        existing = _find_existing_address_for_customer(customer, "Shipping", shipping_line1, address_cache=address_cache)
+        existing = _find_existing_address_for_customer(customer, "Shipping", shipping, address_cache=address_cache)
         shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email)
         # Set as default shipping address for this customer
         if shipping_addr_name:
             _set_address_as_default(shipping_addr_name, customer, "Shipping")
             # Cache newly created address too
             if address_cache is not None and not existing:
-                address_cache[(customer, "Shipping", shipping_line1.lower())] = shipping_addr_name
+                address_cache[(customer, _source_address_signature(shipping))] = shipping_addr_name
 
     # Assign territory from shipping state (delivery zone)
     # Prefer shipping address, fallback to billing
@@ -739,10 +819,9 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     def _upsert_address(kind: str, data: dict) -> Optional[str]:
-        line1 = (data.get("address_1") or "").strip()
-        if not line1:
+        if not _has_usable_source_address(data):
             return None
-        existing = _find_existing_address_for_customer(customer_name, kind, line1)
+        existing = _find_existing_address_for_customer(customer_name, kind, data)
         if existing:
             # Set existing address as default
             _set_address_as_default(existing, customer_name, kind)
@@ -754,13 +833,7 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
             _set_address_as_default(new_addr, customer_name, kind)
         return new_addr
 
-    billing_line1 = (billing.get("address_1") or "").strip()
-    shipping_line1 = (shipping.get("address_1") or "").strip()
-    same_address = (
-        billing_line1
-        and shipping_line1
-        and billing_line1.lower() == shipping_line1.lower()
-    )
+    same_address = _same_source_address(billing, shipping)
 
     billing_name = _upsert_address("Billing", billing)
     if same_address and billing_name:
