@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from jarz_woocommerce_integration.services import order_sync
 
 
@@ -135,3 +137,77 @@ def test_maybe_create_payment_entry_for_invoice_skips_duplicate_completed_kashie
     )
 
     assert calls == []
+
+
+def test_apply_invoice_pos_profile_sets_is_pos_only_after_submit():
+    draft_invoice = SimpleNamespace(pos_profile=None, custom_kanban_profile=None, is_pos=0)
+
+    order_sync._apply_invoice_pos_profile(draft_invoice, "Nasr city", submitted=False)
+
+    assert draft_invoice.pos_profile == "Nasr city"
+    assert draft_invoice.custom_kanban_profile == "Nasr city"
+    assert draft_invoice.is_pos == 0
+
+
+def test_submit_invoice_with_accounting_guards_repairs_missing_ledgers(monkeypatch):
+    submit_calls = []
+    repair_calls = []
+    pos_profile_calls = []
+    invoice = SimpleNamespace(
+        name="ACC-SINV-TEST-003",
+        flags=SimpleNamespace(ignore_permissions=False),
+        submit=lambda: submit_calls.append("submit"),
+        make_gl_entries=lambda: repair_calls.append("make_gl_entries"),
+    )
+    accounting_checks = iter([(False, False), (True, True)])
+
+    monkeypatch.setattr(order_sync, "_get_invoice_accounting_flags", lambda invoice_name: next(accounting_checks))
+    monkeypatch.setattr(
+        order_sync,
+        "_apply_invoice_pos_profile",
+        lambda inv, pos_profile, submitted: pos_profile_calls.append(
+            {"invoice": inv.name, "pos_profile": pos_profile, "submitted": submitted}
+        ),
+    )
+
+    order_sync._submit_invoice_with_accounting_guards(invoice, pos_profile="Nasr city")
+
+    assert submit_calls == ["submit"]
+    assert repair_calls == ["make_gl_entries"]
+    assert invoice.flags.ignore_permissions is True
+    assert pos_profile_calls == [
+        {"invoice": "ACC-SINV-TEST-003", "pos_profile": "Nasr city", "submitted": True}
+    ]
+
+
+def test_submit_invoice_with_accounting_guards_raises_when_ledgers_stay_missing(monkeypatch):
+    submit_calls = []
+    repair_calls = []
+    logged_errors = []
+    invoice = SimpleNamespace(
+        name="ACC-SINV-TEST-004",
+        flags=SimpleNamespace(ignore_permissions=False),
+        submit=lambda: submit_calls.append("submit"),
+        make_gl_entries=lambda: repair_calls.append("make_gl_entries"),
+    )
+
+    monkeypatch.setattr(order_sync, "_get_invoice_accounting_flags", lambda invoice_name: (False, False))
+    monkeypatch.setattr(order_sync.frappe, "log_error", lambda message, title: logged_errors.append((message, title)))
+
+    def fail_throw(message):
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(order_sync.frappe, "throw", fail_throw)
+
+    with pytest.raises(RuntimeError, match="required accounting entries"):
+        order_sync._submit_invoice_with_accounting_guards(invoice, pos_profile="Nasr city")
+
+    assert submit_calls == ["submit"]
+    assert repair_calls == ["make_gl_entries"]
+    assert invoice.flags.ignore_permissions is True
+    assert logged_errors == [
+        (
+            "GL repair failed for ACC-SINV-TEST-004 after submit (gl=0, ple=0)",
+            "GL Entry Repair Error",
+        )
+    ]

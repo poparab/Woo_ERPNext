@@ -596,18 +596,151 @@ def _compute_order_hash(order: dict) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def _get_line_meta_value(meta_data_list: list[dict] | None, target_key: str) -> Any | None:
+    for md in (meta_data_list or []):
+        key = (md.get("key") or md.get("display_key") or "").strip()
+        if key == target_key:
+            value = md.get("value")
+            return value if value not in (None, "") else md.get("display_value")
+    return None
+
+
+def _split_woosb_ids(raw_value: Any) -> list[str]:
+    if raw_value in (None, ""):
+        return []
+
+    entries: list[str] = []
+    current: list[str] = []
+    brace_depth = 0
+
+    for ch in str(raw_value):
+        if ch == "," and brace_depth == 0:
+            entry = "".join(current).strip()
+            if entry:
+                entries.append(entry)
+            current = []
+            continue
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}" and brace_depth > 0:
+            brace_depth -= 1
+        current.append(ch)
+
+    entry = "".join(current).strip()
+    if entry:
+        entries.append(entry)
+    return entries
+
+
+def _resolve_bundle_selection_item_code(
+    selection_identifier: Any,
+    cache: "MigrationCache | None" = None,
+) -> str | None:
+    identifier = str(selection_identifier or "").strip()
+    if not identifier:
+        return None
+
+    if cache:
+        return cache.resolve_item("", identifier, variation_id=identifier)
+
+    item_code = frappe.db.get_value("Item", {"woo_variation_id": identifier}, "name")
+    if item_code:
+        return item_code
+    return frappe.db.get_value("Item", {"woo_product_id": identifier}, "name")
+
+
+def _append_bundle_selection(
+    selected_items: dict[str, list[dict]],
+    item_group: str,
+    item_code: str,
+    quantity: int,
+) -> None:
+    group_list = selected_items.setdefault(item_group, [])
+    for entry in group_list:
+        if entry["item_code"] == item_code:
+            entry["selected_qty"] += quantity
+            return
+    group_list.append({"item_code": item_code, "selected_qty": quantity})
+
+
+def _build_bundle_selections_from_parent_meta(
+    parent_line: dict,
+    parent_qty: int,
+    cache: "MigrationCache | None" = None,
+) -> dict:
+    raw_selection_value = _get_line_meta_value(parent_line.get("meta_data"), "_woosb_ids")
+    if not raw_selection_value:
+        return {}
+
+    selected_items: dict[str, list[dict]] = {}
+    parent_line_id = parent_line.get("id") or "unknown"
+
+    for entry in _split_woosb_ids(raw_selection_value):
+        parts = entry.split("/", 3)
+        if len(parts) < 3:
+            frappe.logger().warning(
+                f"Bundle selection: invalid _woosb_ids entry '{entry}' on parent line {parent_line_id}"
+            )
+            return {}
+
+        child_identifier = str(parts[0] or "").strip()
+        try:
+            child_qty = int(float(parts[2] or 0))
+        except Exception:
+            frappe.logger().warning(
+                f"Bundle selection: invalid quantity in _woosb_ids entry '{entry}' on parent line {parent_line_id}"
+            )
+            return {}
+
+        if not child_identifier or child_qty <= 0:
+            frappe.logger().warning(
+                f"Bundle selection: empty child identifier or quantity in _woosb_ids entry '{entry}' on parent line {parent_line_id}"
+            )
+            return {}
+
+        per_bundle_qty = child_qty // max(1, parent_qty)
+        if per_bundle_qty <= 0:
+            per_bundle_qty = child_qty
+
+        wc_item_code = _resolve_bundle_selection_item_code(child_identifier, cache=cache)
+        if not wc_item_code:
+            frappe.logger().warning(
+                f"Bundle selection: cannot map _woosb_ids child={child_identifier} on parent line {parent_line_id}"
+            )
+            return {}
+
+        wc_item_group = (
+            cache.item_groups.get(wc_item_code) if cache else None
+        ) or frappe.db.get_value("Item", wc_item_code, "item_group")
+        if not wc_item_group:
+            frappe.logger().warning(
+                f"Bundle selection: item {wc_item_code} has no item_group on parent line {parent_line_id}"
+            )
+            return {}
+
+        _append_bundle_selection(selected_items, wc_item_group, wc_item_code, per_bundle_qty)
+
+    if selected_items:
+        frappe.logger().info(
+            f"Bundle selections built from parent _woosb_ids: "
+            f"{{{', '.join(f'{g}: {len(v)} item(s)' for g, v in selected_items.items())}}}"
+        )
+    return selected_items
+
+
 def _build_bundle_selections(
     line_items: list[dict],
     parent_product_id: int | str,
     parent_qty: int,
     cache: "MigrationCache | None" = None,
+    parent_line: dict | None = None,
 ) -> dict:
     """Parse WooCommerce child line items to build *selected_items* for BundleProcessor.
 
-    WooCommerce Smart Bundles (WOOSB) sends a parent line plus individual child
-    lines whose ``meta_data`` contains ``_woosb_parent_id == parent_product_id``.
-    Each child carries the actual item the customer chose (identified by ``sku``
-    or ``product_id``) and the total quantity across all bundle units.
+    WooCommerce Smart Bundles (WOOSB) may send parent-specific ``_woosb_ids`` on
+    the bundle parent. When present, that metadata is preferred because it is tied
+    to a specific parent line instance. Otherwise, fall back to scanning child rows
+    whose ``meta_data`` contains ``_woosb_parent_id == parent_product_id``.
 
     Returns
     -------
@@ -616,6 +749,14 @@ def _build_bundle_selections(
         Empty dict when any child cannot be mapped (caller should fall back to
         default bundle expansion).
     """
+    parent_meta_selections = (
+        _build_bundle_selections_from_parent_meta(parent_line, parent_qty, cache=cache)
+        if parent_line
+        else {}
+    )
+    if parent_line and _get_line_meta_value(parent_line.get("meta_data"), "_woosb_ids"):
+        return parent_meta_selections
+
     parent_pid_str = str(parent_product_id)
 
     # Collect Woo child lines belonging to this bundle parent
@@ -680,18 +821,7 @@ def _build_bundle_selections(
             return {}
 
         # Aggregate into selected_items (same item may appear from multiple child lines)
-        group_list = selected_items.setdefault(wc_item_group, [])
-        found = False
-        for entry in group_list:
-            if entry["item_code"] == wc_item_code:
-                entry["selected_qty"] += per_bundle_qty
-                found = True
-                break
-        if not found:
-            group_list.append({
-                "item_code": wc_item_code,
-                "selected_qty": per_bundle_qty,
-            })
+        _append_bundle_selection(selected_items, wc_item_group, wc_item_code, per_bundle_qty)
 
     if selected_items:
         frappe.logger().info(
@@ -723,12 +853,10 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
 
     # 0) Pre-scan for woosb children and collect their parent IDs
     def _get_parent_id_from_meta(md_list: list[dict] | None) -> str | None:
-        for md in (md_list or []):
-            key = (md.get("key") or md.get("display_key") or "").strip()
-            if key == "_woosb_parent_id":
-                val = (md.get("value") or md.get("display_value") or "").strip()
-                return str(val) if val is not None else None
-        return None
+        value = _get_line_meta_value(md_list, "_woosb_parent_id")
+        if value in (None, ""):
+            return None
+        return str(value).strip()
 
     child_parent_ids: set[str] = set()
     for _li in line_items:
@@ -762,24 +890,29 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
                 from jarz_woocommerce_integration.services.bundle_processing import BundleProcessor  # type: ignore
 
                 # --- Build selected_items from WooCommerce child line items ---
-                selected_items = _build_bundle_selections(line_items, product_id, int(qty), cache=cache)
+                has_explicit_bundle_selections = bool(
+                    _get_line_meta_value(li.get("meta_data"), "_woosb_ids")
+                ) or str(product_id) in child_parent_ids
+                selected_items = _build_bundle_selections(
+                    line_items,
+                    product_id,
+                    int(qty),
+                    cache=cache,
+                    parent_line=li,
+                )
 
-                try:
-                    bp = BundleProcessor(bundle_code, int(qty), selected_items=selected_items)
-                    bp.load_bundle()
-                    bundle_lines = bp.get_invoice_items()
-                except Exception as sel_err:
-                    # If selection-based expansion fails, retry with defaults
-                    if selected_items:
-                        frappe.logger().warning(
-                            f"Bundle {bundle_code}: selection-based expansion failed "
-                            f"({sel_err}), retrying with default items"
-                        )
-                        bp = BundleProcessor(bundle_code, int(qty))
-                        bp.load_bundle()
-                        bundle_lines = bp.get_invoice_items()
-                    else:
-                        raise
+                if has_explicit_bundle_selections and not selected_items:
+                    raise ValueError(
+                        f"Bundle {bundle_code}: explicit Woo selections could not be reconstructed"
+                    )
+
+                bp = BundleProcessor(
+                    bundle_code,
+                    int(qty),
+                    selected_items=selected_items or None,
+                )
+                bp.load_bundle()
+                bundle_lines = bp.get_invoice_items()
 
                 # Log what BundleProcessor returned
                 frappe.logger().info(f"===== BUNDLE EXPANSION DEBUG =====")
@@ -1235,6 +1368,69 @@ def _enqueue_delivery_charge_repost(inv) -> None:
     )
     repost_doc.insert(ignore_permissions=True)
     repost_doc.submit()
+
+
+def _apply_invoice_pos_profile(inv, pos_profile: str | None, *, submitted: bool) -> None:
+    if not pos_profile:
+        return
+
+    if submitted:
+        inv.db_set("pos_profile", pos_profile, commit=False)
+        try:
+            inv.db_set("custom_kanban_profile", pos_profile, commit=False)
+        except Exception:
+            pass
+        try:
+            inv.db_set("is_pos", 1, commit=False)
+        except Exception:
+            pass
+        return
+
+    inv.pos_profile = pos_profile
+    try:
+        inv.custom_kanban_profile = pos_profile
+    except Exception:
+        pass
+
+
+def _get_invoice_accounting_flags(invoice_name: str) -> tuple[bool, bool]:
+    has_payment_ledger = bool(
+        frappe.db.exists("Payment Ledger Entry", {"voucher_no": invoice_name, "delinked": 0})
+    )
+    has_gl_entries = bool(
+        frappe.db.exists("GL Entry", {"voucher_no": invoice_name, "is_cancelled": 0})
+    )
+    return has_payment_ledger, has_gl_entries
+
+
+def _ensure_submitted_invoice_accounting(inv) -> None:
+    has_payment_ledger, has_gl_entries = _get_invoice_accounting_flags(inv.name)
+    if has_payment_ledger and has_gl_entries:
+        return
+
+    try:
+        inv.flags.ignore_permissions = True
+        inv.make_gl_entries()
+    except Exception:
+        frappe.log_error(
+            f"GL repair failed for {inv.name} after submit (gl={int(has_gl_entries)}, ple={int(has_payment_ledger)})",
+            "GL Entry Repair Error",
+        )
+
+    has_payment_ledger, has_gl_entries = _get_invoice_accounting_flags(inv.name)
+    if has_payment_ledger and has_gl_entries:
+        return
+
+    frappe.throw(
+        f"Sales Invoice {inv.name} submit completed without required accounting entries "
+        f"(gl={int(has_gl_entries)}, ple={int(has_payment_ledger)})."
+    )
+
+
+def _submit_invoice_with_accounting_guards(inv, pos_profile: str | None = None) -> None:
+    inv.submit()
+    _ensure_submitted_invoice_accounting(inv)
+    _apply_invoice_pos_profile(inv, pos_profile, submitted=True)
 
 
 def _resolve_paid_to_account(payment_method: str | None, company: str, cache: "MigrationCache | None" = None) -> str | None:
@@ -1744,19 +1940,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 try:
                     if pos_profile:
                         if inv.docstatus == 1:
-                            inv.db_set("pos_profile", pos_profile, commit=False)
-                            try:
-                                inv.db_set("custom_kanban_profile", pos_profile, commit=False)
-                            except Exception:
-                                pass
-                            try:
-                                inv.db_set("is_pos", 1, commit=False)
-                            except Exception:
-                                pass
+                            _apply_invoice_pos_profile(inv, pos_profile, submitted=True)
                         else:
-                            inv.pos_profile = pos_profile
-                            inv.custom_kanban_profile = pos_profile
-                            inv.is_pos = 1
+                            _apply_invoice_pos_profile(inv, pos_profile, submitted=False)
                 except Exception:
                     pass
                 if delivery_date_val:
@@ -1837,13 +2023,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
 
             try:
                 if status_map["docstatus"] == 1 and inv.docstatus == 0:
-                    inv.submit()
+                    _submit_invoice_with_accounting_guards(inv, pos_profile=pos_profile)
                 elif status_map["docstatus"] == 2 and inv.docstatus in (0, 1):
                     if inv.docstatus == 0:
-                        inv.submit()
+                        _submit_invoice_with_accounting_guards(inv, pos_profile=pos_profile)
                     inv.cancel()
             except Exception:
-                pass
+                raise
         else:
             if default_warehouse:
                 for it in lines:
@@ -1933,32 +2119,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 pass
             inv.insert(ignore_permissions=True)
             if status_map["docstatus"] == 1:
-                inv.submit()
-                # Defensive GL repair: Frappe v15 make_gl_entries() can silently fail
-                # on submit (e.g. fiscal year/period closing issues), leaving the SI
-                # with docstatus=1 but zero GL/PLE entries.  Detect and fix immediately.
-                try:
-                    if not frappe.db.exists("Payment Ledger Entry", {"voucher_no": inv.name, "delinked": 0}):
-                        inv.flags.ignore_permissions = True
-                        inv.make_gl_entries()
-                except Exception:
-                    frappe.log_error(
-                        f"GL repair failed for {inv.name} after submit",
-                        "GL Entry Repair Error",
-                    )
-                try:
-                    if pos_profile:
-                        inv.db_set("pos_profile", pos_profile, commit=False)
-                        try:
-                            inv.db_set("custom_kanban_profile", pos_profile, commit=False)
-                        except Exception:
-                            pass
-                        inv.db_set("is_pos", 1, commit=False)
-                except Exception:
-                    pass
+                _submit_invoice_with_accounting_guards(inv, pos_profile=pos_profile)
             elif status_map["docstatus"] == 2:
                 if inv.docstatus == 0:
-                    inv.submit()
+                    _submit_invoice_with_accounting_guards(inv, pos_profile=pos_profile)
                 inv.cancel()
 
         _maybe_create_payment_entry_for_invoice(
