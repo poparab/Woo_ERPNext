@@ -25,7 +25,18 @@ DEFAULT_CANCELLED_BOOTSTRAP_LOOKBACK_MINUTES = 1440
 
 DEFAULT_RECONCILE_LOOKBACK_MINUTES = 1440
 DEFAULT_RECONCILE_MAX_PAGES = 20
-RECONCILE_ORDER_STATUSES = "processing,completed,cancelled,refunded,failed"
+PROCESSING_EQUIVALENT_WOO_STATUSES = (
+    "processing",
+    "pre-nasrcity",
+    "pre-ismailia",
+    "pre-hadayk",
+    "pre-hadayek",
+    "pre-dokki",
+)
+RECONCILE_ORDER_STATUSES = ",".join(
+    PROCESSING_EQUIVALENT_WOO_STATUSES
+    + ("completed", "cancelled", "refunded", "failed")
+)
 KASHIER_AUTO_PAY_METHODS = {"Kashier Card", "Kashier Wallet"}
 NON_PAYABLE_WOO_STATUSES = {"cancelled", "refunded", "failed"}
 
@@ -239,6 +250,10 @@ class MigrationCache:
         return self.territory_chain.get(territory_name, {})
 
 
+def _is_processing_equivalent_woo_status(woo_status: str | None) -> bool:
+    return (woo_status or "").strip().lower() in PROCESSING_EQUIVALENT_WOO_STATUSES
+
+
 def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str, Any]:
     """Map Woo status to ERPNext docstatus and custom state.
     
@@ -255,7 +270,7 @@ def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str
         else:
             # Live: mark as submitted but unpaid
             return {"docstatus": 1, "custom_state": "Completed", "is_paid": False}
-    if s == "processing":
+    if _is_processing_equivalent_woo_status(s):
         # Processing = payment received, not shipped yet. Submit but never mark as paid.
         return {"docstatus": 1, "custom_state": "Processing", "is_paid": False}
     if s == "out-for-delivery":
@@ -315,7 +330,10 @@ def _should_treat_inbound_order_as_paid(
         return True
     if is_historical:
         return False
-    return (custom_payment_method or "").strip() in KASHIER_AUTO_PAY_METHODS and status in {"processing", "completed"}
+    return (
+        (custom_payment_method or "").strip() in KASHIER_AUTO_PAY_METHODS
+        and (_is_processing_equivalent_woo_status(status) or status == "completed")
+    )
 
 
 def _add_payment_failure_comment(invoice_name: str, woo_order_id: Any) -> None:
@@ -1649,7 +1667,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 existing_map = None
             if existing_map and existing_map.get(LINK_FIELD):
                 return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
-            if existing_map and (existing_map.get("status") or "").lower() == "processing":
+            if existing_map and _is_processing_equivalent_woo_status(existing_map.get("status")):
                 return {"status": "skipped", "reason": "processing", "woo_order_id": woo_id}
             raise map_err
 

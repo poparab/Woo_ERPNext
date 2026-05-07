@@ -890,6 +890,23 @@ class TestOutboundStatusSync(unittest.TestCase):
             "is_paid": False,
         })
 
+    def test_map_status_supports_processing_equivalent_aliases(self):
+        expected = {
+            "docstatus": 1,
+            "custom_state": "Processing",
+            "is_paid": False,
+        }
+
+        for status in (
+            "pre-nasrcity",
+            "pre-ismailia",
+            "pre-hadayk",
+            "pre-hadayek",
+            "pre-dokki",
+        ):
+            with self.subTest(status=status):
+                self.assertEqual(order_sync._map_status(status), expected)
+
     def test_build_order_payload_allows_status_only_update_when_existing_line_items_do_not_match(self):
         invoice = DummyInvoice(sales_invoice_state="Delivered")
         cfg = outbound_sync.OutboundConfig(

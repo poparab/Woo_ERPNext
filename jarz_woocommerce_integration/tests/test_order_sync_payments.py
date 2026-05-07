@@ -17,6 +17,40 @@ def test_should_treat_inbound_order_as_paid_for_live_kashier_processing():
     ) is False
 
 
+def test_should_treat_inbound_order_as_paid_for_live_kashier_processing_aliases():
+    status_map = {"is_paid": False}
+
+    for status in (
+        "pre-nasrcity",
+        "pre-ismailia",
+        "pre-hadayk",
+        "pre-hadayek",
+        "pre-dokki",
+    ):
+        assert order_sync._should_treat_inbound_order_as_paid(
+            status, "Kashier Card", status_map=status_map, is_historical=False
+        ) is True
+        assert order_sync._should_treat_inbound_order_as_paid(
+            status, "Kashier Wallet", status_map=status_map, is_historical=False
+        ) is True
+        assert order_sync._should_treat_inbound_order_as_paid(
+            status, "Cash", status_map=status_map, is_historical=False
+        ) is False
+
+
+def test_reconcile_statuses_include_processing_aliases():
+    statuses = set(order_sync.RECONCILE_ORDER_STATUSES.split(","))
+
+    for status in (
+        "pre-nasrcity",
+        "pre-ismailia",
+        "pre-hadayk",
+        "pre-hadayek",
+        "pre-dokki",
+    ):
+        assert status in statuses
+
+
 def test_should_treat_inbound_order_as_paid_skips_non_payable_statuses():
     status_map = {"is_paid": False}
 
