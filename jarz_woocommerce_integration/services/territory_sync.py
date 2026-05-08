@@ -47,6 +47,7 @@ CODE_TO_DISPLAY = {
     "EGMAADI": "Maadi - المعادي",
     "EGMOQATTAM": "Moqattam - المقطم",
     "EGKATAMYA": "Katameya - القطاميه",
+    "EGMARG": "El Marg - المرج",
 }
 
 

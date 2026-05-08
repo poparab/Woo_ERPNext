@@ -15,6 +15,7 @@
   "webhook_secret",
   "section_inbound",
   "enable_inbound_orders",
+  "default_pos_profile",
     "live_order_overlap_minutes",
     "live_order_max_pages",
     "cancelled_order_overlap_minutes",
@@ -106,6 +107,13 @@
    "fieldname": "enable_inbound_orders",
    "fieldtype": "Check",
    "label": "Enable Inbound Order Sync"
+  },
+  {
+   "fieldname": "default_pos_profile",
+   "fieldtype": "Link",
+   "label": "Default POS Profile (Fallback)",
+   "options": "POS Profile",
+   "description": "Used when territory-based POS Profile resolution fails. Ensures every inbound Woo order is assigned a branch and appears in the Flutter app."
   },
     {
      "default": "15",
@@ -247,7 +255,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-04-17 18:00:00.000000",
+ "modified": "2026-05-08 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Jarz WooCommerce Integration",
  "name": "WooCommerce Settings",

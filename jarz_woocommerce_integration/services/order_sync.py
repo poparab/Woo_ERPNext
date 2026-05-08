@@ -1795,6 +1795,21 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except Exception:
         pass
 
+    # Fallback: use Default POS Profile from settings when territory resolution produced nothing
+    if not pos_profile:
+        try:
+            fallback = getattr(settings, "default_pos_profile", None)
+            if fallback and frappe.db.exists("POS Profile", fallback):
+                pos_profile = fallback
+                if not default_warehouse:
+                    default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse") or default_warehouse
+                frappe.logger().warning(
+                    f"woo_order={woo_id} territory={territory_name!r} unresolved POS Profile; "
+                    f"falling back to default_pos_profile={pos_profile!r}"
+                )
+        except Exception:
+            pass
+
     # Resolve ERPNext Price List
     price_list = None
     try:
