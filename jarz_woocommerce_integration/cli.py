@@ -93,6 +93,95 @@ def inspect_invoice_pos_profile(name: str):  # pragma: no cover
     }
 
 
+def repair_invoice_15781_customer():  # pragma: no cover
+    """One-time repair: reassign ACC-SINV-2026-15781 from Mina Atef to a new guest customer.
+
+    Woo order 14746 was a guest order (customer_id=0).  The sync incorrectly
+    reused ERP customer 'Mina Atef' (woo_customer_id=3708) via email match.
+    This function:
+      1. Creates a new Customer 'كريم سيد محمود' with the order's phone number.
+      2. Creates a new Billing address for the new customer (copied from the
+         address already linked on the invoice).
+      3. Reassigns the Sales Invoice (customer, customer_name, customer_address,
+         shipping_address_name).
+      4. Reassigns the GL Entry party for that invoice.
+
+    Usage:
+        bench --site frontend execute jarz_woocommerce_integration.jarz_woocommerce_integration.cli.repair_invoice_15781_customer
+    """
+    import frappe
+
+    INVOICE = "ACC-SINV-2026-15781"
+    NEW_NAME = "كريم سيد محمود"
+    ORDER_PHONE = "01146269820"
+    ORDER_TERRITORY = "EGOBOUR"
+    OLD_ADDRESS = "Mina Atef-Billing-1"
+
+    if not frappe.db.exists("Sales Invoice", INVOICE):
+        return {"error": f"Invoice {INVOICE} not found"}
+
+    current_customer = frappe.db.get_value("Sales Invoice", INVOICE, "customer")
+    if current_customer != "Mina Atef":
+        return {"skipped": True, "reason": f"Invoice customer is already '{current_customer}', not 'Mina Atef'"}
+
+    # 1. Create new Customer
+    cust = frappe.get_doc({
+        "doctype": "Customer",
+        "customer_name": NEW_NAME,
+        "customer_type": "Individual",
+        "territory": ORDER_TERRITORY,
+        "mobile_no": ORDER_PHONE,
+        "disabled": 0,
+    })
+    cust.flags.ignore_woo_outbound = True
+    cust.insert(ignore_permissions=True)
+    new_customer_name = cust.name
+
+    # 2. Create new Address (copy data from OLD_ADDRESS)
+    old_addr = frappe.get_doc("Address", OLD_ADDRESS)
+    new_addr = frappe.get_doc({
+        "doctype": "Address",
+        "address_title": NEW_NAME,
+        "address_type": "Billing",
+        "address_line1": old_addr.address_line1,
+        "address_line2": old_addr.address_line2 or "",
+        "city": old_addr.city,
+        "state": old_addr.state or "",
+        "pincode": old_addr.pincode or "",
+        "country": old_addr.country or "Egypt",
+        "links": [{
+            "doctype": "Address",
+            "link_doctype": "Customer",
+            "link_name": new_customer_name,
+        }],
+    })
+    new_addr.insert(ignore_permissions=True)
+    new_address_name = new_addr.name
+
+    # 3. Reassign the Sales Invoice
+    frappe.db.set_value("Sales Invoice", INVOICE, {
+        "customer": new_customer_name,
+        "customer_name": NEW_NAME,
+        "customer_address": new_address_name,
+        "shipping_address_name": new_address_name,
+    }, update_modified=False)
+
+    # 4. Reassign GL Entry party
+    frappe.db.sql(
+        "UPDATE `tabGL Entry` SET party=%s WHERE voucher_no=%s AND party=%s AND party_type='Customer'",
+        (new_customer_name, INVOICE, "Mina Atef"),
+    )
+    frappe.db.commit()
+
+    return {
+        "success": True,
+        "invoice": INVOICE,
+        "new_customer": new_customer_name,
+        "new_address": new_address_name,
+        "old_customer": "Mina Atef",
+    }
+
+
 def list_recent_woo_invoices_pos_profile(limit: int = 10):  # pragma: no cover
     """List recent Woo-mapped invoices with their POS Profile mapping context."""
     import frappe

@@ -64,6 +64,29 @@ def _candidate_conflicts_with_woo_customer(name: Optional[str], woo_customer_id:
     return bool(existing_woo_customer_id and existing_woo_customer_id != normalized_woo_customer_id)
 
 
+def _candidate_safe_for_guest(name: Optional[str]) -> bool:
+    """Return False if the candidate Customer is already bound to a Woo identity.
+
+    A customer with a woo_customer_id, legacy custom_woo_customer_id, or
+    woo_username belongs to a real Woo account and must never be recycled for a
+    guest order (woo_customer_id=0 / None).  Guest orders always create a fresh
+    customer in that case.
+    """
+    if not name:
+        return True
+    try:
+        existing_woo_id = get_customer_woo_id(name) or get_legacy_customer_woo_id(name)
+        if existing_woo_id:
+            return False
+        if _field_exists("Customer", "woo_username"):
+            existing_username = frappe.db.get_value("Customer", name, "woo_username")
+            if existing_username:
+                return False
+    except Exception:
+        pass
+    return True
+
+
 @contextmanager
 def _suppress_woo_outbound():
     previous = getattr(frappe.flags, "ignore_woo_outbound", None)
@@ -160,7 +183,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         ):
             if cache_key and cache_key in customer_cache:
                 cached_name = customer_cache[cache_key]
-                if cache_key.startswith(("user:", "email:")) and _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id):
+                if cache_key.startswith(("user:", "email:")) and (
+                    _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id)
+                    or (not woo_customer_id and not _candidate_safe_for_guest(cached_name))
+                ):
                     continue
                 return cached_name
 
@@ -184,6 +210,16 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         name = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
         if not name and _field_exists("Customer", "phone"):
             name = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+        # For guest orders, phone alone is not sufficient to reuse a Woo-bound customer;
+        # require email to also match to confirm it is the same person.
+        if name and not woo_customer_id and not _candidate_safe_for_guest(name):
+            phone_email_match = bool(email and frappe.db.get_value("Customer", name, "email_id") == email)
+            if not phone_email_match:
+                frappe.logger("woo").warning(
+                    f"woo_order={order_id} guest phone={phone_norm!r} matched Woo-bound "
+                    f"customer {name!r}; email mismatch — creating new guest customer"
+                )
+                name = None
         if name:
             _update_customer_identity(
                 name,
@@ -199,7 +235,14 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     # 2) username-based
     if username and _field_exists("Customer", "woo_username"):
         name = frappe.db.get_value("Customer", {"woo_username": username}, "name")
-        if _candidate_conflicts_with_woo_customer(name, woo_customer_id):
+        if _candidate_conflicts_with_woo_customer(name, woo_customer_id) or (
+            not woo_customer_id and not _candidate_safe_for_guest(name)
+        ):
+            if name:
+                frappe.logger("woo").warning(
+                    f"woo_order={order_id} guest username={username!r} matched Woo-bound "
+                    f"customer {name!r} — creating new guest customer"
+                )
             name = None
         if name:
             _update_customer_identity(
@@ -216,7 +259,14 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     # 3) email-based
     if email:
         name = frappe.db.get_value("Customer", {"email_id": email}, "name")
-        if _candidate_conflicts_with_woo_customer(name, woo_customer_id):
+        if _candidate_conflicts_with_woo_customer(name, woo_customer_id) or (
+            not woo_customer_id and not _candidate_safe_for_guest(name)
+        ):
+            if name:
+                frappe.logger("woo").warning(
+                    f"woo_order={order_id} guest email={email!r} matched Woo-bound "
+                    f"customer {name!r} — creating new guest customer"
+                )
             name = None
         if name:
             _update_customer_identity(
@@ -267,7 +317,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             ):
                 if cache_key and customer_cache is not None and cache_key in customer_cache:
                     cached_name = customer_cache[cache_key]
-                    if cache_key.startswith(("user:", "email:")) and _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id):
+                    if cache_key.startswith(("user:", "email:")) and (
+                        _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id)
+                        or (not woo_customer_id and not _candidate_safe_for_guest(cached_name))
+                    ):
                         continue
                     return cached_name
 
@@ -281,6 +334,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                 _recheck = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
                 if not _recheck and _field_exists("Customer", "phone"):
                     _recheck = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+                if _recheck and not woo_customer_id and not _candidate_safe_for_guest(_recheck):
+                    phone_email_match = bool(email and frappe.db.get_value("Customer", _recheck, "email_id") == email)
+                    if not phone_email_match:
+                        _recheck = None
                 if _recheck:
                     _update_customer_identity(
                         _recheck,
@@ -294,7 +351,9 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     return _recheck
             if username and _field_exists("Customer", "woo_username"):
                 _recheck = frappe.db.get_value("Customer", {"woo_username": username}, "name")
-                if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id):
+                if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id) or (
+                    not woo_customer_id and not _candidate_safe_for_guest(_recheck)
+                ):
                     _recheck = None
                 if _recheck:
                     _update_customer_identity(
@@ -309,7 +368,9 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     return _recheck
             if email:
                 _recheck = frappe.db.get_value("Customer", {"email_id": email}, "name")
-                if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id):
+                if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id) or (
+                    not woo_customer_id and not _candidate_safe_for_guest(_recheck)
+                ):
                     _recheck = None
                 if _recheck:
                     _update_customer_identity(
