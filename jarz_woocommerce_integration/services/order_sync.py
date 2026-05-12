@@ -1605,6 +1605,7 @@ def repair_current_month_free_delivery_imports(
                             payment_entry.cancel()
                             canceled_payment_entries.append(payment_entry_name)
 
+                    inv = frappe.get_doc("Sales Invoice", inv.name)
                     if inv.docstatus == 1:
                         inv.cancel()
 
