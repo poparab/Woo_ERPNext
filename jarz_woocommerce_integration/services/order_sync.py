@@ -1237,6 +1237,416 @@ def _bundle_has_free_shipping(bundle_code: str | None, cache: "MigrationCache | 
         return False
 
 
+def _row_value(row: Any, fieldname: str, default: Any = None) -> Any:
+    if hasattr(row, "get"):
+        try:
+            return row.get(fieldname, default)
+        except TypeError:
+            value = row.get(fieldname)
+            return default if value is None else value
+    return getattr(row, fieldname, default)
+
+
+def _get_invoice_item_qty(inv) -> float:
+    total_qty = 0.0
+    for item in inv.get("items", []) or []:
+        try:
+            total_qty += float(_row_value(item, "qty", 0) or 0)
+        except Exception:
+            continue
+    return total_qty
+
+
+def _get_invoice_merchandise_subtotal(inv) -> float:
+    subtotal = 0.0
+    for item in inv.get("items", []) or []:
+        try:
+            qty = float(_row_value(item, "qty", 0) or 0)
+            price_list_rate = _row_value(item, "price_list_rate", None)
+            if price_list_rate in (None, ""):
+                price_list_rate = _row_value(item, "rate", 0) or 0
+            discount_pct = float(_row_value(item, "discount_percentage", 0) or 0)
+        except Exception:
+            continue
+        discount_pct = min(max(discount_pct, 0.0), 100.0)
+        subtotal += float(price_list_rate or 0) * qty * (1 - discount_pct / 100.0)
+    return round(subtotal, 2)
+
+
+def _apply_delivery_promotion_audit(inv, decision: dict[str, Any]) -> None:
+    if not decision.get("matched") or not decision.get("rule_name"):
+        return
+
+    marker = (
+        f"[DELIVERY PROMO] {decision['rule_name']} | "
+        f"merchandise_subtotal={float(decision.get('merchandise_subtotal', 0) or 0):.2f}"
+    )
+    existing = (getattr(inv, "remarks", "") or "").strip()
+    if marker in existing:
+        return
+    inv.remarks = (existing + "\n" if existing else "") + marker
+
+
+def _woo_order_has_free_shipping(order: dict[str, Any] | None) -> bool:
+    if not isinstance(order, dict):
+        return False
+
+    try:
+        shipping_total = float(order.get("shipping_total") or 0)
+    except Exception:
+        shipping_total = 0.0
+
+    shipping_lines = order.get("shipping_lines") or []
+    method_ids = {
+        str(line.get("method_id") or "").strip().lower()
+        for line in shipping_lines
+        if isinstance(line, dict)
+    }
+
+    if shipping_total > 0:
+        return False
+    if "free_shipping" in method_ids:
+        return True
+    if not shipping_lines:
+        return True
+
+    try:
+        return all(float(line.get("total") or 0) <= 0 for line in shipping_lines if isinstance(line, dict))
+    except Exception:
+        return False
+
+
+def _resolve_delivery_promotion(
+    inv,
+    *,
+    territory_name: str | None,
+    customer_name: str | None = None,
+    pos_profile_name: str | None = None,
+    channel: str = "woo",
+    is_pickup: bool = False,
+) -> dict[str, Any]:
+    decision = {
+        "matched": False,
+        "rule_name": None,
+        "rule_type": None,
+        "merchandise_subtotal": _get_invoice_merchandise_subtotal(inv),
+        "item_qty": _get_invoice_item_qty(inv),
+        "suppress_shipping_income": False,
+        "suppress_legacy_delivery_charges": False,
+    }
+
+    if is_pickup:
+        return decision
+
+    if not frappe.db.exists("DocType", "Jarz Promotion Rule"):
+        return decision
+
+    customer_group = None
+    if customer_name:
+        try:
+            customer_group = frappe.db.get_value("Customer", customer_name, "customer_group")
+        except Exception:
+            customer_group = None
+
+    normalized_channel = (channel or "woo").strip().lower()
+    if normalized_channel == "woocommerce":
+        normalized_channel = "woo"
+
+    rule_names = frappe.get_all(
+        "Jarz Promotion Rule",
+        filters={"enabled": 1, "promotion_scope": "Delivery"},
+        pluck="name",
+        order_by="priority asc, creation asc",
+    )
+    now_dt = frappe.utils.now_datetime()
+
+    for rule_name in rule_names:
+        rule = frappe.get_doc("Jarz Promotion Rule", rule_name)
+
+        if getattr(rule, "active_from", None) and rule.active_from > now_dt:
+            continue
+        if getattr(rule, "active_to", None) and rule.active_to < now_dt:
+            continue
+
+        company = getattr(inv, "company", None)
+        if getattr(rule, "company", None) and rule.company != company:
+            continue
+        if getattr(rule, "territory", None) and rule.territory != territory_name:
+            continue
+        if getattr(rule, "customer_group", None) and rule.customer_group != customer_group:
+            continue
+        if getattr(rule, "pos_profile", None) and rule.pos_profile != pos_profile_name:
+            continue
+
+        allowed_channels = {
+            str(_row_value(row, "channel", "") or "").strip().lower()
+            for row in (getattr(rule, "channels", None) or [])
+            if str(_row_value(row, "channel", "") or "").strip()
+        }
+        if allowed_channels and normalized_channel not in allowed_channels:
+            continue
+
+        basis = getattr(rule, "threshold_basis", None) or "Merchandise Subtotal"
+        if basis == "Item Quantity":
+            metric_value = decision["item_qty"]
+            minimum_value = float(getattr(rule, "minimum_item_qty", 0) or 0)
+            maximum_value = None
+        else:
+            metric_value = decision["merchandise_subtotal"]
+            minimum_value = float(getattr(rule, "minimum_threshold", 0) or 0)
+            maximum_value = getattr(rule, "maximum_threshold", None)
+            maximum_value = float(maximum_value or 0) if maximum_value not in (None, "") else None
+            if maximum_value is not None and maximum_value <= 0:
+                maximum_value = None
+
+        if minimum_value and metric_value < minimum_value:
+            continue
+        if maximum_value is not None and metric_value > maximum_value:
+            continue
+        if (getattr(rule, "rule_type", "") or "") != "Free Delivery":
+            continue
+
+        decision["matched"] = True
+        decision["rule_name"] = getattr(rule, "rule_name", None) or rule_name
+        decision["rule_type"] = getattr(rule, "rule_type", None)
+        decision["suppress_shipping_income"] = bool(getattr(rule, "apply_to_shipping_income", 0))
+        decision["suppress_legacy_delivery_charges"] = bool(getattr(rule, "apply_to_legacy_delivery_charges", 0))
+        return decision
+
+    return decision
+
+
+def _get_linked_payment_entries(invoice_name: str) -> list[str]:
+    rows = frappe.get_all(
+        "Payment Entry Reference",
+        filters={
+            "reference_doctype": "Sales Invoice",
+            "reference_name": invoice_name,
+        },
+        pluck="parent",
+    )
+    return [str(row).strip() for row in rows if str(row).strip()]
+
+
+def _payment_entries_are_simple_for_invoice(invoice_name: str, payment_entries: list[str]) -> bool:
+    if not payment_entries:
+        return True
+    for payment_entry in payment_entries:
+        refs = frappe.get_all(
+            "Payment Entry Reference",
+            filters={"parent": payment_entry},
+            fields=["reference_doctype", "reference_name"],
+        )
+        if len(refs) != 1:
+            return False
+        ref = refs[0]
+        if ref.get("reference_doctype") != "Sales Invoice" or ref.get("reference_name") != invoice_name:
+            return False
+    return True
+
+
+def _invoice_has_delivery_note_link(invoice_name: str) -> bool:
+    return bool(
+        frappe.db.exists(
+            "Delivery Note Item",
+            {"against_sales_invoice": invoice_name},
+        )
+    )
+
+
+def _list_current_month_free_delivery_repair_candidates(limit: int | None = None) -> list[dict[str, Any]]:
+    limit_clause = ""
+    params: list[Any] = []
+    if limit and int(limit) > 0:
+        limit_clause = " LIMIT %s"
+        params.append(int(limit))
+
+    return frappe.db.sql(
+        """
+        SELECT
+            si.name,
+            si.woo_order_id,
+            si.customer,
+            si.territory,
+            si.pos_profile,
+            si.posting_date,
+            si.docstatus,
+            IFNULL(si.amended_from, '') AS amended_from,
+            IFNULL(si.is_return, 0) AS is_return
+        FROM `tabSales Invoice` si
+        WHERE COALESCE(si.woo_order_id, 0) > 0
+          AND si.posting_date >= DATE_FORMAT(CURDATE(), '%%Y-%%m-01')
+          AND si.posting_date < DATE_ADD(LAST_DAY(CURDATE()), INTERVAL 1 DAY)
+          AND si.docstatus IN (0, 1)
+          AND EXISTS (
+              SELECT 1
+              FROM `tabSales Taxes and Charges` stc
+              WHERE stc.parent = si.name
+                AND stc.parenttype = 'Sales Invoice'
+                AND stc.description LIKE 'Shipping Income%%'
+          )
+        ORDER BY si.posting_date ASC, si.modified ASC
+        """ + limit_clause,
+        tuple(params),
+        as_dict=True,
+    )
+
+
+def repair_current_month_free_delivery_imports(
+    limit: int | None = None,
+    *,
+    dry_run: bool = True,
+    require_woo_free_shipping: bool = True,
+) -> dict[str, Any]:
+    settings = frappe.get_single("WooCommerce Settings")
+    ensure_custom_fields()
+    client = WooClient(
+        base_url=settings.base_url,
+        consumer_key=settings.consumer_key,
+        consumer_secret=settings.get_password("consumer_secret"),
+    )
+
+    candidates = _list_current_month_free_delivery_repair_candidates(limit=limit)
+    summary: dict[str, Any] = {
+        "current_month": frappe.utils.today()[:7],
+        "requested": len(candidates),
+        "evaluated": 0,
+        "repaired": 0,
+        "skipped": 0,
+        "errors": 0,
+        "dry_run": bool(dry_run),
+        "require_woo_free_shipping": bool(require_woo_free_shipping),
+        "results": [],
+    }
+
+    original_ignore_woo_outbound = getattr(frappe.flags, "ignore_woo_outbound", False)
+    frappe.flags.ignore_woo_outbound = True
+
+    try:
+        for row in candidates:
+            invoice_name = row.get("name")
+            woo_order_id = row.get("woo_order_id")
+            result: dict[str, Any] = {
+                "invoice": invoice_name,
+                "woo_order_id": woo_order_id,
+                "status": "skipped",
+            }
+            summary["evaluated"] += 1
+            summary["results"].append(result)
+
+            try:
+                inv = frappe.get_doc("Sales Invoice", invoice_name)
+                if int(getattr(inv, "is_return", 0) or 0):
+                    result["reason"] = "is_return"
+                    summary["skipped"] += 1
+                    continue
+                if getattr(inv, "amended_from", None):
+                    result["reason"] = "already_amended"
+                    summary["skipped"] += 1
+                    continue
+
+                territory_name = getattr(inv, "territory", None) or row.get("territory")
+                if not territory_name:
+                    territory_name = frappe.db.get_value("Customer", inv.customer, "territory")
+
+                promotion = _resolve_delivery_promotion(
+                    inv,
+                    territory_name=territory_name,
+                    customer_name=inv.customer,
+                    pos_profile_name=getattr(inv, "pos_profile", None) or row.get("pos_profile"),
+                    channel="woo",
+                )
+                result["promotion"] = {
+                    "matched": bool(promotion.get("matched")),
+                    "rule_name": promotion.get("rule_name"),
+                    "merchandise_subtotal": promotion.get("merchandise_subtotal"),
+                }
+                if not promotion.get("matched") or not promotion.get("suppress_shipping_income"):
+                    result["reason"] = "promotion_not_matched"
+                    summary["skipped"] += 1
+                    continue
+
+                order = client.get_order(woo_order_id)
+                if not order:
+                    result["reason"] = "woo_order_not_found"
+                    summary["skipped"] += 1
+                    continue
+                woo_free_shipping = _woo_order_has_free_shipping(order)
+                result["woo_shipping_total"] = order.get("shipping_total")
+                result["woo_free_shipping"] = woo_free_shipping
+                if require_woo_free_shipping and not woo_free_shipping:
+                    result["reason"] = "woo_shipping_not_free"
+                    summary["skipped"] += 1
+                    continue
+
+                payment_entries = _get_linked_payment_entries(inv.name)
+                result["payment_entries"] = payment_entries
+                if not _payment_entries_are_simple_for_invoice(inv.name, payment_entries):
+                    result["reason"] = "complex_payment_entries"
+                    summary["skipped"] += 1
+                    continue
+                if _invoice_has_delivery_note_link(inv.name):
+                    result["reason"] = "delivery_note_linked"
+                    summary["skipped"] += 1
+                    continue
+
+                if dry_run:
+                    result["status"] = "dry_run"
+                    result["reason"] = "eligible"
+                    continue
+
+                save_point = f"woo_free_delivery_repair_{str(woo_order_id).strip()}"
+                frappe.db.savepoint(save_point)
+                canceled_payment_entries: list[str] = []
+                try:
+                    for payment_entry_name in payment_entries:
+                        payment_entry = frappe.get_doc("Payment Entry", payment_entry_name)
+                        if payment_entry.docstatus == 1:
+                            payment_entry.cancel()
+                            canceled_payment_entries.append(payment_entry_name)
+
+                    if inv.docstatus == 1:
+                        inv.cancel()
+
+                    replay = process_order_phase1(order, settings, allow_update=True)
+                    if replay.get("status") not in {"created", "updated"}:
+                        raise frappe.ValidationError(f"replay_failed: {replay}")
+
+                    new_invoice_name = replay.get("invoice")
+                    if not new_invoice_name:
+                        raise frappe.ValidationError(f"replay_missing_invoice: {replay}")
+
+                    new_invoice = frappe.get_doc("Sales Invoice", new_invoice_name)
+                    shipping_rows_after = _get_delivery_charge_rows(new_invoice)
+                    if shipping_rows_after:
+                        raise frappe.ValidationError(
+                            f"shipping_rows_still_present: {shipping_rows_after}"
+                        )
+
+                    frappe.db.release_savepoint(save_point)
+                    frappe.db.commit()
+
+                    result["status"] = "repaired"
+                    result["reason"] = "replayed"
+                    result["recreated_invoice"] = new_invoice_name
+                    result["canceled_payment_entries"] = canceled_payment_entries
+                    summary["repaired"] += 1
+                except Exception:
+                    frappe.db.rollback(save_point=save_point)
+                    raise
+            except Exception as exc:  # noqa: BLE001
+                result["status"] = "error"
+                result["reason"] = str(exc)
+                summary["errors"] += 1
+            else:
+                if result["status"] == "skipped":
+                    summary["skipped"] += 1
+    finally:
+        frappe.flags.ignore_woo_outbound = original_ignore_woo_outbound
+
+    return summary
+
+
 def _get_delivery_charge_rows(inv) -> list[dict[str, Any]]:
     rows = []
     for tax in inv.get("taxes", []) or []:
@@ -1268,12 +1678,39 @@ def _resolve_delivery_charge_policy(
     territory_name: str | None,
     has_free_shipping_bundle: bool,
     cache: "MigrationCache | None" = None,
+    *,
+    inv=None,
+    customer_name: str | None = None,
+    pos_profile_name: str | None = None,
+    channel: str = "woo",
 ) -> dict[str, Any]:
     if has_free_shipping_bundle:
         return {
             "amount": 0.0,
             "description": None,
             "reason": "free_shipping_bundle",
+        }
+
+    promotion = None
+    if inv is not None:
+        try:
+            promotion = _resolve_delivery_promotion(
+                inv,
+                territory_name=territory_name,
+                customer_name=customer_name,
+                pos_profile_name=pos_profile_name,
+                channel=channel,
+            )
+        except Exception:
+            promotion = None
+
+    if promotion and promotion.get("matched") and promotion.get("suppress_shipping_income"):
+        return {
+            "amount": 0.0,
+            "description": None,
+            "reason": "delivery_promotion",
+            "promotion": promotion,
+            "promotion_rule_name": promotion.get("rule_name"),
         }
 
     delivery_amt = 0.0
@@ -1305,12 +1742,20 @@ def _apply_delivery_charge_policy(
     territory_name: str | None,
     has_free_shipping_bundle: bool,
     cache: "MigrationCache | None" = None,
+    *,
+    customer_name: str | None = None,
+    pos_profile_name: str | None = None,
+    channel: str = "woo",
 ) -> dict[str, Any]:
     before_rows = _get_delivery_charge_rows(inv)
     decision = _resolve_delivery_charge_policy(
         territory_name,
         has_free_shipping_bundle=has_free_shipping_bundle,
         cache=cache,
+        inv=inv,
+        customer_name=customer_name,
+        pos_profile_name=pos_profile_name,
+        channel=channel,
     )
 
     _clear_delivery_charge_rows(inv)
@@ -1326,6 +1771,10 @@ def _apply_delivery_charge_policy(
     except Exception:
         pass
 
+    promotion = decision.get("promotion")
+    if promotion and promotion.get("matched"):
+        _apply_delivery_promotion_audit(inv, promotion)
+
     after_rows = _get_delivery_charge_rows(inv)
     decision["changed"] = before_rows != after_rows
     decision["before_rows"] = before_rows
@@ -1340,6 +1789,7 @@ def _apply_delivery_charge_policy(
                 "has_free_shipping_bundle": has_free_shipping_bundle,
                 "reason": decision["reason"],
                 "amount": decision["amount"],
+                "promotion_rule_name": decision.get("promotion_rule_name"),
                 "changed": decision["changed"],
             }
         )
@@ -1997,6 +2447,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         territory_name=territory_name,
                         has_free_shipping_bundle=bundle_context.get("has_free_shipping_bundle", False),
                         cache=cache,
+                        customer_name=customer,
+                        pos_profile_name=pos_profile,
+                        channel="woo",
                     )
                 except Exception:
                     pass
@@ -2129,6 +2582,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     territory_name=territory_name,
                     has_free_shipping_bundle=bundle_context.get("has_free_shipping_bundle", False),
                     cache=cache,
+                    customer_name=customer,
+                    pos_profile_name=pos_profile,
+                    channel="woo",
                 )
             except Exception:
                 pass

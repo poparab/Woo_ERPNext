@@ -42,17 +42,21 @@ class DummyBundleCache:
 
 
 class DummyInvoice:
-    def __init__(self, taxes=None):
+    def __init__(self, taxes=None, items=None, remarks=""):
         self.company = "_Test Company"
         self.docstatus = 0
         self.doctype = "Sales Invoice"
         self.name = "ACC-SINV-TEST"
         self._taxes = list(taxes or [])
+        self._items = list(items or [])
+        self.remarks = remarks
         self.calculate_calls = 0
 
     def get(self, fieldname, default=None):
         if fieldname == "taxes":
             return self._taxes
+        if fieldname == "items":
+            return self._items
         return default
 
     def set(self, fieldname, value):
@@ -65,6 +69,44 @@ class DummyInvoice:
 
     def calculate_taxes_and_totals(self):
         self.calculate_calls += 1
+
+
+def _mock_delivery_rule(minimum_threshold=999.0, channels=None):
+    return SimpleNamespace(
+        rule_name="Free Delivery >= 999 EGP",
+        rule_type="Free Delivery",
+        company=None,
+        territory=None,
+        customer_group=None,
+        pos_profile=None,
+        threshold_basis="Merchandise Subtotal",
+        minimum_threshold=minimum_threshold,
+        maximum_threshold=None,
+        minimum_item_qty=None,
+        active_from=None,
+        active_to=None,
+        apply_to_shipping_income=1,
+        apply_to_legacy_delivery_charges=1,
+        channels=[SimpleNamespace(channel=channel) for channel in (channels or [])],
+    )
+
+
+def _fake_frappe_for_delivery_rule(rule, customer_group="Retail"):
+    def fake_exists(doctype, name=None):
+        return doctype == "DocType" and name == "Jarz Promotion Rule"
+
+    def fake_get_value(doctype, name_or_filters, fieldname=None):
+        if doctype == "Customer" and fieldname == "customer_group":
+            return customer_group
+        return None
+
+    return SimpleNamespace(
+        db=SimpleNamespace(exists=fake_exists, get_value=fake_get_value),
+        get_all=lambda *args, **kwargs: ["PROMO-0001"],
+        get_doc=lambda doctype, name=None: rule,
+        utils=SimpleNamespace(now_datetime=lambda: order_sync.datetime(2026, 5, 13, 12, 0, 0)),
+        logger=lambda: SimpleNamespace(info=lambda *args, **kwargs: None),
+    )
 
 
 def test_resolve_delivery_charge_policy_uses_territory_only():
@@ -155,6 +197,106 @@ def test_apply_delivery_charge_policy_removes_shipping_for_free_bundle(monkeypat
     assert invoice.get("taxes") == [
         {"charge_type": "Actual", "description": "VAT", "tax_amount": 14}
     ]
+
+
+def test_apply_delivery_charge_policy_honors_delivery_promotion(monkeypatch):
+    monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
+    monkeypatch.setattr(order_sync, "frappe", _fake_frappe_for_delivery_rule(_mock_delivery_rule()))
+
+    invoice = DummyInvoice(
+        taxes=[
+            {"charge_type": "Actual", "description": "Shipping Income (EG6OCT)", "tax_amount": 60},
+            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
+        ],
+        items=[
+            {"item_code": "ITEM-1", "qty": 2, "price_list_rate": 500},
+        ],
+    )
+    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
+
+    decision = order_sync._apply_delivery_charge_policy(
+        invoice,
+        territory_name="EG6OCT",
+        has_free_shipping_bundle=False,
+        cache=cache,
+        customer_name="CUST-001",
+        pos_profile_name="Main POS",
+        channel="woo",
+    )
+
+    assert decision["reason"] == "delivery_promotion"
+    assert decision["promotion_rule_name"] == "Free Delivery >= 999 EGP"
+    assert decision["after_rows"] == []
+    assert invoice.get("taxes") == [
+        {"charge_type": "Actual", "description": "VAT", "tax_amount": 14}
+    ]
+    assert "[DELIVERY PROMO] Free Delivery >= 999 EGP | merchandise_subtotal=1000.00" in invoice.remarks
+
+
+def test_apply_delivery_charge_policy_ignores_non_woo_channel_restriction(monkeypatch):
+    monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
+    monkeypatch.setattr(
+        order_sync,
+        "frappe",
+        _fake_frappe_for_delivery_rule(_mock_delivery_rule(channels=["flutter"])),
+    )
+
+    invoice = DummyInvoice(
+        taxes=[
+            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
+        ],
+        items=[
+            {"item_code": "ITEM-1", "qty": 2, "price_list_rate": 500},
+        ],
+    )
+    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
+
+    decision = order_sync._apply_delivery_charge_policy(
+        invoice,
+        territory_name="EG6OCT",
+        has_free_shipping_bundle=False,
+        cache=cache,
+        customer_name="CUST-001",
+        pos_profile_name="Main POS",
+        channel="woo",
+    )
+
+    assert decision["reason"] == "territory_delivery_income"
+    assert decision["after_rows"] == [
+        {"description": "Shipping Income (EG6OCT)", "tax_amount": 60.0}
+    ]
+    assert invoice.get("taxes") == [
+        {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
+        {
+            "charge_type": "Actual",
+            "description": "Shipping Income (EG6OCT)",
+            "tax_amount": 60.0,
+            "account_head": "Freight - TEST",
+        },
+    ]
+    assert invoice.remarks == ""
+
+
+def test_woo_order_has_free_shipping_when_zero_total_and_free_shipping_method():
+    assert order_sync._woo_order_has_free_shipping(
+        {
+            "shipping_total": "0.00",
+            "shipping_lines": [
+                {"method_id": "free_shipping", "method_title": "Free Delivery", "total": "0.00"}
+            ],
+        }
+    ) is True
+
+
+def test_woo_order_has_free_shipping_rejects_positive_shipping_total():
+    assert order_sync._woo_order_has_free_shipping(
+        {
+            "shipping_total": "50.00",
+            "shipping_lines": [
+                {"method_id": "flat_rate", "method_title": "Shipping", "total": "50.00"}
+            ],
+        }
+    ) is False
 
 
 def test_build_invoice_items_tracks_free_shipping_bundle_metadata(monkeypatch):
