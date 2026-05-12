@@ -33,10 +33,13 @@ PROCESSING_EQUIVALENT_WOO_STATUSES = (
     "pre-hadayek",
     "pre-dokki",
 )
-RECONCILE_ORDER_STATUSES = ",".join(
-    PROCESSING_EQUIVALENT_WOO_STATUSES
-    + ("completed", "cancelled", "refunded", "failed")
+RECONCILE_TARGET_WOO_STATUSES = PROCESSING_EQUIVALENT_WOO_STATUSES + (
+    "completed", "cancelled", "refunded", "failed"
 )
+# Value actually sent to Woo REST API — custom statuses are filtered client-side
+RECONCILE_API_STATUS_FILTER = "any"
+# Local-membership constant (not sent to Woo API). Used for set membership checks and tests.
+RECONCILE_ORDER_STATUSES = ",".join(RECONCILE_TARGET_WOO_STATUSES)
 KASHIER_AUTO_PAY_METHODS = {"Kashier Card", "Kashier Wallet"}
 NON_PAYABLE_WOO_STATUSES = {"cancelled", "refunded", "failed"}
 
@@ -1821,6 +1824,89 @@ def _enqueue_delivery_charge_repost(inv) -> None:
     repost_doc.submit()
 
 
+def _check_and_repair_submitted_invoice_drift(inv, woo_id, territory_name=None, pos_profile=None, default_warehouse=None):
+    """Check if a submitted Sales Invoice has item warehouses that don't match the resolved
+    POS Profile's warehouse. If drift is detected: log it loudly, and optionally repair
+    (controlled by WooCommerce Settings.auto_repair_drift flag, default OFF)."""
+    if not pos_profile or not default_warehouse:
+        return
+
+    try:
+        item_rows = frappe.get_all(
+            "Sales Invoice Item",
+            filters={"parent": inv.name},
+            fields=["name", "warehouse", "item_code"],
+        )
+        drifted = [r for r in item_rows if r.get("warehouse") != default_warehouse]
+        if not drifted:
+            return
+
+        # Drift detected — log it
+        drift_detail = [{"row": r["name"], "item": r["item_code"], "has_wh": r["warehouse"], "want_wh": default_warehouse} for r in drifted]
+        create_sync_log_entry(
+            "DriftDetected",
+            "Warning",
+            frappe.as_json({
+                "invoice": inv.name,
+                "pos_profile": pos_profile,
+                "target_warehouse": default_warehouse,
+                "drifted_rows": len(drifted),
+                "detail": drift_detail,
+            }),
+            woo_order_id=woo_id,
+        )
+        frappe.log_error(
+            title=f"Woo: warehouse drift on submitted invoice {inv.name}",
+            message=frappe.as_json({
+                "woo_order_id": woo_id,
+                "invoice": inv.name,
+                "territory": territory_name,
+                "pos_profile": pos_profile,
+                "target_warehouse": default_warehouse,
+                "drifted_rows": drift_detail,
+            })
+        )
+
+        # Auto-repair if enabled and safe (no Delivery Notes)
+        try:
+            settings = frappe.get_single("WooCommerce Settings")
+            auto_repair = getattr(settings, "auto_repair_drift", None)
+        except Exception:
+            auto_repair = None
+
+        if not auto_repair:
+            return
+
+        # Safety: abort if any Delivery Note references this invoice
+        if frappe.db.exists("Delivery Note Item", {"against_sales_invoice": inv.name}):
+            frappe.log_error(
+                title=f"Woo: drift auto-repair blocked — Delivery Note exists for {inv.name}",
+                message=f"woo_order={woo_id}"
+            )
+            return
+
+        # Repair all drifted rows
+        for r in drifted:
+            frappe.db.set_value("Sales Invoice Item", r["name"], "warehouse", default_warehouse, update_modified=False)
+        frappe.db.set_value("Sales Invoice", inv.name, "set_warehouse", default_warehouse, update_modified=False)
+        frappe.db.commit()
+        create_sync_log_entry(
+            "DriftRepaired",
+            "Success",
+            frappe.as_json({
+                "invoice": inv.name,
+                "repaired_rows": len(drifted),
+                "warehouse": default_warehouse,
+            }),
+            woo_order_id=woo_id,
+        )
+    except Exception as e:
+        try:
+            frappe.log_error(title=f"Woo: drift check failed for {inv.name}", message=str(e))
+        except Exception:
+            pass
+
+
 def _apply_invoice_pos_profile(inv, pos_profile: str | None, *, submitted: bool) -> None:
     if not pos_profile:
         return
@@ -2227,39 +2313,65 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except Exception as ce:  # noqa
         return {"status": "skipped", "reason": f"customer_error:{ce}", "woo_order_id": woo_id}
 
-    # Resolve Territory -> POS Profile and warehouse (with fallback to settings.default_warehouse)
+    # Resolve Territory -> POS Profile -> warehouse.
+    # Warehouse is ALWAYS derived from POS Profile.warehouse — never from settings.default_warehouse.
     territory_name = None
     pos_profile = None
     default_warehouse = None
+    _territory_fallback_used = False
     try:
         territory_name = frappe.db.get_value("Customer", customer, "territory")
         if cache and territory_name:
             td = cache.get_territory_data(territory_name)
             pos_profile = td.get("pos_profile")
-            default_warehouse = td.get("warehouse")
+            # warehouse must come from POS Profile directly, not from territory cache
+            if pos_profile and not td.get("warehouse"):
+                default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse")
+            else:
+                default_warehouse = td.get("warehouse")
         elif territory_name:
             pos_profile = frappe.db.get_value("Territory", territory_name, "pos_profile")
             if pos_profile:
                 default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse")
-        if not default_warehouse:
-            default_warehouse = getattr(settings, "default_warehouse", None)
     except Exception:
         pass
 
-    # Fallback: use Default POS Profile from settings when territory resolution produced nothing
+    # Fallback: use Default POS Profile from settings when territory resolution produced nothing.
+    # This is intentionally loud — fires a frappe.log_error and marks the map for self-heal.
     if not pos_profile:
+        _territory_fallback_used = True
         try:
             fallback = getattr(settings, "default_pos_profile", None)
             if fallback and frappe.db.exists("POS Profile", fallback):
                 pos_profile = fallback
-                if not default_warehouse:
-                    default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse") or default_warehouse
-                frappe.logger().warning(
-                    f"woo_order={woo_id} territory={territory_name!r} unresolved POS Profile; "
-                    f"falling back to default_pos_profile={pos_profile!r}"
+                default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse")
+                frappe.log_error(
+                    title="Woo: territory_unresolved — fallback pos_profile used",
+                    message=frappe.as_json({
+                        "woo_order_id": woo_id,
+                        "customer": customer,
+                        "territory_name": territory_name,
+                        "billing_state": (order.get("billing") or {}).get("state"),
+                        "shipping_state": (order.get("shipping") or {}).get("state"),
+                        "fallback_pos_profile": pos_profile,
+                        "fallback_warehouse": default_warehouse,
+                    })
                 )
         except Exception:
             pass
+
+    # Final guard: if we still have no warehouse (POS Profile missing warehouse field),
+    # derive it by name convention as last resort and log.
+    if pos_profile and not default_warehouse:
+        try:
+            default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse")
+        except Exception:
+            pass
+        if not default_warehouse:
+            frappe.log_error(
+                title="Woo: POS Profile has no warehouse configured",
+                message=f"woo_order={woo_id} pos_profile={pos_profile!r} — items may have NULL warehouse"
+            )
 
     # Resolve ERPNext Price List
     price_list = None
@@ -2366,6 +2478,29 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             inv = candidate_doc
             action = "updated"
             delivery_result = None
+            # PROD-WOO-001: Once a Sales Invoice is submitted (docstatus=1), the inbound
+            # sync must not mutate it in any way — no save, no db_set, no cancel.
+            # ERPNext is the source of truth from submission onwards; all status/delivery
+            # changes flow outbound to Woo via outbound_sync.py hooks.
+            if inv.docstatus == 1:
+                # Before skipping, check for warehouse drift and self-heal if possible.
+                _check_and_repair_submitted_invoice_drift(
+                    inv, woo_id, territory_name=territory_name, pos_profile=pos_profile,
+                    default_warehouse=default_warehouse,
+                )
+                create_sync_log_entry(
+                    "InboundSkip",
+                    "Skipped",
+                    f"submitted_frozen: {inv.name} is submitted; "
+                    f"inbound Woo update blocked (woo_status={woo_status!r})",
+                    woo_order_id=woo_id,
+                )
+                return {
+                    "status": "skipped",
+                    "reason": "submitted_frozen",
+                    "woo_order_id": woo_id,
+                    "invoice": inv.name,
+                }
             try:
                 current_woo_order_id = getattr(inv, "woo_order_id", None)
                 current_woo_order_number = getattr(inv, "woo_order_number", None)
@@ -2629,6 +2764,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "payment_method": order.get("payment_method"),
                 "synced_on": frappe.utils.now_datetime(),
                 "hash": order_hash,
+                "needs_territory_recheck": 1 if _territory_fallback_used else 0,
             })
             map_doc.save(ignore_permissions=True)
         else:
@@ -2708,6 +2844,7 @@ def pull_recent_orders_phase1(
     orderby: str | None = None,
     order: str | None = None,
     max_pages: int = 1,
+    status_filter_set: set[str] | None = None,
 ) -> dict[str, Any]:
     """Pull recent orders from WooCommerce.
     
@@ -2760,8 +2897,16 @@ def pull_recent_orders_phase1(
         params=params,
         max_pages=max_pages,
     )
+    orders_fetched_raw = len(orders)
+    if status_filter_set:
+        orders = [
+            o for o in orders
+            if (o.get("status") or "").strip().lower() in status_filter_set
+        ]
     metrics: dict[str, Any] = {
         "orders_fetched": len(orders),
+        "orders_fetched_raw": orders_fetched_raw,
+        "filtered_out": orders_fetched_raw - len(orders),
         "pages_fetched": pages_fetched,
         "total_pages": total_pages,
         "processed": 0,
@@ -2862,6 +3007,7 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
         "processing",
         "locked",
         "db_locked",
+        "submitted_frozen",  # PROD-WOO-001: submitted SI is intentionally frozen
     }
     result["success"] = result.get("status") in ("created", "updated") or (
         result.get("status") == "skipped" and result.get("reason") in skipped_success_reasons
@@ -2953,17 +3099,20 @@ def reconcile_recent_orders_phase1(
     modified_after = _format_datetime_for_woo(
         datetime.now(timezone.utc) - timedelta(minutes=effective_lookback)
     )
+    effective_api_status = RECONCILE_API_STATUS_FILTER if not statuses else statuses
+    effective_filter_set = set(RECONCILE_TARGET_WOO_STATUSES) if not statuses else None
     result = pull_recent_orders_phase1(
         limit=100,
         dry_run=dry_run,
         force=False,
         allow_update=allow_update,
         is_historical=False,
-        status=statuses or RECONCILE_ORDER_STATUSES,
+        status=effective_api_status,
         modified_after=modified_after,
         orderby="modified",
         order="asc",
         max_pages=effective_max_pages,
+        status_filter_set=effective_filter_set,
     )
     result["lookback_minutes"] = effective_lookback
     return result
@@ -3133,7 +3282,8 @@ def reconcile_recent_orders_cron():  # pragma: no cover - scheduler entry for mi
         {
             "lookback_minutes": lookback_minutes,
             "max_pages": max_pages,
-            "statuses": RECONCILE_ORDER_STATUSES,
+            "api_status_filter": RECONCILE_API_STATUS_FILTER,
+            "target_statuses": list(RECONCILE_TARGET_WOO_STATUSES),
         },
         started_on=started_on,
     )
@@ -3142,7 +3292,6 @@ def reconcile_recent_orders_cron():  # pragma: no cover - scheduler entry for mi
         result = reconcile_recent_orders_phase1(
             lookback_minutes=lookback_minutes,
             dry_run=False,
-            statuses=RECONCILE_ORDER_STATUSES,
             max_pages=max_pages,
             allow_update=True,
         )

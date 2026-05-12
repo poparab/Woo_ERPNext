@@ -303,7 +303,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         _lock_acquired = _lock.acquire(blocking=True)
     except Exception:
         _lock = None
-        _lock_acquired = True  # proceed without lock if Redis unavailable
+        _lock_acquired = False  # Redis unavailable — _safe_insert_customer is the recovery safeguard
 
     try:
         if _lock_acquired:
@@ -402,9 +402,16 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
         doc = frappe.get_doc(fields)
         doc.flags.ignore_woo_outbound = True
         with _suppress_woo_outbound():
-            doc.insert(ignore_permissions=True)
-        _cache_customer(customer_cache, doc.name, woo_customer_id, username, phone_norm, email)
-        return doc.name
+            inserted_name = _safe_insert_customer(
+                doc,
+                woo_customer_id=woo_customer_id,
+                username=username,
+                phone_norm=phone_norm,
+                email=email,
+                order_id=order_id,
+            )
+        _cache_customer(customer_cache, inserted_name, woo_customer_id, username, phone_norm, email)
+        return inserted_name
 
     finally:
         if _lock is not None and _lock_acquired:
@@ -426,6 +433,63 @@ def _cache_customer(cache: dict | None, name: str, woo_cid, username, phone, ema
         cache[f"phone:{phone}"] = name
     if email:
         cache[f"email:{email}"] = name
+
+
+def _safe_insert_customer(
+    doc,
+    *,
+    woo_customer_id: Optional[int | str],
+    username: Optional[str],
+    phone_norm: Optional[str],
+    email: Optional[str],
+    order_id: Optional[int],
+) -> str:
+    """Insert a Customer doc with duplicate-key race recovery.
+
+    On a DuplicateEntryError the savepoint is rolled back and the full
+    identifier-priority lookup chain is re-run to return the Customer already
+    inserted by a concurrent worker.  If no match is found after recovery
+    (genuine non-race name collision) the customer_name is suffixed with
+    the order_id and retried once before raising.
+    """
+    sp = "woo_cust_ins"
+    try:
+        frappe.db.savepoint(sp)
+        doc.insert(ignore_permissions=True)
+        frappe.db.release_savepoint(sp)
+        return doc.name
+    except frappe.DuplicateEntryError:
+        frappe.db.rollback(save_point=sp)
+        frappe.logger("woo").info(
+            f"recovered_from_race customer woo_cid={woo_customer_id} order={order_id}"
+        )
+        # Re-run priority lookup to find what the racing worker created.
+        if woo_customer_id and _field_exists("Customer", "woo_customer_id"):
+            found = find_customer_by_woo_id(woo_customer_id)
+            if found:
+                return found
+        if phone_norm:
+            found = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
+            if not found and _field_exists("Customer", "phone"):
+                found = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+            if found:
+                return found
+        if username and _field_exists("Customer", "woo_username"):
+            found = frappe.db.get_value("Customer", {"woo_username": username}, "name")
+            if found:
+                return found
+        if email:
+            found = frappe.db.get_value("Customer", {"email_id": email}, "name")
+            if found:
+                return found
+        # Genuine non-race collision on the generated name — suffix once and retry.
+        suffix = f"-{order_id}" if order_id else "-dup"
+        doc.customer_name = f"{doc.customer_name}{suffix}"
+        doc.insert(ignore_permissions=True)
+        frappe.logger("woo").warning(
+            f"customer_name_suffix_applied customer='{doc.name}' order={order_id}"
+        )
+        return doc.name
 
 
 def _normalize_address_text(value: Any) -> str:
@@ -641,7 +705,8 @@ def _resolve_territory_from_state(state_value: str | None, territory_state_cache
     if not state_value:
         return None
     
-    state_value = state_value.strip()
+    import unicodedata
+    state_value = unicodedata.normalize("NFC", state_value).strip()
     if not state_value:
         return None
 
@@ -675,6 +740,21 @@ def _resolve_territory_from_state(state_value: str | None, territory_state_cache
                     result = code
                     break
     
+    if not result:
+        # Try matching against the Arabic part of the display value (e.g. "الهرم" matches "Haram - الهرم")
+        import unicodedata
+        state_normalized = unicodedata.normalize("NFC", state_value).strip()
+        for code, display in CODE_TO_DISPLAY.items():
+            parts = display.split(" - ")
+            for part in parts:
+                part_normalized = unicodedata.normalize("NFC", part).strip()
+                if state_normalized == part_normalized:
+                    if frappe.db.exists("Territory", code):
+                        result = code
+                        break
+            if result:
+                break
+
     if not result:
         # Try exact match against territory name directly (for territories not in CODE_TO_DISPLAY)
         if frappe.db.exists("Territory", {"territory_name": state_value, "is_group": 0}):
@@ -710,7 +790,45 @@ def _resolve_territory_from_state(state_value: str | None, territory_state_cache
     return result
 
 
-def _create_address(customer: str, address_type: str, data: dict, phone: str | None, email: str | None) -> str:
+def _safe_insert_address(
+    addr_doc,
+    *,
+    customer: str,
+    data: dict,
+    order_id: Optional[int],
+) -> str:
+    """Insert an Address doc with duplicate-key race recovery.
+
+    On a DuplicateEntryError the savepoint is rolled back and
+    _find_existing_address_for_customer is re-run to return the Address
+    already inserted by a concurrent worker.  If still not found the
+    address_title is suffixed once and retried before raising.
+    """
+    sp = "woo_addr_ins"
+    try:
+        frappe.db.savepoint(sp)
+        addr_doc.insert(ignore_permissions=True)
+        frappe.db.release_savepoint(sp)
+        return addr_doc.name
+    except frappe.DuplicateEntryError:
+        frappe.db.rollback(save_point=sp)
+        frappe.logger("woo").info(
+            f"recovered_from_race address customer={customer} order={order_id}"
+        )
+        found = _find_existing_address_for_customer(customer, addr_doc.address_type, data)
+        if found:
+            return found
+        # Genuine collision — suffix address_title once and retry.
+        suffix = f"-{order_id}" if order_id else "-dup"
+        addr_doc.address_title = f"{addr_doc.address_title}{suffix}"
+        addr_doc.insert(ignore_permissions=True)
+        frappe.logger("woo").warning(
+            f"address_title_suffix_applied address='{addr_doc.name}' order={order_id}"
+        )
+        return addr_doc.name
+
+
+def _create_address(customer: str, address_type: str, data: dict, phone: str | None, email: str | None, order_id: int | None = None) -> str:
     country_val = _resolve_country(data.get("country"))
     city_val = (data.get("city") or "").strip() or (data.get("state") or "").strip() or "Unknown"
     # Truncate address fields to ERPNext's 240-char limit and accept line2-only source addresses.
@@ -734,8 +852,31 @@ def _create_address(customer: str, address_type: str, data: dict, phone: str | N
             }
         ],
     })
-    addr.insert(ignore_permissions=True)
-    return addr.name
+    # Best-effort Redis lock to minimise duplicate insert attempts before
+    # falling through to the savepoint-based recovery in _safe_insert_address.
+    _alock = None
+    _alock_acquired = False
+    try:
+        from frappe.utils.background_jobs import get_redis_conn as _get_redis
+        _r = _get_redis()
+        _alock = _r.lock(f"woo-address-lock:{customer}:{address_type}", timeout=30, blocking_timeout=10)
+        _alock_acquired = _alock.acquire(blocking=True)
+    except Exception:
+        _alock = None
+        _alock_acquired = False
+    try:
+        if _alock_acquired:
+            # Re-check under lock: another worker may have already created this address.
+            _recheck = _find_existing_address_for_customer(customer, address_type, data)
+            if _recheck:
+                return _recheck
+        return _safe_insert_address(addr, customer=customer, data=data, order_id=order_id)
+    finally:
+        if _alock is not None and _alock_acquired:
+            try:
+                _alock.release()
+            except Exception:
+                pass
 
 
 def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict | None = None, address_cache: dict | None = None, territory_state_cache: dict | None = None) -> Tuple[str, str | None, str | None]:
@@ -767,7 +908,8 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
 
     # Extract WooCommerce customer ID from order for idempotent lookups
     woo_customer_id = order.get("customer_id") if isinstance(order.get("customer_id"), int) and order.get("customer_id") > 0 else None
-    
+    order_id = order.get("id") if isinstance(order.get("id"), int) else None
+
     customer = _ensure_customer(email, billing.get("first_name"), billing.get("last_name"), order.get("id"), username=username, phone=phone, woo_customer_id=woo_customer_id, customer_cache=customer_cache)
 
     billing_addr_name = None
@@ -779,7 +921,7 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     # Ensure billing address if present
     if _has_usable_source_address(billing):
         existing = _find_existing_address_for_customer(customer, "Billing", billing, address_cache=address_cache)
-        billing_addr_name = existing or _create_address(customer, "Billing", billing, billing.get("phone"), email)
+        billing_addr_name = existing or _create_address(customer, "Billing", billing, billing.get("phone"), email, order_id)
         # Set as default billing address for this customer
         if billing_addr_name:
             _set_address_as_default(billing_addr_name, customer, "Billing")
@@ -794,7 +936,7 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     elif _has_usable_source_address(shipping):
         # Different address — create/find shipping separately
         existing = _find_existing_address_for_customer(customer, "Shipping", shipping, address_cache=address_cache)
-        shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email)
+        shipping_addr_name = existing or _create_address(customer, "Shipping", shipping, billing.get("phone") or shipping.get("phone"), email, order_id)
         # Set as default shipping address for this customer
         if shipping_addr_name:
             _set_address_as_default(shipping_addr_name, customer, "Shipping")

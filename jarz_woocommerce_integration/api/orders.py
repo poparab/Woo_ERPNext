@@ -6,7 +6,6 @@ from typing import Any
 
 import frappe
 from jarz_woocommerce_integration.services.order_sync import (
-    RECONCILE_ORDER_STATUSES,
     backfill_orders_by_ids_phase1,
     create_sync_log_entry,
     finish_sync_log_entry,
@@ -138,7 +137,7 @@ def backfill_order_ids_phase1(
 def reconcile_recent_phase1(
     lookback_minutes: int = 0,
     dry_run: int = 0,
-    statuses: str = RECONCILE_ORDER_STATUSES,
+    statuses: str = "",
     max_pages: int = 0,
     allow_update: int = 1,
 ):
@@ -146,7 +145,7 @@ def reconcile_recent_phase1(
     data = reconcile_recent_orders_phase1(
         lookback_minutes=int(lookback_minutes or 0) or None,
         dry_run=bool(int(dry_run)),
-        statuses=statuses or RECONCILE_ORDER_STATUSES,
+        statuses=statuses or None,
         max_pages=int(max_pages or 0) or None,
         allow_update=bool(int(allow_update)),
     )
