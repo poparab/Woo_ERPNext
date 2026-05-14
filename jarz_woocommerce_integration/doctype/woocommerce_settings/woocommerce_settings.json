@@ -15,6 +15,7 @@
   "webhook_secret",
   "section_inbound",
   "enable_inbound_orders",
+  "enable_inbound_amendment",
   "default_pos_profile",
     "live_order_overlap_minutes",
     "live_order_max_pages",
@@ -107,6 +108,13 @@
    "fieldname": "enable_inbound_orders",
    "fieldtype": "Check",
    "label": "Enable Inbound Order Sync"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_inbound_amendment",
+   "fieldtype": "Check",
+   "label": "Enable Inbound Order Amendment",
+   "description": "When ON, item edits on WooCommerce orders will trigger a cancel + recreate of the ERPNext Sales Invoice. Keep OFF until the feature is tested in staging."
   },
   {
    "fieldname": "default_pos_profile",

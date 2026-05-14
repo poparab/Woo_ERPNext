@@ -587,12 +587,36 @@ def _compute_order_hash(order: dict) -> str:
     import hashlib
     import json as _json
 
+    line_items = order.get("line_items") or []
+    line_fingerprints = [
+        {
+            "product_id": item.get("product_id"),
+            "variation_id": item.get("variation_id"),
+            "quantity": item.get("quantity"),
+            "total": item.get("total"),
+            "subtotal": item.get("subtotal"),
+        }
+        for item in sorted(
+            line_items,
+            key=lambda x: (x.get("product_id") or 0, x.get("variation_id") or 0),
+        )
+    ]
+    shipping_lines = order.get("shipping_lines") or []
+    shipping_total = sum(
+        float(s.get("total") or 0) for s in shipping_lines if s.get("total")
+    )
+    billing = order.get("billing") or {}
+    shipping = order.get("shipping") or {}
     payload = {
         "id": order.get("id"),
         "total": order.get("total"),
         "currency": order.get("currency"),
         "status": order.get("status"),
-        "line_count": len(order.get("line_items") or []),
+        "payment_method": order.get("payment_method"),
+        "shipping_total": f"{shipping_total:.2f}",
+        "billing_postcode": billing.get("postcode"),
+        "shipping_postcode": shipping.get("postcode"),
+        "lines": line_fingerprints,
         "updated": order.get("date_modified") or order.get("date_created"),
     }
     b = _json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -1824,6 +1848,28 @@ def _enqueue_delivery_charge_repost(inv) -> None:
     repost_doc.submit()
 
 
+def _flag_order_map_for_manual_review(*, woo_id: int, invoice_name: str, reason: str) -> None:
+    """Set needs_manual_review on the WooCommerce Order Map row for this order."""
+    try:
+        map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_id}, "name")
+        if map_name:
+            frappe.db.set_value(
+                "WooCommerce Order Map",
+                map_name,
+                {
+                    "needs_manual_review": 1,
+                    "manual_review_reason": reason,
+                    "manual_review_logged_on": frappe.utils.now_datetime(),
+                },
+                update_modified=False,
+            )
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"_flag_order_map_for_manual_review failed for woo_id={woo_id}",
+        )
+
+
 def _check_and_repair_submitted_invoice_drift(inv, woo_id, territory_name=None, pos_profile=None, default_warehouse=None):
     """Check if a submitted Sales Invoice has item warehouses that don't match the resolved
     POS Profile's warehouse. If drift is detected: log it loudly, and optionally repair
@@ -2134,7 +2180,7 @@ def _maybe_create_payment_entry_for_invoice(
             pass
 
 
-def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None, skip_payment_entry: bool = False) -> dict:
+def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None, skip_payment_entry: bool = False, amended_from: "str | None" = None) -> dict:
     """Process a single Woo order into a Sales Invoice.
     
     Args:
@@ -2488,6 +2534,99 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     inv, woo_id, territory_name=territory_name, pos_profile=pos_profile,
                     default_warehouse=default_warehouse,
                 )
+
+                # --- OFD permanent hard-lock -----------------------------------------
+                # Once an invoice has ever reached "Out for Delivery", it may no longer
+                # be amended by any automated path (POS or Woo).  The check uses the
+                # permanent flag `custom_was_out_for_delivery` set by a hooks handler
+                # whenever the state first transitions to that value.  Falling back to
+                # the live state catches the rare race where the flag was not yet persisted.
+                inv_state = str(inv.get("custom_sales_invoice_state") or "").strip()
+                was_ofd = bool(int(inv.get("custom_was_out_for_delivery") or 0))
+                if was_ofd or inv_state == "Out for Delivery":
+                    create_sync_log_entry(
+                        "InboundSkip",
+                        "Skipped",
+                        f"out_for_delivery_locked: {inv.name} is permanently locked "
+                        f"(was_ofd={was_ofd}, state={inv_state!r}); woo_status={woo_status!r}",
+                        woo_order_id=woo_id,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "out_for_delivery_locked",
+                        "woo_order_id": woo_id,
+                        "invoice": inv.name,
+                    }
+                # --- Item-edit detection / amendment gate ----------------------------
+                # Compute the hash of the incoming Woo payload and compare it with the
+                # stored hash on the Order Map.  A mismatch means the order was edited
+                # after it was already submitted in ERPNext — trigger the amendment flow
+                # when the feature flag is ON; otherwise flag for manual review.
+                new_hash = _compute_order_hash(order)
+                stored_hash = (existing_map or {}).get("hash") or ""
+                hash_changed = new_hash != stored_hash
+
+                amendment_statuses = {"processing", "on-hold"}
+                can_auto_amend = (
+                    hash_changed
+                    and woo_status in amendment_statuses
+                    and bool(int(getattr(settings, "enable_inbound_amendment", None) or 0))
+                )
+
+                if hash_changed:
+                    if can_auto_amend:
+                        # Enqueue the amendment job and return immediately.  The job
+                        # itself will relink the Order Map and create the new invoice.
+                        frappe.enqueue(
+                            "jarz_woocommerce_integration.services.order_amendment.run_woo_amendment_job",
+                            woo_order_id=woo_id,
+                            order_payload=order,
+                            settings_name=getattr(settings, "name", None) or "WooCommerce Settings",
+                            queue="default",
+                            timeout=300,
+                            is_async=True,
+                            now=False,
+                        )
+                        create_sync_log_entry(
+                            "ItemEditDetected",
+                            "Queued",
+                            f"hash mismatch on submitted invoice {inv.name}; "
+                            f"amendment job enqueued (woo_status={woo_status!r})",
+                            woo_order_id=woo_id,
+                        )
+                        return {
+                            "status": "queued",
+                            "reason": "amendment_enqueued",
+                            "woo_order_id": woo_id,
+                            "invoice": inv.name,
+                        }
+                    else:
+                        # Flag the Order Map for manual review.
+                        _flag_order_map_for_manual_review(
+                            woo_id=woo_id,
+                            invoice_name=inv.name,
+                            reason=(
+                                f"Item edit detected (hash changed) but auto-amendment "
+                                f"blocked: enable_inbound_amendment=off or "
+                                f"woo_status={woo_status!r} not in {sorted(amendment_statuses)}"
+                            ),
+                        )
+                        create_sync_log_entry(
+                            "ItemEditDetected",
+                            "NeedsReview",
+                            f"hash mismatch on submitted invoice {inv.name}; "
+                            f"flagged for manual review (woo_status={woo_status!r}, "
+                            f"enable_inbound_amendment="
+                            f"{getattr(settings, 'enable_inbound_amendment', 0)!r})",
+                            woo_order_id=woo_id,
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "needs_manual_review",
+                            "woo_order_id": woo_id,
+                            "invoice": inv.name,
+                        }
+
                 create_sync_log_entry(
                     "InboundSkip",
                     "Skipped",
@@ -2700,6 +2839,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             if attribution:
                 inv_data.update(attribution)
 
+            # Wire amendment chain if this creation is the replacement for a cancelled invoice
+            if amended_from:
+                inv_data["amended_from"] = amended_from
+
             inv = frappe.get_doc(inv_data)
             try:
                 if pos_profile:
@@ -2724,6 +2867,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 )
             except Exception:
                 pass
+            # Suppress outbound push to Woo when this invoice is being created as the
+            # replacement in a Woo-initiated amendment — Woo already has the latest state.
+            if amended_from:
+                inv.flags.skip_woo_outbound_after_amend = True
             inv.insert(ignore_permissions=True)
             if status_map["docstatus"] == 1:
                 _submit_invoice_with_accounting_guards(inv, pos_profile=pos_profile)

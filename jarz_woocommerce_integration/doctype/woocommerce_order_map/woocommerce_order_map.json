@@ -25,7 +25,10 @@
     "synced_on",
     "hash",
     "needs_territory_recheck",
-    "last_territory_error"
+    "last_territory_error",
+    "needs_manual_review",
+    "manual_review_reason",
+    "manual_review_logged_on"
   ],
   "fields": [
   {"fieldname": "woo_order_id", "fieldtype": "Int", "label": "Woo Order ID", "reqd": 1, "unique": 1},
@@ -38,7 +41,10 @@
     {"fieldname": "synced_on", "fieldtype": "Datetime", "label": "Synced On", "read_only": 1},
     {"fieldname": "hash", "fieldtype": "Data", "label": "Hash"},
     {"fieldname": "needs_territory_recheck", "fieldtype": "Check", "label": "Needs Territory Recheck", "default": "0", "in_list_view": 0, "read_only": 0},
-    {"fieldname": "last_territory_error", "fieldtype": "Small Text", "label": "Last Territory Error", "read_only": 1}
+    {"fieldname": "last_territory_error", "fieldtype": "Small Text", "label": "Last Territory Error", "read_only": 1},
+    {"fieldname": "needs_manual_review", "fieldtype": "Check", "label": "Needs Manual Review", "default": "0", "in_list_view": 0, "read_only": 0},
+    {"fieldname": "manual_review_reason", "fieldtype": "Small Text", "label": "Manual Review Reason", "read_only": 1},
+    {"fieldname": "manual_review_logged_on", "fieldtype": "Datetime", "label": "Manual Review Logged On", "read_only": 1}
   ],
   "permissions": [
     {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1, "export": 1, "report": 1, "print": 1, "email": 1, "share": 1},

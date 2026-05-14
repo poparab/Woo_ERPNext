@@ -1809,6 +1809,11 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     if getattr(invoice.flags, "ignore_woo_outbound", False) or getattr(frappe.flags, "ignore_woo_outbound", False):
         return {"skipped": True, "reason": "inbound"}
 
+    # When the invoice was just created as the replacement half of a Woo-initiated
+    # amendment, Woo already holds the authoritative state — suppress the outbound push.
+    if getattr(invoice.flags, "skip_woo_outbound_after_amend", False):
+        return {"skipped": True, "reason": "amendment_no_push"}
+
     _woo_id = invoice.get("woo_order_id") or _recover_amended_invoice_woo_order_id(invoice)
     order_map_exists = bool(_woo_id and frappe.db.exists("WooCommerce Order Map", {"woo_order_id": _woo_id}))
 
