@@ -1917,6 +1917,31 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
 
     woo_id = response.get("id") if isinstance(response, dict) else None
     woo_number = response.get("number") if isinstance(response, dict) else None
+
+    # --- Verify WooCommerce accepted the desired status ------------------
+    # Some WordPress plugins (e.g. delivery management) silently override the
+    # status in the same PUT response.  If the response status doesn't match
+    # what we sent, do not mark as Synced — flag as error so the reconcile
+    # will retry.
+    actual_woo_status = (response.get("status") or "") if isinstance(response, dict) else ""
+    desired_woo_status = payload.get("status") or ""
+    if actual_woo_status and desired_woo_status and actual_woo_status != desired_woo_status:
+        LOGGER.warning({
+            "event": "woo_outbound_status_mismatch",
+            "invoice": invoice_name,
+            "desired_status": desired_woo_status,
+            "actual_status": actual_woo_status,
+            "woo_order_id": woo_order_id,
+            "reason": reason,
+        })
+        _mark_invoice_status(
+            invoice_name,
+            status="error",
+            error=f"WooCommerce returned status={actual_woo_status!r}; expected {desired_woo_status!r}",
+        )
+        return {"status": "error", "detail": f"status_mismatch:{actual_woo_status}"}
+    # ---------------------------------------------------------------------
+
     updates = {
         "woo_outbound_status": "Synced",
         "woo_outbound_error": "",

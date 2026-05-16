@@ -2544,6 +2544,24 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 inv_state = str(inv.get("custom_sales_invoice_state") or "").strip()
                 was_ofd = bool(int(inv.get("custom_was_out_for_delivery") or 0))
                 if was_ofd or inv_state == "Out for Delivery":
+                    # If the invoice is *currently* "Out for Delivery" in ERPNext but
+                    # WooCommerce shows a different status, a delivery-management plugin
+                    # has silently reverted the order.  Mark woo_outbound_status=error so
+                    # the outbound reconcile (runs every hour) re-pushes "out-for-delivery"
+                    # back to WooCommerce.
+                    if inv_state == "Out for Delivery" and woo_status and woo_status != "out-for-delivery":
+                        frappe.db.set_value(
+                            "Sales Invoice",
+                            inv.name,
+                            "woo_outbound_status",
+                            "error",
+                            update_modified=False,
+                        )
+                        frappe.logger().info(
+                            f"woo_ofd_revert_detected: {inv.name} is OFD in ERPNext but "
+                            f"WooCommerce shows {woo_status!r}; marked outbound status=error "
+                            f"to trigger re-push (woo_order_id={woo_id})"
+                        )
                     create_sync_log_entry(
                         "InboundSkip",
                         "Skipped",
