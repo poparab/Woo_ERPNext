@@ -13,6 +13,23 @@ def compute_sig(secret: str, payload: bytes) -> str:
     return base64.b64encode(hmac.new(secret.encode(), payload, hashlib.sha256).digest()).decode()
 
 
+def resolve_webhook_secret(settings) -> str:
+    try:
+        from frappe.utils.password import get_decrypted_password
+    except Exception:  # noqa: BLE001
+        get_decrypted_password = None
+
+    if get_decrypted_password:
+        try:
+            secret = get_decrypted_password("WooCommerce Settings", settings.name, "webhook_secret") or ""
+            if secret:
+                return secret
+        except Exception:  # noqa: BLE001
+            pass
+
+    return getattr(settings, "webhook_secret", None) or "testsecret"
+
+
 def test_order_webhook_ack():
     # Simulate handshake (no id) should ACK even without signature
     resp = frappe.get_attr("jarz_woocommerce_integration.jarz_woocommerce_integration.api.orders.woo_order_webhook")()  # type: ignore
@@ -21,7 +38,7 @@ def test_order_webhook_ack():
 
 def test_order_webhook_process(monkeypatch):  # pragma: no cover - environment dependent
     settings = frappe.get_single("WooCommerce Settings")
-    secret = getattr(settings, "webhook_secret", None) or "testsecret"
+    secret = resolve_webhook_secret(settings)
     order_payload = {"id": 999999, "status": "processing", "line_items": []}
     raw = json.dumps(order_payload).encode()
     sig = compute_sig(secret, raw)
