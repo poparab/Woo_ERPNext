@@ -342,6 +342,55 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
         except Exception:  # noqa: BLE001
             pass
 
+    from jarz_woocommerce_integration.services import sync_events
+
+    if sync_events.should_use_order_webhook_inbox(settings):
+        try:
+            event = sync_events.create_inbound_order_event(
+                payload,
+                event_type="order_webhook",
+                payload_hash=payload_hash,
+                sync_log=receipt_log,
+            )
+            frappe.db.commit()
+        except Exception:  # noqa: BLE001
+            frappe.logger().error({
+                "event": "woo_order_webhook_event_insert_error",
+                "order_id": order_id,
+                "traceback": frappe.get_traceback(),
+            })
+            finish_sync_log_entry(
+                receipt_log,
+                "InboxPersistFailed",
+                {
+                    "order_id": order_id,
+                    "topic": topic_header,
+                    "payload_hash": payload_hash,
+                },
+                traceback=frappe.get_traceback(),
+                started_on=receipt_started,
+            )
+            frappe.local.response.http_status_code = 503
+            return {"success": False, "queued": False, "error": "event_insert_failed"}
+
+        if not sync_events.is_shadow_mode_enabled(settings):
+            sync_events.enqueue_sync_event(event.name, after_commit=False)
+            finish_sync_log_entry(
+                receipt_log,
+                "Queued",
+                {
+                    "order_id": order_id,
+                    "topic": topic_header,
+                    "payload_hash": payload_hash,
+                    "event_name": event.name,
+                },
+                started_on=receipt_started,
+            )
+            resp = {"success": True, "queued": True, "event_name": event.name}
+            if debug_flag:
+                resp["debug"] = {"payload_hash": payload_hash}
+            return resp
+
     job_name = f"woo_order_{order_id}_{frappe.utils.now_datetime().isoformat()}"
     try:
         frappe.enqueue(
@@ -364,6 +413,7 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
                 "topic": topic_header,
                 "payload_hash": payload_hash,
                 "job_name": job_name,
+                **({"event_name": event.name} if sync_events.should_use_order_webhook_inbox(settings) else {}),
             },
             started_on=receipt_started,
         )

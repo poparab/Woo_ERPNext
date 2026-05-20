@@ -1,0 +1,300 @@
+{
+  "doctype": "DocType",
+  "name": "WooCommerce Sync Event",
+  "module": "Jarz WooCommerce Integration",
+  "custom": 0,
+  "istable": 0,
+  "editable_grid": 0,
+  "engine": "InnoDB",
+  "quick_entry": 0,
+  "is_tree": 0,
+  "show_preview_popup": 0,
+  "issingle": 0,
+  "is_submittable": 0,
+  "index_web_pages_for_search": 0,
+  "actions": [],
+  "links": [],
+  "allow_import": 0,
+  "allow_rename": 0,
+  "autoname": "WOOEVT-.#####",
+  "sort_field": "modified",
+  "sort_order": "DESC",
+  "search_fields": "direction,event_type,status,source_id,woo_order_id,local_docname,idempotency_key",
+  "field_order": [
+    "core_section",
+    "direction",
+    "event_type",
+    "status",
+    "priority",
+    "timing_section",
+    "first_seen_on",
+    "started_on",
+    "completed_on",
+    "next_attempt_at",
+    "attempt_count",
+    "max_attempts",
+    "locked_by",
+    "locked_until",
+    "correlation_id",
+    "link_section",
+    "source_system",
+    "target_system",
+    "object_type",
+    "source_id",
+    "woo_order_id",
+    "woo_customer_id",
+    "local_doctype",
+    "local_docname",
+    "idempotency_key",
+    "payload_hash",
+    "manual_review_reason",
+    "sync_log",
+    "parent_event",
+    "payload_section",
+    "payload_json",
+    "desired_state_json",
+    "remote_response_json",
+    "result_section",
+    "last_error",
+    "traceback"
+  ],
+  "fields": [
+    {
+      "fieldname": "core_section",
+      "fieldtype": "Section Break",
+      "label": "Core"
+    },
+    {
+      "fieldname": "direction",
+      "fieldtype": "Select",
+      "label": "Direction",
+      "options": "\nInbound\nOutbound",
+      "reqd": 1,
+      "in_list_view": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "event_type",
+      "fieldtype": "Data",
+      "label": "Event Type",
+      "reqd": 1,
+      "in_list_view": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "status",
+      "fieldtype": "Select",
+      "label": "Status",
+      "options": "\nPending\nProcessing\nSucceeded\nRetryScheduled\nSkipped\nSuperseded\nNeedsReview\nDeadLetter",
+      "default": "Pending",
+      "reqd": 1,
+      "in_list_view": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "priority",
+      "fieldtype": "Int",
+      "label": "Priority",
+      "default": "50",
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "timing_section",
+      "fieldtype": "Section Break",
+      "label": "Timing"
+    },
+    {
+      "fieldname": "first_seen_on",
+      "fieldtype": "Datetime",
+      "label": "First Seen On",
+      "read_only": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "started_on",
+      "fieldtype": "Datetime",
+      "label": "Started On",
+      "read_only": 1
+    },
+    {
+      "fieldname": "completed_on",
+      "fieldtype": "Datetime",
+      "label": "Completed On",
+      "read_only": 1
+    },
+    {
+      "fieldname": "next_attempt_at",
+      "fieldtype": "Datetime",
+      "label": "Next Attempt At",
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "attempt_count",
+      "fieldtype": "Int",
+      "label": "Attempt Count",
+      "default": "0",
+      "read_only": 1
+    },
+    {
+      "fieldname": "max_attempts",
+      "fieldtype": "Int",
+      "label": "Max Attempts",
+      "default": "8"
+    },
+    {
+      "fieldname": "locked_by",
+      "fieldtype": "Data",
+      "label": "Locked By",
+      "read_only": 1
+    },
+    {
+      "fieldname": "locked_until",
+      "fieldtype": "Datetime",
+      "label": "Locked Until",
+      "read_only": 1
+    },
+    {
+      "fieldname": "correlation_id",
+      "fieldtype": "Data",
+      "label": "Correlation ID"
+    },
+    {
+      "fieldname": "link_section",
+      "fieldtype": "Section Break",
+      "label": "References"
+    },
+    {
+      "fieldname": "source_system",
+      "fieldtype": "Data",
+      "label": "Source System"
+    },
+    {
+      "fieldname": "target_system",
+      "fieldtype": "Data",
+      "label": "Target System"
+    },
+    {
+      "fieldname": "object_type",
+      "fieldtype": "Data",
+      "label": "Object Type",
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "source_id",
+      "fieldtype": "Data",
+      "label": "Source ID",
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "woo_order_id",
+      "fieldtype": "Int",
+      "label": "Woo Order ID",
+      "in_list_view": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "woo_customer_id",
+      "fieldtype": "Data",
+      "label": "Woo Customer ID"
+    },
+    {
+      "fieldname": "local_doctype",
+      "fieldtype": "Link",
+      "label": "Local DocType",
+      "options": "DocType"
+    },
+    {
+      "fieldname": "local_docname",
+      "fieldtype": "Data",
+      "label": "Local Docname"
+    },
+    {
+      "fieldname": "idempotency_key",
+      "fieldtype": "Data",
+      "label": "Idempotency Key",
+      "unique": 1,
+      "reqd": 1
+    },
+    {
+      "fieldname": "payload_hash",
+      "fieldtype": "Data",
+      "label": "Payload Hash"
+    },
+    {
+      "fieldname": "manual_review_reason",
+      "fieldtype": "Small Text",
+      "label": "Manual Review Reason"
+    },
+    {
+      "fieldname": "sync_log",
+      "fieldtype": "Link",
+      "label": "Sync Log",
+      "options": "WooCommerce Sync Log"
+    },
+    {
+      "fieldname": "parent_event",
+      "fieldtype": "Link",
+      "label": "Parent Event",
+      "options": "WooCommerce Sync Event"
+    },
+    {
+      "fieldname": "payload_section",
+      "fieldtype": "Section Break",
+      "label": "Payload"
+    },
+    {
+      "fieldname": "payload_json",
+      "fieldtype": "Long Text",
+      "label": "Payload JSON"
+    },
+    {
+      "fieldname": "desired_state_json",
+      "fieldtype": "Long Text",
+      "label": "Desired State JSON"
+    },
+    {
+      "fieldname": "remote_response_json",
+      "fieldtype": "Long Text",
+      "label": "Remote Response JSON",
+      "read_only": 1
+    },
+    {
+      "fieldname": "result_section",
+      "fieldtype": "Section Break",
+      "label": "Result"
+    },
+    {
+      "fieldname": "last_error",
+      "fieldtype": "Small Text",
+      "label": "Last Error",
+      "read_only": 1
+    },
+    {
+      "fieldname": "traceback",
+      "fieldtype": "Long Text",
+      "label": "Traceback",
+      "read_only": 1
+    }
+  ],
+  "permissions": [
+    {
+      "role": "System Manager",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1,
+      "export": 1,
+      "report": 1,
+      "print": 1,
+      "email": 1,
+      "share": 1
+    },
+    {
+      "role": "Administrator",
+      "read": 1,
+      "write": 1,
+      "create": 1,
+      "delete": 1
+    }
+  ]
+}

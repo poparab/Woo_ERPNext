@@ -195,6 +195,36 @@ def woo_customer_webhook():  # pragma: no cover - network entrypoint
         return base_ack
 
     headers = {k: v for k, v in (frappe.request.headers or {}).items()}
+    payload_hash = hashlib.sha256(raw_body).hexdigest() if raw_body else ""
+
+    from jarz_woocommerce_integration.services import sync_events
+
+    if sync_events.should_use_customer_webhook_inbox(settings):
+        try:
+            event = sync_events.create_inbound_customer_event(
+                payload,
+                payload_hash=payload_hash,
+                headers=headers,
+            )
+            frappe.db.commit()
+        except Exception:  # noqa: BLE001
+            frappe.logger().error(
+                {
+                    "event": "woo_customer_webhook_event_insert_error",
+                    "customer_id": payload.get("id"),
+                    "traceback": frappe.get_traceback(),
+                }
+            )
+            frappe.local.response.http_status_code = 503
+            return {"success": False, "queued": False, "error": "event_insert_failed"}
+
+        if not sync_events.is_shadow_mode_enabled(settings):
+            sync_events.enqueue_sync_event(event.name, after_commit=False)
+            resp = {"success": True, "queued": True, "event_name": event.name}
+            if debug_flag:
+                resp["debug"] = {"body_len": len(raw_body), "payload_hash": payload_hash}
+            return resp
+
     job_name = f"woo_customer_{payload.get('id')}_{now_datetime().isoformat()}"
     frappe.enqueue(
         _enqueue_customer_process,
@@ -209,6 +239,7 @@ def woo_customer_webhook():  # pragma: no cover - network entrypoint
             "event": "woo_customer_webhook_enqueued",
             "customer_id": payload.get("id"),
             "job_name": job_name,
+            **({"shadow_event": event.name} if sync_events.should_use_customer_webhook_inbox(settings) else {}),
         }
     )
     resp = {"success": True, "queued": True, "job_name": job_name}

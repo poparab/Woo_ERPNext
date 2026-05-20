@@ -256,6 +256,62 @@ class TestOutboundStatusSync(unittest.TestCase):
     def setUp(self):
         self.patcher = unittest.mock.patch
 
+    def test_enqueue_customer_sync_routes_to_event_outbox_when_enabled(self):
+        customer = DummyCustomer()
+        enqueue_calls = []
+        event_enqueue_calls = []
+        fake_event = SimpleNamespace(name="WOOEVT-00011")
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(enable_sync_event_ledger=1), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.should_use_customer_outbox", return_value=True), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.create_outbound_customer_event", return_value=fake_event) as create_event, \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.is_shadow_mode_enabled", return_value=False), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.enqueue_sync_event", side_effect=lambda *args, **kwargs: event_enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_customer_sync(customer, method="after_insert")
+
+        self.assertEqual(enqueue_calls, [])
+        create_event.assert_called_once()
+        self.assertEqual(event_enqueue_calls[0][0][0], fake_event.name)
+
+    def test_enqueue_customer_sync_keeps_direct_enqueue_in_shadow_mode(self):
+        customer = DummyCustomer()
+        enqueue_calls = []
+        event_enqueue_calls = []
+        fake_event = SimpleNamespace(name="WOOEVT-00012")
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(enable_sync_event_ledger=1), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.should_use_customer_outbox", return_value=True), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.create_outbound_customer_event", return_value=fake_event), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.is_shadow_mode_enabled", return_value=True), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.enqueue_sync_event", side_effect=lambda *args, **kwargs: event_enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_customer_sync(customer, method="after_insert")
+
+        self.assertEqual(len(enqueue_calls), 1)
+        self.assertEqual(event_enqueue_calls, [])
+
+    def test_enqueue_invoice_sync_routes_to_event_outbox_when_enabled(self):
+        current = DummyInvoice(sales_invoice_state="Delivered")
+        enqueue_calls = []
+        event_enqueue_calls = []
+        fake_event = SimpleNamespace(name="WOOEVT-00013")
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(enable_sync_event_ledger=1), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.should_use_invoice_outbox", return_value=True), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.create_outbound_invoice_event", return_value=fake_event) as create_event, \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.is_shadow_mode_enabled", return_value=False), \
+             unittest.mock.patch("jarz_woocommerce_integration.services.sync_events.enqueue_sync_event", side_effect=lambda *args, **kwargs: event_enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_invoice_sync(current, method="on_submit")
+
+        self.assertEqual(enqueue_calls, [])
+        create_event.assert_called_once()
+        self.assertEqual(event_enqueue_calls[0][0][0], fake_event.name)
+
     def test_enqueue_customer_sync_skips_when_customer_flag_marks_inbound(self):
         customer = DummyCustomer()
         customer.flags.ignore_woo_outbound = True

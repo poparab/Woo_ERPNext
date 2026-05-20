@@ -1,5 +1,6 @@
 import frappe
 from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_fields
+from jarz_woocommerce_integration.utils.add_sync_indexes import ensure_sync_indexes
 
 
 def after_install():  # pragma: no cover
@@ -16,12 +17,14 @@ def after_install():  # pragma: no cover
     except Exception:  # noqa: BLE001
         frappe.log_error(frappe.get_traceback(), "WooCommerce Settings Reload Failed")
     ensure_custom_fields()
+    ensure_sync_indexes(verbose=False)
     _ensure_company_defaults()
     frappe.clear_cache()
 
 
 def after_migrate():  # pragma: no cover
     ensure_custom_fields()
+    ensure_sync_indexes(verbose=False)
     _ensure_company_defaults()
     frappe.clear_cache()
 

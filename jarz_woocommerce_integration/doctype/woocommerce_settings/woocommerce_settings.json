@@ -40,7 +40,22 @@
   "payment_method_wallet",
   "shipping_section",
   "default_shipping_method_id",
-  "default_shipping_method_title"
+  "default_shipping_method_title",
+  "event_section",
+  "enable_sync_event_ledger",
+  "sync_event_shadow_mode",
+  "use_outbox_for_customer_push",
+  "use_outbox_for_invoice_push",
+  "event_column_break",
+  "use_inbox_for_order_webhook",
+  "use_inbox_for_customer_webhook",
+  "use_inbox_for_order_polling",
+  "use_event_reconciliation",
+  "worker_section",
+  "sync_event_worker_enabled",
+  "sync_event_max_attempts",
+  "sync_event_batch_size",
+  "sync_event_success_retention_days"
  ],
  "fields": [
   {
@@ -259,6 +274,94 @@
    "fieldname": "default_shipping_method_title",
    "fieldtype": "Data",
    "label": "Woo Shipping Method Title"
+  },
+  {
+   "fieldname": "event_section",
+   "fieldtype": "Section Break",
+   "label": "Sync Event Ledger"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_sync_event_ledger",
+   "fieldtype": "Check",
+   "label": "Enable Sync Event Ledger",
+   "description": "Master switch for DB-backed inbox/outbox event capture."
+  },
+  {
+   "default": "1",
+   "fieldname": "sync_event_shadow_mode",
+   "fieldtype": "Check",
+   "label": "Shadow Mode",
+   "description": "Capture events while the existing direct sync path still runs."
+  },
+  {
+   "default": "0",
+   "fieldname": "use_outbox_for_customer_push",
+   "fieldtype": "Check",
+   "label": "Use Outbox For Customer Push"
+  },
+  {
+   "default": "0",
+   "fieldname": "use_outbox_for_invoice_push",
+   "fieldtype": "Check",
+   "label": "Use Outbox For Invoice Push"
+  },
+  {
+   "fieldname": "event_column_break",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "use_inbox_for_order_webhook",
+   "fieldtype": "Check",
+   "label": "Use Inbox For Order Webhook"
+  },
+  {
+   "default": "0",
+   "fieldname": "use_inbox_for_customer_webhook",
+   "fieldtype": "Check",
+   "label": "Use Inbox For Customer Webhook"
+  },
+  {
+   "default": "0",
+   "fieldname": "use_inbox_for_order_polling",
+   "fieldtype": "Check",
+   "label": "Use Inbox For Order Polling"
+  },
+  {
+   "default": "0",
+   "fieldname": "use_event_reconciliation",
+   "fieldtype": "Check",
+   "label": "Use Event Reconciliation"
+  },
+  {
+   "fieldname": "worker_section",
+   "fieldtype": "Section Break",
+   "label": "Worker"
+  },
+  {
+   "default": "0",
+   "fieldname": "sync_event_worker_enabled",
+   "fieldtype": "Check",
+   "label": "Sync Event Worker Enabled"
+  },
+  {
+   "default": "8",
+   "fieldname": "sync_event_max_attempts",
+   "fieldtype": "Int",
+   "label": "Sync Event Max Attempts"
+  },
+  {
+   "default": "25",
+   "fieldname": "sync_event_batch_size",
+   "fieldtype": "Int",
+   "label": "Sync Event Batch Size"
+  },
+  {
+   "default": "90",
+   "fieldname": "sync_event_success_retention_days",
+   "fieldtype": "Int",
+   "label": "Sync Event Success Retention Days"
   }
  ],
  "issingle": 1,

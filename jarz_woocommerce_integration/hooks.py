@@ -166,6 +166,9 @@ doc_events = {
 # Customer incremental sync every 15 minutes
 scheduler_events = {
 	"cron": {
+		"* * * * *": [
+			"jarz_woocommerce_integration.services.sync_events.process_due_sync_events"
+		],
 		"*/15 * * * *": [
 			"jarz_woocommerce_integration.services.customer_sync.sync_customers_cron"
 		],
@@ -187,6 +190,9 @@ scheduler_events = {
 		],
 		"10 * * * *": [
 			"jarz_woocommerce_integration.services.outbound_sync.reconcile_outbound_state"
+		],
+		"31 3 * * *": [
+			"jarz_woocommerce_integration.services.sync_events.purge_old_sync_events"
 		]
 	}
 }

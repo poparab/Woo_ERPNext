@@ -3134,6 +3134,126 @@ def pull_recent_orders_phase1(
     return metrics
 
 
+def _enqueue_order_window_events(
+    *,
+    settings: Any,
+    event_type: str,
+    limit: int = 100,
+    status: str | None = None,
+    after: str | None = None,
+    before: str | None = None,
+    modified_after: str | None = None,
+    modified_before: str | None = None,
+    orderby: str | None = None,
+    order: str | None = None,
+    max_pages: int = 1,
+    status_filter_set: set[str] | None = None,
+) -> dict[str, Any]:
+    from jarz_woocommerce_integration.services import sync_events
+
+    ensure_custom_fields()
+    client = WooClient(
+        base_url=settings.base_url,
+        consumer_key=settings.consumer_key,
+        consumer_secret=settings.get_password("consumer_secret"),
+    )
+
+    params: dict[str, Any] = {"per_page": max(1, min(int(limit), 100))}
+    if status:
+        params["status"] = status
+    if after:
+        params["after"] = after
+    if before:
+        params["before"] = before
+    if modified_after:
+        params["modified_after"] = modified_after
+    if modified_before:
+        params["modified_before"] = modified_before
+    if orderby:
+        params["orderby"] = orderby
+    if order:
+        params["order"] = order
+
+    orders, pages_fetched, total_pages = _list_orders_window(
+        client,
+        params=params,
+        max_pages=max_pages,
+    )
+    orders_fetched_raw = len(orders)
+    if status_filter_set:
+        orders = [
+            item for item in orders
+            if (item.get("status") or "").strip().lower() in status_filter_set
+        ]
+
+    metrics: dict[str, Any] = {
+        "orders_fetched": len(orders),
+        "orders_fetched_raw": orders_fetched_raw,
+        "filtered_out": orders_fetched_raw - len(orders),
+        "pages_fetched": pages_fetched,
+        "total_pages": total_pages,
+        "queued": 0,
+        "errors": 0,
+        "results_sample": [],
+        "status": status,
+        "after": after,
+        "before": before,
+        "modified_after": modified_after,
+        "modified_before": modified_before,
+        "orderby": orderby,
+        "order": order,
+        "max_pages": max_pages,
+    }
+    latest_seen_modified: datetime | None = None
+    latest_seen_order_id = 0
+
+    for order_payload in orders:
+        modified_at, order_id = _extract_order_cursor(order_payload)
+        if modified_at is not None:
+            if latest_seen_modified is None or modified_at > latest_seen_modified:
+                latest_seen_modified = modified_at
+                latest_seen_order_id = order_id
+            elif modified_at == latest_seen_modified and order_id > latest_seen_order_id:
+                latest_seen_order_id = order_id
+
+        try:
+            event = sync_events.create_inbound_order_reference_event(
+                order_id=order_payload.get("id"),
+                event_type=event_type,
+                status=order_payload.get("status"),
+                modified_gmt=order_payload.get("date_modified_gmt") or order_payload.get("date_modified"),
+            )
+            sync_events.enqueue_sync_event(event.name, after_commit=False)
+            metrics["queued"] += 1
+            if len(metrics["results_sample"]) < 10:
+                metrics["results_sample"].append(
+                    {
+                        "woo_order_id": order_payload.get("id"),
+                        "event_name": event.name,
+                        "status": getattr(event, "status", None),
+                        "event_type": event_type,
+                    }
+                )
+        except Exception:
+            metrics["errors"] += 1
+            if len(metrics["results_sample"]) < 10:
+                metrics["results_sample"].append(
+                    {
+                        "woo_order_id": order_payload.get("id"),
+                        "status": "error",
+                        "reason": frappe.get_traceback(),
+                    }
+                )
+
+    metrics["fetched_order_ids_sample"] = [o.get("id") for o in orders[:20] if o.get("id") is not None]
+    metrics["latest_seen_modified_gmt"] = (
+        _format_datetime_for_woo(latest_seen_modified) if latest_seen_modified is not None else None
+    )
+    metrics["latest_seen_order_id"] = latest_seen_order_id or None
+    frappe.db.commit()
+    return metrics
+
+
 def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: bool = False, allow_update: bool = True) -> dict[str, Any]:
     settings = frappe.get_single("WooCommerce Settings")
     ensure_custom_fields()
@@ -3299,6 +3419,8 @@ def _run_order_cursor_sync(
     settings = frappe.get_single("WooCommerce Settings")
     ensure_custom_fields()
 
+    from jarz_woocommerce_integration.services import sync_events
+
     overlap_minutes = _get_setting_int(settings, overlap_field, default_overlap_minutes)
     max_pages = _get_setting_int(settings, pages_field, default_max_pages)
     cursor_before_dt, cursor_before_order_id = _get_order_sync_cursor(settings, cursor_name)
@@ -3328,18 +3450,30 @@ def _run_order_cursor_sync(
     )
 
     try:
-        result = pull_recent_orders_phase1(
-            limit=100,
-            dry_run=False,
-            force=False,
-            allow_update=True,
-            is_historical=False,
-            status=status,
-            modified_after=_format_datetime_for_woo(modified_after_dt),
-            orderby="modified",
-            order="asc",
-            max_pages=max_pages,
-        )
+        if sync_events.should_use_order_polling_events(settings):
+            result = _enqueue_order_window_events(
+                settings=settings,
+                event_type="order_poll",
+                limit=100,
+                status=status,
+                modified_after=_format_datetime_for_woo(modified_after_dt),
+                orderby="modified",
+                order="asc",
+                max_pages=max_pages,
+            )
+        else:
+            result = pull_recent_orders_phase1(
+                limit=100,
+                dry_run=False,
+                force=False,
+                allow_update=True,
+                is_historical=False,
+                status=status,
+                modified_after=_format_datetime_for_woo(modified_after_dt),
+                orderby="modified",
+                order="asc",
+                max_pages=max_pages,
+            )
         result.update(
             {
                 "cursor_name": cursor_name,
@@ -3454,12 +3588,30 @@ def reconcile_recent_orders_cron():  # pragma: no cover - scheduler entry for mi
     )
 
     try:
-        result = reconcile_recent_orders_phase1(
-            lookback_minutes=lookback_minutes,
-            dry_run=False,
-            max_pages=max_pages,
-            allow_update=True,
-        )
+        from jarz_woocommerce_integration.services import sync_events
+
+        if sync_events.should_use_reconcile_events(settings):
+            result = _enqueue_order_window_events(
+                settings=settings,
+                event_type="order_reconcile",
+                limit=100,
+                status=RECONCILE_API_STATUS_FILTER,
+                modified_after=_format_datetime_for_woo(
+                    datetime.now(timezone.utc) - timedelta(minutes=lookback_minutes)
+                ),
+                orderby="modified",
+                order="asc",
+                max_pages=max_pages,
+                status_filter_set=set(RECONCILE_TARGET_WOO_STATUSES),
+            )
+            result["lookback_minutes"] = lookback_minutes
+        else:
+            result = reconcile_recent_orders_phase1(
+                lookback_minutes=lookback_minutes,
+                dry_run=False,
+                max_pages=max_pages,
+                allow_update=True,
+            )
         log_status = "Partial" if result.get("errors") else "Success"
         finish_sync_log_entry(log_doc, log_status, result, started_on=started_on)
         frappe.logger().info({"event": "woo_order_sync_reconcile", "result": result})

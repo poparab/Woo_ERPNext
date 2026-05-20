@@ -516,6 +516,19 @@ def enqueue_linked_customer_sync_for_address(
 
     enqueue_reason = reason if reason != "event" else (method or "address_event")
     for customer_name in customer_names:
+        from jarz_woocommerce_integration.services import sync_events
+
+        if sync_events.should_use_customer_outbox(settings, reason=enqueue_reason):
+            event = sync_events.create_outbound_customer_event(
+                customer_name,
+                reason=enqueue_reason,
+                scope="shipping",
+                force=force,
+            )
+            if not sync_events.is_shadow_mode_enabled(settings):
+                sync_events.enqueue_sync_event(event.name, after_commit=not force)
+                continue
+
         frappe.enqueue(
             "jarz_woocommerce_integration.services.outbound_sync.sync_customer",
             queue="short",
@@ -548,6 +561,20 @@ def enqueue_customer_sync(
         if _is_outbound_suppressed():
             return
         customer_name = customer
+
+    from jarz_woocommerce_integration.services import sync_events
+
+    if sync_events.should_use_customer_outbox(settings, reason=reason):
+        event = sync_events.create_outbound_customer_event(
+            customer_name,
+            reason=reason,
+            scope=scope,
+            force=force,
+        )
+        if not sync_events.is_shadow_mode_enabled(settings):
+            sync_events.enqueue_sync_event(event.name, after_commit=not force)
+            return
+
     frappe.enqueue(
         "jarz_woocommerce_integration.services.outbound_sync.sync_customer",
         queue="short",
@@ -872,6 +899,20 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
         if _is_outbound_suppressed():
             return
         invoice_name = invoice
+
+    from jarz_woocommerce_integration.services import sync_events
+
+    if sync_events.should_use_invoice_outbox(settings, reason=reason):
+        event = sync_events.create_outbound_invoice_event(
+            invoice_name,
+            reason=reason,
+            cancel=cancel,
+            force=force,
+        )
+        if not sync_events.is_shadow_mode_enabled(settings):
+            sync_events.enqueue_sync_event(event.name, after_commit=not force)
+            return
+
     frappe.enqueue(
         "jarz_woocommerce_integration.services.outbound_sync.sync_sales_invoice",
         queue="short",
