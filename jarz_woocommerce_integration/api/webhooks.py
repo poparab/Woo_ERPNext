@@ -9,6 +9,7 @@ import base64
 import hashlib
 import hmac
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 import frappe
@@ -27,6 +28,13 @@ __all__ = [
     "dev_invoke_customer",
 ]
 
+
+def _safe_now_datetime():
+    try:
+        return now_datetime()
+    except Exception:
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
 def _compute_signature(secret: bytes, raw_body: bytes) -> str:
     return base64.b64encode(hmac.new(secret, raw_body, hashlib.sha256).digest()).decode()
 
@@ -43,7 +51,7 @@ def _verify_signature(raw_body: bytes, provided: str | None, secret: str | None)
 def _enqueue_customer_process(payload: dict[str, Any], headers: dict[str, Any]):  # background job
     frappe.set_user("Administrator")
     settings = WooCommerceSettings.get_settings()
-    start = now_datetime()
+    start = _safe_now_datetime()
     try:
         metrics = process_customer_record(payload, settings, debug=False, debug_samples=None)
         frappe.logger().info(
@@ -51,7 +59,7 @@ def _enqueue_customer_process(payload: dict[str, Any], headers: dict[str, Any]):
                 "event": "woo_customer_webhook_processed",
                 "customer_id": payload.get("id"),
                 "metrics": metrics,
-                "duration_ms": (now_datetime() - start).total_seconds() * 1000,
+                "duration_ms": (_safe_now_datetime() - start).total_seconds() * 1000,
             }
         )
     except Exception:  # noqa: BLE001
@@ -239,7 +247,7 @@ def woo_customer_webhook():  # pragma: no cover - network entrypoint
                 resp["debug"] = {"body_len": len(raw_body), "payload_hash": payload_hash}
             return resp
 
-    job_name = f"woo_customer_{payload.get('id')}_{now_datetime().isoformat()}"
+    job_name = f"woo_customer_{payload.get('id')}_{_safe_now_datetime().isoformat()}"
     frappe.enqueue(
         _enqueue_customer_process,
         queue="short",
