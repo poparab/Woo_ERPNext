@@ -3,6 +3,9 @@ from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_field
 from jarz_woocommerce_integration.utils.add_sync_indexes import ensure_sync_indexes
 
 
+SYNC_OPERATOR_ROLE = "WooCommerce Sync Operator"
+
+
 def after_install():  # pragma: no cover
     module_name = "Jarz WooCommerce Integration"
     if not frappe.db.exists("Module Def", module_name):
@@ -18,6 +21,7 @@ def after_install():  # pragma: no cover
         frappe.log_error(frappe.get_traceback(), "WooCommerce Settings Reload Failed")
     ensure_custom_fields()
     ensure_sync_indexes(verbose=False)
+    _ensure_sync_operator_role()
     _ensure_company_defaults()
     frappe.clear_cache()
 
@@ -25,8 +29,24 @@ def after_install():  # pragma: no cover
 def after_migrate():  # pragma: no cover
     ensure_custom_fields()
     ensure_sync_indexes(verbose=False)
+    _ensure_sync_operator_role()
     _ensure_company_defaults()
     frappe.clear_cache()
+
+
+def _ensure_sync_operator_role():  # pragma: no cover
+    if frappe.db.exists("Role", SYNC_OPERATOR_ROLE):
+        return
+    try:
+        role = frappe.get_doc({
+            "doctype": "Role",
+            "role_name": SYNC_OPERATOR_ROLE,
+            "desk_access": 1,
+        })
+        role.insert(ignore_permissions=True)
+        frappe.db.commit()
+    except Exception:  # noqa: BLE001
+        frappe.log_error(frappe.get_traceback(), "Woo Integration: ensure sync operator role")
 
 
 def _ensure_company_defaults():  # pragma: no cover

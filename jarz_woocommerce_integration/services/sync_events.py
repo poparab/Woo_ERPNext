@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -68,8 +69,17 @@ SKIP_REASON_TOKENS = (
 )
 RETRYABLE_ORDER_REASONS = {"locked", "db_locked"}
 TERMINAL_STATUSES = {"Succeeded", "Skipped", "Superseded", "Failed", "NeedsReview", "DeadLetter"}
+ATTENTION_EVENT_STATUSES = {"Failed", "NeedsReview", "DeadLetter"}
 
-LOGGER = frappe.logger("jarz_woocommerce.sync_events")
+
+def _build_logger() -> logging.Logger:
+    try:
+        return frappe.logger("jarz_woocommerce.sync_events")
+    except Exception:
+        return logging.getLogger("jarz_woocommerce.sync_events")
+
+
+LOGGER = _build_logger()
 
 
 @dataclass(slots=True)
@@ -764,6 +774,7 @@ def record_manual_push_audit_event(
                 {
                     "last_error": _manual_push_result_detail(result, error)[:500],
                     "manual_review_reason": "manual_push_failed",
+                    "review_state": "Open",
                     "completed_on": now_datetime(),
                 },
                 update_modified=False,
@@ -957,6 +968,18 @@ def _mark_event(
         "completed_on": now_datetime() if status in TERMINAL_STATUSES else None,
         "next_attempt_at": next_attempt_at,
     }
+    if status in ATTENTION_EVENT_STATUSES:
+        updates.update({
+            "review_state": "Open",
+            "reviewed_by": "",
+            "reviewed_on": None,
+        })
+    elif status in {"Pending", "RetryScheduled", "Processing", "Succeeded", "Skipped", "Superseded"}:
+        updates.update({
+            "review_state": "",
+            "reviewed_by": "",
+            "reviewed_on": None,
+        })
     event_doc.db_set(updates, update_modified=False)
 
 
@@ -1222,6 +1245,9 @@ def retry_sync_event(event_name: str) -> dict[str, Any]:
             "status": "Pending",
             "last_error": "",
             "manual_review_reason": "",
+            "review_state": "",
+            "reviewed_by": "",
+            "reviewed_on": None,
             "traceback": "",
             "locked_by": "",
             "locked_until": None,
@@ -1240,15 +1266,21 @@ def purge_old_sync_events(retention_days: int | None = None) -> dict[str, Any]: 
     cfg = get_sync_event_config(settings)
     days = max(1, int(retention_days or cfg.success_retention_days))
     cutoff = now_datetime() - timedelta(days=days)
-    names = frappe.get_all(
-        EVENT_DOCTYPE,
-        filters={
-            "status": ["in", ["Succeeded", "Skipped", "Superseded"]],
-            "completed_on": ["<", cutoff],
-        },
-        pluck="name",
-        limit_page_length=500,
+    now = now_datetime()
+    rows = frappe.db.sql(
+        """
+        SELECT name
+        FROM `tabWooCommerce Sync Event`
+        WHERE status IN ('Succeeded', 'Skipped', 'Superseded')
+          AND completed_on < %s
+          AND IFNULL(is_retention_exempt, 0) = 0
+          AND (retain_until IS NULL OR retain_until < %s)
+        LIMIT 500
+        """,
+        (cutoff, now),
+        as_dict=True,
     )
+    names = [row.get("name") for row in rows if row.get("name")]
     for name in names:
         frappe.delete_doc(EVENT_DOCTYPE, name, ignore_permissions=True)
     frappe.db.commit()

@@ -55,6 +55,16 @@
     "desired_state_json",
     "remote_response_json",
     "result_section",
+    "operator_section",
+    "review_state",
+    "reviewed_by",
+    "reviewed_on",
+    "resolution_notes",
+    "is_retention_exempt",
+    "retain_until",
+    "last_operation",
+    "last_operation_by",
+    "last_operation_on",
     "last_error",
     "traceback"
   ],
@@ -264,6 +274,72 @@
       "label": "Result"
     },
     {
+      "fieldname": "operator_section",
+      "fieldtype": "Section Break",
+      "label": "Operations"
+    },
+    {
+      "fieldname": "review_state",
+      "fieldtype": "Select",
+      "label": "Review State",
+      "options": "\nOpen\nInvestigating\nResolved\nIgnored",
+      "read_only": 1,
+      "in_list_view": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "reviewed_by",
+      "fieldtype": "Link",
+      "label": "Reviewed By",
+      "options": "User",
+      "read_only": 1
+    },
+    {
+      "fieldname": "reviewed_on",
+      "fieldtype": "Datetime",
+      "label": "Reviewed On",
+      "read_only": 1
+    },
+    {
+      "fieldname": "resolution_notes",
+      "fieldtype": "Small Text",
+      "label": "Resolution Notes",
+      "read_only": 1
+    },
+    {
+      "fieldname": "is_retention_exempt",
+      "fieldtype": "Check",
+      "label": "Retention Exempt",
+      "default": "0",
+      "read_only": 1,
+      "in_standard_filter": 1
+    },
+    {
+      "fieldname": "retain_until",
+      "fieldtype": "Datetime",
+      "label": "Retain Until",
+      "read_only": 1
+    },
+    {
+      "fieldname": "last_operation",
+      "fieldtype": "Data",
+      "label": "Last Operation",
+      "read_only": 1
+    },
+    {
+      "fieldname": "last_operation_by",
+      "fieldtype": "Link",
+      "label": "Last Operation By",
+      "options": "User",
+      "read_only": 1
+    },
+    {
+      "fieldname": "last_operation_on",
+      "fieldtype": "Datetime",
+      "label": "Last Operation On",
+      "read_only": 1
+    },
+    {
       "fieldname": "last_error",
       "fieldtype": "Small Text",
       "label": "Last Error",
@@ -295,6 +371,13 @@
       "write": 1,
       "create": 1,
       "delete": 1
+    },
+    {
+      "role": "WooCommerce Sync Operator",
+      "read": 1,
+      "export": 1,
+      "report": 1,
+      "print": 1
     }
   ]
 }

@@ -247,3 +247,57 @@ class TestSyncEvents(unittest.TestCase):
 
 		self.assertIs(result, existing_doc)
 		self.assertEqual(fake_local.message_log, [{"message": "preexisting"}])
+
+	def test_mark_event_opens_review_state_for_attention_status(self):
+		event_doc, updates = _event_doc()
+
+		with unittest.mock.patch.object(sync_events, "now_datetime", return_value=datetime(2024, 1, 2, 8, 0, 0)):
+			sync_events._mark_event(
+				event_doc,
+				status="NeedsReview",
+				last_error="manual_review_required",
+				manual_review_reason="manual_review_required",
+			)
+
+		self.assertEqual(updates[-1]["review_state"], "Open")
+		self.assertEqual(updates[-1]["reviewed_by"], "")
+
+	def test_purge_old_sync_events_uses_retention_guards(self):
+		cfg = sync_events.SyncEventConfig(
+			enabled=True,
+			shadow_mode=False,
+			use_outbox_for_customer_push=False,
+			use_outbox_for_invoice_push=False,
+			use_inbox_for_order_webhook=False,
+			use_inbox_for_customer_webhook=False,
+			use_inbox_for_order_polling=False,
+			use_event_reconciliation=False,
+			worker_enabled=True,
+			max_attempts=8,
+			batch_size=25,
+			success_retention_days=90,
+			lock_ttl_seconds=900,
+			shadow_alert_threshold=5,
+			circuit_breaker_threshold=10,
+			circuit_breaker_window_seconds=300,
+			circuit_breaker_cooldown_seconds=300,
+		)
+		sql_calls = []
+		deleted = []
+
+		def sql_side_effect(query, params=None, as_dict=False):
+			sql_calls.append((query, params, as_dict))
+			return [{"name": "WOOEVT-00077"}]
+
+		with unittest.mock.patch.object(sync_events.WooCommerceSettings, "get_settings", return_value=SimpleNamespace()), \
+			 unittest.mock.patch.object(sync_events, "get_sync_event_config", return_value=cfg), \
+			 unittest.mock.patch.object(sync_events, "now_datetime", return_value=datetime(2024, 1, 10, 0, 0, 0)), \
+			 unittest.mock.patch.object(sync_events.frappe.db, "sql", side_effect=sql_side_effect), \
+			 unittest.mock.patch.object(sync_events.frappe, "delete_doc", side_effect=lambda doctype, name, ignore_permissions=True: deleted.append((doctype, name))), \
+			 unittest.mock.patch.object(sync_events.frappe.db, "commit", return_value=None):
+			result = sync_events.purge_old_sync_events(retention_days=30)
+
+		self.assertEqual(result["deleted"], 1)
+		self.assertEqual(deleted, [(sync_events.EVENT_DOCTYPE, "WOOEVT-00077")])
+		self.assertIn("IFNULL(is_retention_exempt, 0) = 0", sql_calls[0][0])
+		self.assertIn("retain_until IS NULL OR retain_until < %s", sql_calls[0][0])
