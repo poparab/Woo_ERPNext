@@ -1,4 +1,5 @@
 import base64
+from datetime import datetime
 import hashlib
 import hmac
 import json
@@ -31,9 +32,54 @@ def _verify_signature(raw_body: bytes, provided: str | None, secret: str | None)
     return hmac.compare_digest(expected, provided.strip())
 
 
+def _safe_now_datetime():
+    try:
+        return frappe.utils.now_datetime()
+    except Exception:
+        return datetime.utcnow()
+
+
+def _safe_request_body() -> bytes:
+    try:
+        return frappe.request.data or b""
+    except Exception:
+        return b""
+
+
+def _safe_request_header(header_name: str) -> str:
+    try:
+        return frappe.get_request_header(header_name) or ""
+    except Exception:
+        return ""
+
+
+def _safe_form_value(fieldname: str) -> Any:
+    try:
+        form_dict = frappe.form_dict or {}
+    except Exception:
+        return None
+    return form_dict.get(fieldname)
+
+
+def _safe_create_sync_log_entry(*args, **kwargs):
+    try:
+        return create_sync_log_entry(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _safe_finish_sync_log_entry(log_doc, *args, **kwargs) -> None:
+    if not log_doc:
+        return
+    try:
+        finish_sync_log_entry(log_doc, *args, **kwargs)
+    except Exception:
+        pass
+
+
 def _process_order_webhook(order_payload: dict[str, Any]):  # background job (must be top-level for RQ pickling)
     frappe.set_user("Administrator")
-    start = frappe.utils.now_datetime()
+    start = _safe_now_datetime()
     log_doc = create_sync_log_entry(
         "WebhookProcess",
         "Started",
@@ -49,7 +95,7 @@ def _process_order_webhook(order_payload: dict[str, Any]):  # background job (mu
             force=False,
             allow_update=True,
         )
-        duration = (frappe.utils.now_datetime() - start).total_seconds()
+        duration = (_safe_now_datetime() - start).total_seconds()
         finish_sync_log_entry(
             log_doc,
             "Success" if res.get("success") else "Failed",
@@ -237,13 +283,13 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
 
     Uses same signature scheme as customer webhook. Fast ACK + background job.
     """
-    raw_body: bytes = frappe.request.data or b""
-    sig_header = frappe.get_request_header("X-WC-Webhook-Signature") or ""
-    topic_header = frappe.get_request_header("X-WC-Webhook-Topic") or ""
-    debug_flag = frappe.form_dict.get("d") in ("1", "true", "True")
+    raw_body = _safe_request_body()
+    sig_header = _safe_request_header("X-WC-Webhook-Signature")
+    topic_header = _safe_request_header("X-WC-Webhook-Topic")
+    debug_flag = _safe_form_value("d") in ("1", "true", "True")
     payload_hash = hashlib.sha256(raw_body).hexdigest() if raw_body else ""
-    receipt_started = frappe.utils.now_datetime()
-    receipt_log = create_sync_log_entry(
+    receipt_started = _safe_now_datetime()
+    receipt_log = _safe_create_sync_log_entry(
         "WebhookReceipt",
         "Received",
         {
@@ -306,7 +352,7 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
             "expected_prefix": exp_pref,
             "body_len": len(raw_body),
         })
-        finish_sync_log_entry(
+        _safe_finish_sync_log_entry(
             receipt_log,
             "InvalidSignature",
             {
@@ -327,7 +373,7 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
 
     # Handshake when creating webhook (no order object yet)
     if not isinstance(payload, dict) or not payload.get("id"):
-        finish_sync_log_entry(
+        _safe_finish_sync_log_entry(
             receipt_log,
             "Ack",
             {"topic": topic_header, "payload_hash": payload_hash, "reason": "handshake"},
@@ -375,7 +421,7 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
 
         if not sync_events.is_shadow_mode_enabled(settings):
             sync_events.enqueue_sync_event(event.name, after_commit=False)
-            finish_sync_log_entry(
+            _safe_finish_sync_log_entry(
                 receipt_log,
                 "Queued",
                 {
@@ -391,7 +437,7 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
                 resp["debug"] = {"payload_hash": payload_hash}
             return resp
 
-    job_name = f"woo_order_{order_id}_{frappe.utils.now_datetime().isoformat()}"
+    job_name = f"woo_order_{order_id}_{_safe_now_datetime().isoformat()}"
     try:
         frappe.enqueue(
             _process_order_webhook,
@@ -405,7 +451,7 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
             "order_id": order_id,
             "job_name": job_name,
         })
-        finish_sync_log_entry(
+        _safe_finish_sync_log_entry(
             receipt_log,
             "Queued",
             {
@@ -425,7 +471,7 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
             "order_id": order_id,
             "traceback": frappe.get_traceback(),
         })
-        finish_sync_log_entry(
+        _safe_finish_sync_log_entry(
             receipt_log,
             "EnqueueFailed",
             {
