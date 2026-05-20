@@ -955,7 +955,8 @@ def _parse_product_identifier(raw: Any) -> tuple[Optional[int], Optional[int]]:
 
 
 def _format_money(value: float | int, precision: int = 2) -> str:
-    return f"{flt(value, precision):.{precision}f}"
+    numeric = flt(value) if value not in (None, "") else 0.0
+    return f"{numeric:.{precision}f}"
 
 
 def _is_truthy_flag(value: Any) -> bool:
