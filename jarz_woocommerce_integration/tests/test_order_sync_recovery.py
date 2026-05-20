@@ -206,3 +206,19 @@ def test_reconcile_recent_orders_phase1_sends_any_to_woo(monkeypatch):
         assert bad not in api_status, f"{bad!r} must not be sent to Woo API"
     # But all target statuses are covered by the client-side filter set
     assert captured["status_filter_set"] == set(order_sync.RECONCILE_TARGET_WOO_STATUSES)
+
+
+def test_sync_cancelled_orders_cron_uses_any_with_local_status_filter(monkeypatch):
+    captured = {}
+
+    def fake_run_order_cursor_sync(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(order_sync.frappe.db, "get_single_value", lambda doctype, fieldname: 1)
+    monkeypatch.setattr(order_sync, "_run_order_cursor_sync", fake_run_order_cursor_sync)
+
+    order_sync.sync_cancelled_orders_cron()
+
+    assert captured["status"] == "any"
+    assert captured["status_filter_set"] == set(order_sync.CANCELLED_CURSOR_TARGET_WOO_STATUSES)

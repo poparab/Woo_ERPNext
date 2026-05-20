@@ -502,10 +502,19 @@ def create_sync_event(
         "manual_review_reason": manual_review_reason,
     }
     try:
+        message_log_before = list(getattr(frappe.local, "message_log", []) or [])
+    except Exception:
+        message_log_before = None
+    try:
         doc = frappe.get_doc(doc_values)
         doc.insert(ignore_permissions=True)
         return doc
     except (frappe.DuplicateEntryError, frappe.UniqueValidationError):
+        if message_log_before is not None:
+            try:
+                frappe.local.message_log = message_log_before
+            except Exception:
+                pass
         existing_name = frappe.db.get_value(EVENT_DOCTYPE, {"idempotency_key": idempotency_key}, "name")
         if existing_name:
             return frappe.get_doc(EVENT_DOCTYPE, existing_name)

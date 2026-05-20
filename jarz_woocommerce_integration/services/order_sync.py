@@ -36,6 +36,7 @@ PROCESSING_EQUIVALENT_WOO_STATUSES = (
 RECONCILE_TARGET_WOO_STATUSES = PROCESSING_EQUIVALENT_WOO_STATUSES + (
     "completed", "cancelled", "refunded", "failed"
 )
+CANCELLED_CURSOR_TARGET_WOO_STATUSES = ("cancelled", "refunded", "failed")
 # Value actually sent to Woo REST API — custom statuses are filtered client-side
 RECONCILE_API_STATUS_FILTER = "any"
 # Local-membership constant (not sent to Woo API). Used for set membership checks and tests.
@@ -3410,6 +3411,7 @@ def _run_order_cursor_sync(
     event_name: str,
     error_event: str,
     status: str | None,
+    status_filter_set: set[str] | None = None,
     overlap_field: str,
     default_overlap_minutes: int,
     pages_field: str,
@@ -3441,6 +3443,7 @@ def _run_order_cursor_sync(
         {
             "cursor_name": cursor_name,
             "status": status,
+            "status_filter_set": sorted(status_filter_set) if status_filter_set else None,
             "overlap_minutes": overlap_minutes,
             "max_pages": max_pages,
             "cold_start": cold_start,
@@ -3460,6 +3463,7 @@ def _run_order_cursor_sync(
                 orderby="modified",
                 order="asc",
                 max_pages=max_pages,
+                status_filter_set=status_filter_set,
             )
         else:
             result = pull_recent_orders_phase1(
@@ -3473,6 +3477,7 @@ def _run_order_cursor_sync(
                 orderby="modified",
                 order="asc",
                 max_pages=max_pages,
+                status_filter_set=status_filter_set,
             )
         result.update(
             {
@@ -3546,7 +3551,8 @@ def sync_cancelled_orders_cron():  # pragma: no cover - scheduler entry for canc
             operation="CronCancelled",
             event_name="woo_order_sync_cancelled",
             error_event="woo_order_sync_cancelled_error",
-            status="cancelled,refunded,failed",
+            status=RECONCILE_API_STATUS_FILTER,
+            status_filter_set=set(CANCELLED_CURSOR_TARGET_WOO_STATUSES),
             overlap_field="cancelled_order_overlap_minutes",
             default_overlap_minutes=DEFAULT_CANCELLED_ORDER_OVERLAP_MINUTES,
             pages_field="cancelled_order_max_pages",

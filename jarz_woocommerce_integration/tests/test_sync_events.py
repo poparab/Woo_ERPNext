@@ -213,7 +213,13 @@ class TestSyncEvents(unittest.TestCase):
 			"WOOEVT-00099",
 			Exception("duplicate idempotency key"),
 		)
-		insert_doc = SimpleNamespace(insert=lambda ignore_permissions=True: (_ for _ in ()).throw(duplicate_exc))
+		fake_local = SimpleNamespace(message_log=[{"message": "preexisting"}])
+
+		def insert_side_effect(ignore_permissions=True):
+			fake_local.message_log.append({"message": "Idempotency Key must be unique"})
+			raise duplicate_exc
+
+		insert_doc = SimpleNamespace(insert=insert_side_effect)
 		existing_doc = SimpleNamespace(name="WOOEVT-00005")
 
 		def fake_get_doc(*args, **kwargs):
@@ -226,6 +232,7 @@ class TestSyncEvents(unittest.TestCase):
 		with unittest.mock.patch.object(sync_events.WooCommerceSettings, "get_settings", return_value=SimpleNamespace()), \
 			 unittest.mock.patch.object(sync_events, "get_sync_event_config", return_value=cfg), \
 			 unittest.mock.patch.object(sync_events, "now_datetime", return_value=datetime(2024, 1, 2, 3, 4, 5)), \
+			 unittest.mock.patch.object(sync_events.frappe, "local", fake_local), \
 			 unittest.mock.patch.object(sync_events.frappe, "get_doc", side_effect=fake_get_doc), \
 			 unittest.mock.patch.object(sync_events.frappe.db, "get_value", return_value="WOOEVT-00005"):
 			result = sync_events.create_sync_event(
@@ -239,3 +246,4 @@ class TestSyncEvents(unittest.TestCase):
 			)
 
 		self.assertIs(result, existing_doc)
+		self.assertEqual(fake_local.message_log, [{"message": "preexisting"}])
