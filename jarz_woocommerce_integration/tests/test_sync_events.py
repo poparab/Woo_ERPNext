@@ -187,3 +187,55 @@ class TestSyncEvents(unittest.TestCase):
 		self.assertEqual(create_event.call_args.kwargs["status"], "Failed")
 		self.assertEqual(create_event.call_args.kwargs["event_type"], "manual_push")
 		self.assertTrue(any(update.get("manual_review_reason") == "manual_push_failed" for update in updates))
+
+	def test_create_sync_event_reuses_existing_row_on_unique_validation_duplicate(self):
+		cfg = sync_events.SyncEventConfig(
+			enabled=True,
+			shadow_mode=False,
+			use_outbox_for_customer_push=False,
+			use_outbox_for_invoice_push=False,
+			use_inbox_for_order_webhook=False,
+			use_inbox_for_customer_webhook=False,
+			use_inbox_for_order_polling=False,
+			use_event_reconciliation=False,
+			worker_enabled=True,
+			max_attempts=8,
+			batch_size=25,
+			success_retention_days=90,
+			lock_ttl_seconds=900,
+			shadow_alert_threshold=5,
+			circuit_breaker_threshold=10,
+			circuit_breaker_window_seconds=300,
+			circuit_breaker_cooldown_seconds=300,
+		)
+		duplicate_exc = sync_events.frappe.UniqueValidationError(
+			"WooCommerce Sync Event",
+			"WOOEVT-00099",
+			Exception("duplicate idempotency key"),
+		)
+		insert_doc = SimpleNamespace(insert=lambda ignore_permissions=True: (_ for _ in ()).throw(duplicate_exc))
+		existing_doc = SimpleNamespace(name="WOOEVT-00005")
+
+		def fake_get_doc(*args, **kwargs):
+			if len(args) == 1 and isinstance(args[0], dict):
+				return insert_doc
+			if len(args) == 2 and args[0] == sync_events.EVENT_DOCTYPE and args[1] == "WOOEVT-00005":
+				return existing_doc
+			raise AssertionError(f"Unexpected get_doc args: {args!r}")
+
+		with unittest.mock.patch.object(sync_events.WooCommerceSettings, "get_settings", return_value=SimpleNamespace()), \
+			 unittest.mock.patch.object(sync_events, "get_sync_event_config", return_value=cfg), \
+			 unittest.mock.patch.object(sync_events, "now_datetime", return_value=datetime(2024, 1, 2, 3, 4, 5)), \
+			 unittest.mock.patch.object(sync_events.frappe, "get_doc", side_effect=fake_get_doc), \
+			 unittest.mock.patch.object(sync_events.frappe.db, "get_value", return_value="WOOEVT-00005"):
+			result = sync_events.create_sync_event(
+				direction="Outbound",
+				event_type="customer_push",
+				source_system="ERPNext",
+				target_system="WooCommerce",
+				object_type="Customer",
+				source_id="CUST-001",
+				idempotency_key="out:erp:Customer:CUST-001:full:2024-01-02T03:04:05",
+			)
+
+		self.assertIs(result, existing_doc)

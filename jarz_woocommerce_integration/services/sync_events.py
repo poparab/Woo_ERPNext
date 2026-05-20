@@ -505,7 +505,7 @@ def create_sync_event(
         doc = frappe.get_doc(doc_values)
         doc.insert(ignore_permissions=True)
         return doc
-    except frappe.DuplicateEntryError:
+    except (frappe.DuplicateEntryError, frappe.UniqueValidationError):
         existing_name = frappe.db.get_value(EVENT_DOCTYPE, {"idempotency_key": idempotency_key}, "name")
         if existing_name:
             return frappe.get_doc(EVENT_DOCTYPE, existing_name)
