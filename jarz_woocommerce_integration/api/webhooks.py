@@ -199,7 +199,10 @@ def woo_customer_webhook():  # pragma: no cover - network entrypoint
 
     from jarz_woocommerce_integration.services import sync_events
 
+    event = None
+    event_insert_failed = False
     if sync_events.should_use_customer_webhook_inbox(settings):
+        shadow_mode = sync_events.is_shadow_mode_enabled(settings)
         try:
             event = sync_events.create_inbound_customer_event(
                 payload,
@@ -207,7 +210,8 @@ def woo_customer_webhook():  # pragma: no cover - network entrypoint
                 headers=headers,
             )
             frappe.db.commit()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            event_insert_failed = True
             frappe.logger().error(
                 {
                     "event": "woo_customer_webhook_event_insert_error",
@@ -215,8 +219,18 @@ def woo_customer_webhook():  # pragma: no cover - network entrypoint
                     "traceback": frappe.get_traceback(),
                 }
             )
-            frappe.local.response.http_status_code = 503
-            return {"success": False, "queued": False, "error": "event_insert_failed"}
+            sync_events.report_shadow_insert_failure(
+                "customer_webhook",
+                exc,
+                settings=settings,
+                context={
+                    "customer_id": payload.get("id"),
+                    "payload_hash": payload_hash,
+                },
+            )
+            if not shadow_mode:
+                frappe.local.response.http_status_code = 503
+                return {"success": False, "queued": False, "error": "event_insert_failed"}
 
         if not sync_events.is_shadow_mode_enabled(settings):
             sync_events.enqueue_sync_event(event.name, after_commit=False)
@@ -239,7 +253,8 @@ def woo_customer_webhook():  # pragma: no cover - network entrypoint
             "event": "woo_customer_webhook_enqueued",
             "customer_id": payload.get("id"),
             "job_name": job_name,
-            **({"shadow_event": event.name} if sync_events.should_use_customer_webhook_inbox(settings) else {}),
+            **({"shadow_event": event.name} if event else {}),
+            **({"event_insert_failed": True} if event_insert_failed else {}),
         }
     )
     resp = {"success": True, "queued": True, "job_name": job_name}

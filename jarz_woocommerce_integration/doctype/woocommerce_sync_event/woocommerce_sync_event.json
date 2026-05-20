@@ -85,7 +85,7 @@
       "fieldname": "status",
       "fieldtype": "Select",
       "label": "Status",
-      "options": "\nPending\nProcessing\nSucceeded\nRetryScheduled\nSkipped\nSuperseded\nNeedsReview\nDeadLetter",
+      "options": "\nPending\nProcessing\nSucceeded\nRetryScheduled\nSkipped\nSuperseded\nFailed\nNeedsReview\nDeadLetter",
       "default": "Pending",
       "reqd": 1,
       "in_list_view": 1,

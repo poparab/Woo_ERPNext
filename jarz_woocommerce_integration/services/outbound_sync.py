@@ -519,12 +519,27 @@ def enqueue_linked_customer_sync_for_address(
         from jarz_woocommerce_integration.services import sync_events
 
         if sync_events.should_use_customer_outbox(settings, reason=enqueue_reason):
-            event = sync_events.create_outbound_customer_event(
-                customer_name,
-                reason=enqueue_reason,
-                scope="shipping",
-                force=force,
-            )
+            event = None
+            try:
+                event = sync_events.create_outbound_customer_event(
+                    customer_name,
+                    reason=enqueue_reason,
+                    scope="shipping",
+                    force=force,
+                )
+            except Exception as exc:  # noqa: BLE001
+                if not sync_events.is_shadow_mode_enabled(settings):
+                    raise
+                sync_events.report_shadow_insert_failure(
+                    "outbound_customer_address",
+                    exc,
+                    settings=settings,
+                    context={
+                        "customer_name": customer_name,
+                        "reason": enqueue_reason,
+                        "scope": "shipping",
+                    },
+                )
             if not sync_events.is_shadow_mode_enabled(settings):
                 sync_events.enqueue_sync_event(event.name, after_commit=not force)
                 continue
@@ -565,12 +580,27 @@ def enqueue_customer_sync(
     from jarz_woocommerce_integration.services import sync_events
 
     if sync_events.should_use_customer_outbox(settings, reason=reason):
-        event = sync_events.create_outbound_customer_event(
-            customer_name,
-            reason=reason,
-            scope=scope,
-            force=force,
-        )
+        event = None
+        try:
+            event = sync_events.create_outbound_customer_event(
+                customer_name,
+                reason=reason,
+                scope=scope,
+                force=force,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not sync_events.is_shadow_mode_enabled(settings):
+                raise
+            sync_events.report_shadow_insert_failure(
+                "outbound_customer_enqueue",
+                exc,
+                settings=settings,
+                context={
+                    "customer_name": customer_name,
+                    "reason": reason,
+                    "scope": scope,
+                },
+            )
         if not sync_events.is_shadow_mode_enabled(settings):
             sync_events.enqueue_sync_event(event.name, after_commit=not force)
             return
@@ -903,12 +933,27 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
     from jarz_woocommerce_integration.services import sync_events
 
     if sync_events.should_use_invoice_outbox(settings, reason=reason):
-        event = sync_events.create_outbound_invoice_event(
-            invoice_name,
-            reason=reason,
-            cancel=cancel,
-            force=force,
-        )
+        event = None
+        try:
+            event = sync_events.create_outbound_invoice_event(
+                invoice_name,
+                reason=reason,
+                cancel=cancel,
+                force=force,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if not sync_events.is_shadow_mode_enabled(settings):
+                raise
+            sync_events.report_shadow_insert_failure(
+                "outbound_invoice_enqueue",
+                exc,
+                settings=settings,
+                context={
+                    "invoice_name": invoice_name,
+                    "reason": reason,
+                    "cancel": cancel,
+                },
+            )
         if not sync_events.is_shadow_mode_enabled(settings):
             sync_events.enqueue_sync_event(event.name, after_commit=not force)
             return

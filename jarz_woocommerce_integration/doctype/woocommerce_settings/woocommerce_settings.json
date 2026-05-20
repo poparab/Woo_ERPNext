@@ -55,7 +55,13 @@
   "sync_event_worker_enabled",
   "sync_event_max_attempts",
   "sync_event_batch_size",
-  "sync_event_success_retention_days"
+  "sync_event_success_retention_days",
+  "worker_column_break",
+  "sync_event_lock_ttl_seconds",
+  "sync_event_shadow_alert_threshold",
+  "sync_event_circuit_breaker_threshold",
+  "sync_event_circuit_breaker_window_seconds",
+  "sync_event_circuit_breaker_cooldown_seconds"
  ],
  "fields": [
   {
@@ -362,6 +368,42 @@
    "fieldname": "sync_event_success_retention_days",
    "fieldtype": "Int",
    "label": "Sync Event Success Retention Days"
+  },
+  {
+   "fieldname": "worker_column_break",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "900",
+   "fieldname": "sync_event_lock_ttl_seconds",
+   "fieldtype": "Int",
+   "label": "Sync Event Lock TTL Seconds",
+   "description": "Crash-recovery lock timeout for Processing events."
+  },
+  {
+   "default": "5",
+   "fieldname": "sync_event_shadow_alert_threshold",
+   "fieldtype": "Int",
+   "label": "Shadow Insert Alert Threshold",
+   "description": "Raise a rate-limited alert when shadow event insert failures exceed this count within 15 minutes."
+  },
+  {
+   "default": "10",
+   "fieldname": "sync_event_circuit_breaker_threshold",
+   "fieldtype": "Int",
+   "label": "Circuit Breaker Failure Threshold"
+  },
+  {
+   "default": "300",
+   "fieldname": "sync_event_circuit_breaker_window_seconds",
+   "fieldtype": "Int",
+   "label": "Circuit Breaker Window Seconds"
+  },
+  {
+   "default": "300",
+   "fieldname": "sync_event_circuit_breaker_cooldown_seconds",
+   "fieldtype": "Int",
+   "label": "Circuit Breaker Cooldown Seconds"
   }
  ],
  "issingle": 1,

@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -36,7 +36,7 @@ def _safe_now_datetime():
     try:
         return frappe.utils.now_datetime()
     except Exception:
-        return datetime.utcnow()
+        return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _safe_request_body() -> bytes:
@@ -390,7 +390,10 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
 
     from jarz_woocommerce_integration.services import sync_events
 
+    event = None
+    event_insert_failed = False
     if sync_events.should_use_order_webhook_inbox(settings):
+        shadow_mode = sync_events.is_shadow_mode_enabled(settings)
         try:
             event = sync_events.create_inbound_order_event(
                 payload,
@@ -399,25 +402,37 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
                 sync_log=receipt_log,
             )
             frappe.db.commit()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            event_insert_failed = True
             frappe.logger().error({
                 "event": "woo_order_webhook_event_insert_error",
                 "order_id": order_id,
                 "traceback": frappe.get_traceback(),
             })
-            finish_sync_log_entry(
-                receipt_log,
-                "InboxPersistFailed",
-                {
+            sync_events.report_shadow_insert_failure(
+                "order_webhook",
+                exc,
+                settings=settings,
+                context={
                     "order_id": order_id,
                     "topic": topic_header,
                     "payload_hash": payload_hash,
                 },
-                traceback=frappe.get_traceback(),
-                started_on=receipt_started,
             )
-            frappe.local.response.http_status_code = 503
-            return {"success": False, "queued": False, "error": "event_insert_failed"}
+            if not shadow_mode:
+                _safe_finish_sync_log_entry(
+                    receipt_log,
+                    "InboxPersistFailed",
+                    {
+                        "order_id": order_id,
+                        "topic": topic_header,
+                        "payload_hash": payload_hash,
+                    },
+                    traceback=frappe.get_traceback(),
+                    started_on=receipt_started,
+                )
+                frappe.local.response.http_status_code = 503
+                return {"success": False, "queued": False, "error": "event_insert_failed"}
 
         if not sync_events.is_shadow_mode_enabled(settings):
             sync_events.enqueue_sync_event(event.name, after_commit=False)
@@ -459,7 +474,8 @@ def woo_order_webhook():  # pragma: no cover - network entrypoint
                 "topic": topic_header,
                 "payload_hash": payload_hash,
                 "job_name": job_name,
-                **({"event_name": event.name} if sync_events.should_use_order_webhook_inbox(settings) else {}),
+                **({"event_name": event.name} if event else {}),
+                **({"event_insert_failed": True} if event_insert_failed else {}),
             },
             started_on=receipt_started,
         )

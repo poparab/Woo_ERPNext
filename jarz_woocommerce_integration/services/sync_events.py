@@ -4,7 +4,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import frappe
@@ -21,6 +21,7 @@ ORDER_PRIORITY = 10
 CUSTOMER_PRIORITY = 20
 OUTBOUND_PRIORITY = 40
 LOCK_TIMEOUT_SECONDS = 900
+SHADOW_ALERT_WINDOW_SECONDS = 900
 PROCESSING_STATUSES = ("Pending", "RetryScheduled")
 TRANSIENT_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 RETRYABLE_REASON_TOKENS = (
@@ -66,6 +67,7 @@ SKIP_REASON_TOKENS = (
     "submitted_frozen",
 )
 RETRYABLE_ORDER_REASONS = {"locked", "db_locked"}
+TERMINAL_STATUSES = {"Succeeded", "Skipped", "Superseded", "Failed", "NeedsReview", "DeadLetter"}
 
 LOGGER = frappe.logger("jarz_woocommerce.sync_events")
 
@@ -84,6 +86,11 @@ class SyncEventConfig:
     max_attempts: int
     batch_size: int
     success_retention_days: int
+    lock_ttl_seconds: int
+    shadow_alert_threshold: int
+    circuit_breaker_threshold: int
+    circuit_breaker_window_seconds: int
+    circuit_breaker_cooldown_seconds: int
 
 
 def _setting_int(settings: WooCommerceSettings, fieldname: str, default: int) -> int:
@@ -109,6 +116,11 @@ def get_sync_event_config(settings: WooCommerceSettings | None = None) -> SyncEv
         max_attempts=_setting_int(settings, "sync_event_max_attempts", 8),
         batch_size=_setting_int(settings, "sync_event_batch_size", 25),
         success_retention_days=_setting_int(settings, "sync_event_success_retention_days", 90),
+        lock_ttl_seconds=_setting_int(settings, "sync_event_lock_ttl_seconds", LOCK_TIMEOUT_SECONDS),
+        shadow_alert_threshold=_setting_int(settings, "sync_event_shadow_alert_threshold", 5),
+        circuit_breaker_threshold=_setting_int(settings, "sync_event_circuit_breaker_threshold", 10),
+        circuit_breaker_window_seconds=_setting_int(settings, "sync_event_circuit_breaker_window_seconds", 300),
+        circuit_breaker_cooldown_seconds=_setting_int(settings, "sync_event_circuit_breaker_cooldown_seconds", 300),
     )
 
 
@@ -195,6 +207,218 @@ def _hash_text(value: str | None) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _coerce_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _site_name() -> str:
+    try:
+        return str(frappe.local.site or "site")
+    except Exception:
+        return "site"
+
+
+def _cache_key(suffix: str) -> str:
+    return f"jarz_woocommerce_integration:sync_events:{_site_name()}:{suffix}"
+
+
+def _cache_get_json_state(key: str) -> dict[str, Any]:
+    try:
+        cache = frappe.cache()
+        raw = cache.get_value(key)
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def _cache_set_json_state(key: str, state: dict[str, Any], *, ttl_seconds: int) -> None:
+    try:
+        cache = frappe.cache()
+        cache.set_value(key, json.dumps(state, sort_keys=True, ensure_ascii=True), expires_in_sec=max(1, ttl_seconds))
+    except TypeError:
+        try:
+            cache = frappe.cache()
+            cache.set_value(key, json.dumps(state, sort_keys=True, ensure_ascii=True))
+        except Exception:
+            return
+    except Exception:
+        return
+
+
+def _cache_delete_state(key: str) -> None:
+    try:
+        frappe.cache().delete_value(key)
+    except Exception:
+        pass
+
+
+def _shadow_failure_counter_key() -> str:
+    return _cache_key("shadow_insert_failures")
+
+
+def _outbound_breaker_key() -> str:
+    return _cache_key("outbound_breaker")
+
+
+def report_shadow_insert_failure(
+    source: str,
+    exc: Exception,
+    *,
+    settings: WooCommerceSettings | None = None,
+    context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cfg = get_sync_event_config(settings)
+    now = now_datetime()
+    state = _cache_get_json_state(_shadow_failure_counter_key())
+    window_started = _coerce_datetime(state.get("window_started")) or now
+    if (now - window_started).total_seconds() > SHADOW_ALERT_WINDOW_SECONDS:
+        state = {}
+        window_started = now
+    count = int(state.get("count", 0) or 0) + 1
+    state.update({
+        "count": count,
+        "window_started": window_started.isoformat(),
+        "last_error": str(exc)[:500],
+        "source": source,
+    })
+    _cache_set_json_state(_shadow_failure_counter_key(), state, ttl_seconds=SHADOW_ALERT_WINDOW_SECONDS + 60)
+
+    error_payload = {
+        "event": "woo_sync_event_shadow_insert_failed",
+        "site": _site_name(),
+        "source": source,
+        "count": count,
+        "window_seconds": SHADOW_ALERT_WINDOW_SECONDS,
+        "error": str(exc),
+        "context": context or {},
+    }
+    try:
+        frappe.log_error(_to_json(error_payload), f"Woo Sync Shadow Insert Failed: {source}")
+    except Exception:
+        pass
+
+    last_alert = _coerce_datetime(state.get("last_alert"))
+    should_alert = count >= cfg.shadow_alert_threshold and (
+        last_alert is None or (now - last_alert).total_seconds() >= SHADOW_ALERT_WINDOW_SECONDS
+    )
+    if should_alert:
+        state["last_alert"] = now.isoformat()
+        _cache_set_json_state(_shadow_failure_counter_key(), state, ttl_seconds=SHADOW_ALERT_WINDOW_SECONDS + 60)
+        alert_payload = {
+            **error_payload,
+            "threshold": cfg.shadow_alert_threshold,
+            "alert": True,
+        }
+        try:
+            frappe.log_error(_to_json(alert_payload), "Woo Sync Shadow Insert Failure Threshold Exceeded")
+        except Exception:
+            pass
+        LOGGER.error(alert_payload)
+    else:
+        LOGGER.warning(error_payload)
+
+    return {"count": count, "threshold": cfg.shadow_alert_threshold}
+
+
+def _get_outbound_circuit_breaker_state(settings: WooCommerceSettings | None = None) -> dict[str, Any]:
+    cfg = get_sync_event_config(settings)
+    now = now_datetime()
+    state = _cache_get_json_state(_outbound_breaker_key())
+    failures: list[str] = []
+    for raw in state.get("failures", []) or []:
+        failure_time = _coerce_datetime(raw)
+        if failure_time and (now - failure_time).total_seconds() <= cfg.circuit_breaker_window_seconds:
+            failures.append(failure_time.isoformat())
+
+    open_until = _coerce_datetime(state.get("open_until"))
+    if open_until and open_until <= now:
+        _cache_delete_state(_outbound_breaker_key())
+        return {"failures": [], "open_until": None}
+
+    normalized = {
+        "failures": failures,
+        "open_until": open_until.isoformat() if open_until else None,
+    }
+    if normalized != state:
+        ttl_seconds = max(cfg.circuit_breaker_window_seconds, cfg.circuit_breaker_cooldown_seconds) + 60
+        _cache_set_json_state(_outbound_breaker_key(), normalized, ttl_seconds=ttl_seconds)
+    return {"failures": failures, "open_until": open_until}
+
+
+def _get_outbound_circuit_breaker_open_until(settings: WooCommerceSettings | None = None) -> datetime | None:
+    return _get_outbound_circuit_breaker_state(settings).get("open_until")
+
+
+def _clear_outbound_circuit_breaker() -> None:
+    _cache_delete_state(_outbound_breaker_key())
+
+
+def _record_outbound_circuit_breaker_failure(
+    detail: str | None = None,
+    *,
+    settings: WooCommerceSettings | None = None,
+) -> dict[str, Any]:
+    cfg = get_sync_event_config(settings)
+    now = now_datetime()
+    state = _get_outbound_circuit_breaker_state(settings)
+    failures = list(state.get("failures") or [])
+    failures.append(now.isoformat())
+    was_open = bool(state.get("open_until"))
+    open_until = state.get("open_until")
+    if len(failures) >= cfg.circuit_breaker_threshold:
+        open_until = now + timedelta(seconds=cfg.circuit_breaker_cooldown_seconds)
+
+    normalized = {
+        "failures": failures,
+        "open_until": open_until.isoformat() if open_until else None,
+    }
+    ttl_seconds = max(cfg.circuit_breaker_window_seconds, cfg.circuit_breaker_cooldown_seconds) + 60
+    _cache_set_json_state(_outbound_breaker_key(), normalized, ttl_seconds=ttl_seconds)
+
+    opened = bool(open_until) and not was_open
+    if opened:
+        payload = {
+            "event": "woo_sync_event_outbound_breaker_open",
+            "site": _site_name(),
+            "failure_count": len(failures),
+            "threshold": cfg.circuit_breaker_threshold,
+            "window_seconds": cfg.circuit_breaker_window_seconds,
+            "cooldown_seconds": cfg.circuit_breaker_cooldown_seconds,
+            "open_until": open_until.isoformat(),
+            "detail": detail or "",
+        }
+        try:
+            frappe.log_error(_to_json(payload), "Woo Sync Event Outbound Circuit Breaker Open")
+        except Exception:
+            pass
+        LOGGER.error(payload)
+
+    return {"failure_count": len(failures), "open_until": open_until, "opened": opened}
+
+
 def _event_doc_name(doc_or_name: Any) -> str | None:
     if not doc_or_name:
         return None
@@ -247,6 +471,7 @@ def create_sync_event(
     payload_hash = payload_hash or _hash_text(payload_text or desired_text)
     settings = WooCommerceSettings.get_settings()
     cfg = get_sync_event_config(settings)
+    created_on = now_datetime()
     doc_values = {
         "doctype": EVENT_DOCTYPE,
         "direction": direction,
@@ -268,8 +493,9 @@ def create_sync_event(
         "priority": priority,
         "attempt_count": 0,
         "max_attempts": max_attempts or cfg.max_attempts,
-        "next_attempt_at": next_attempt_at or now_datetime(),
-        "first_seen_on": now_datetime(),
+        "next_attempt_at": next_attempt_at or created_on,
+        "first_seen_on": created_on,
+        "completed_on": created_on if status in TERMINAL_STATUSES else None,
         "correlation_id": correlation_id,
         "parent_event": parent_event,
         "sync_log": sync_log,
@@ -486,6 +712,64 @@ def create_inbound_order_reference_event(
     )
 
 
+def _manual_push_result_detail(result: Any, error: str | None) -> str:
+    if error:
+        return error
+    if isinstance(result, dict):
+        return str(result.get("detail") or result.get("error") or result.get("reason") or "")
+    return ""
+
+
+def record_manual_push_audit_event(
+    *,
+    object_type: str,
+    docname: str,
+    result: Any = None,
+    error: str | None = None,
+) -> Any | None:
+    status = "Succeeded"
+    if error:
+        status = "Failed"
+    elif isinstance(result, dict) and (result.get("status") == "error" or result.get("success") is False):
+        status = "Failed"
+
+    try:
+        event = create_sync_event(
+            direction="Outbound",
+            event_type="manual_push",
+            source_system="ERPNext",
+            target_system="WooCommerce",
+            object_type=object_type,
+            source_id=docname,
+            local_doctype=object_type,
+            local_docname=docname,
+            idempotency_key=_build_idempotency_key("manual:erp", object_type, f"{docname}:{uuid.uuid4().hex}"),
+            payload_json={"docname": docname, "object_type": object_type},
+            remote_response_json=result or ({"error": error} if error else None),
+            priority=OUTBOUND_PRIORITY,
+            status=status,
+            manual_review_reason="manual_push_failed" if status == "Failed" else None,
+        )
+        if status == "Failed":
+            event.db_set(
+                {
+                    "last_error": _manual_push_result_detail(result, error)[:500],
+                    "manual_review_reason": "manual_push_failed",
+                    "completed_on": now_datetime(),
+                },
+                update_modified=False,
+            )
+        return event
+    except Exception:  # noqa: BLE001
+        LOGGER.error({
+            "event": "woo_sync_event_manual_push_audit_failed",
+            "object_type": object_type,
+            "docname": docname,
+            "traceback": frappe.get_traceback(),
+        })
+        return None
+
+
 def enqueue_sync_event(event_name: str, *, after_commit: bool = True, queue: str = "short") -> None:
     frappe.enqueue(
         "jarz_woocommerce_integration.services.sync_events.process_sync_event",
@@ -496,34 +780,137 @@ def enqueue_sync_event(event_name: str, *, after_commit: bool = True, queue: str
     )
 
 
-def _claim_sync_event(event_name: str) -> Any | None:
+def _breaker_pause_reason(open_until: datetime) -> str:
+    return f"Paused by outbound circuit breaker until {open_until.isoformat()}"
+
+
+def _defer_single_event_for_breaker(event_name: str, open_until: datetime) -> None:
+    frappe.db.set_value(
+        EVENT_DOCTYPE,
+        event_name,
+        {
+            "next_attempt_at": open_until,
+            "last_error": _breaker_pause_reason(open_until)[:500],
+        },
+        update_modified=False,
+    )
+    frappe.db.commit()
+
+
+def _recover_stale_processing_events() -> int:
     now = now_datetime()
-    worker_id = f"{frappe.local.site}:{uuid.uuid4().hex[:12]}"
-    lock_until = now + timedelta(seconds=LOCK_TIMEOUT_SECONDS)
+    names = frappe.get_all(
+        EVENT_DOCTYPE,
+        filters={
+            "status": "Processing",
+            "locked_until": ["<", now],
+        },
+        pluck="name",
+        limit_page_length=500,
+    )
+    if not names:
+        return 0
+    placeholders = ", ".join(["%s"] * len(names))
+    frappe.db.sql(
+        f"""
+        UPDATE `tabWooCommerce Sync Event`
+        SET status = 'Pending',
+            locked_by = '',
+            locked_until = NULL,
+            completed_on = NULL,
+            next_attempt_at = %s,
+            last_error = 'Recovered from stale lock'
+        WHERE name IN ({placeholders})
+        """,
+        tuple([now, *names]),
+    )
+    frappe.db.commit()
+    return len(names)
+
+
+def _defer_outbound_events_for_breaker(open_until: datetime) -> int:
+    now = now_datetime()
     frappe.db.sql(
         """
+        UPDATE `tabWooCommerce Sync Event`
+        SET next_attempt_at = %s,
+            last_error = %s
+        WHERE direction = 'Outbound'
+          AND status IN ('Pending', 'RetryScheduled')
+          AND (next_attempt_at IS NULL OR next_attempt_at < %s)
+          AND (locked_until IS NULL OR locked_until < %s)
+        """,
+        (open_until, _breaker_pause_reason(open_until)[:500], open_until, now),
+    )
+    row_count = 0
+    try:
+        count_rows = frappe.db.sql("SELECT ROW_COUNT() AS row_count", as_dict=True)
+        if count_rows:
+            row_count = int(count_rows[0].get("row_count") or 0)
+    except Exception:
+        row_count = 0
+    if row_count:
+        frappe.db.commit()
+    return row_count
+
+
+def _claim_due_sync_events(
+    *,
+    batch_size: int,
+    settings: WooCommerceSettings | None = None,
+    allow_outbound: bool = True,
+    event_name: str | None = None,
+) -> list[Any]:
+    settings = settings or WooCommerceSettings.get_settings()
+    cfg = get_sync_event_config(settings)
+    now = now_datetime()
+    worker_id = f"{_site_name()}:{uuid.uuid4().hex[:12]}"
+    lock_until = now + timedelta(seconds=cfg.lock_ttl_seconds)
+    params: list[Any] = [now, now]
+    sql = [
+        "SELECT name",
+        "FROM `tabWooCommerce Sync Event`",
+        "WHERE status IN ('Pending', 'RetryScheduled')",
+        "  AND (next_attempt_at IS NULL OR next_attempt_at <= %s)",
+        "  AND (locked_until IS NULL OR locked_until < %s)",
+    ]
+    if event_name:
+        sql.append("  AND name = %s")
+        params.append(event_name)
+    if not allow_outbound:
+        sql.append("  AND direction != 'Outbound'")
+    sql.extend([
+        "ORDER BY priority ASC, first_seen_on ASC",
+        "LIMIT %s",
+        "FOR UPDATE SKIP LOCKED",
+    ])
+    params.append(max(1, int(batch_size)))
+    rows = frappe.db.sql("\n".join(sql), tuple(params), as_dict=True)
+    if not rows:
+        return []
+    names = [row["name"] for row in rows if row.get("name")]
+    if not names:
+        return []
+    placeholders = ", ".join(["%s"] * len(names))
+    frappe.db.sql(
+        f"""
         UPDATE `tabWooCommerce Sync Event`
         SET status = 'Processing',
             locked_by = %s,
             locked_until = %s,
             started_on = %s,
             attempt_count = IFNULL(attempt_count, 0) + 1
-        WHERE name = %s
-          AND status IN ('Pending', 'RetryScheduled')
-          AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
-          AND (locked_until IS NULL OR locked_until < %s)
+        WHERE name IN ({placeholders})
         """,
-        (worker_id, lock_until, now, event_name, now, now),
+        tuple([worker_id, lock_until, now, *names]),
     )
-    row = frappe.db.get_value(
-        EVENT_DOCTYPE,
-        event_name,
-        ["name", "locked_by", "status"],
-        as_dict=True,
-    )
-    if not row or row.get("locked_by") != worker_id or row.get("status") != "Processing":
-        return None
-    return frappe.get_doc(EVENT_DOCTYPE, event_name)
+    frappe.db.commit()
+    return [frappe.get_doc(EVENT_DOCTYPE, name) for name in names]
+
+
+def _claim_sync_event(event_name: str, settings: WooCommerceSettings | None = None) -> Any | None:
+    rows = _claim_due_sync_events(batch_size=1, settings=settings, event_name=event_name)
+    return rows[0] if rows else None
 
 
 def _backoff_minutes(attempt_count: int) -> int:
@@ -558,7 +945,7 @@ def _mark_event(
         "traceback": traceback_text or "",
         "locked_by": "",
         "locked_until": None,
-        "completed_on": now_datetime() if status in {"Succeeded", "Skipped", "Superseded", "NeedsReview", "DeadLetter"} else None,
+        "completed_on": now_datetime() if status in TERMINAL_STATUSES else None,
         "next_attempt_at": next_attempt_at,
     }
     event_doc.db_set(updates, update_modified=False)
@@ -630,6 +1017,8 @@ def _handle_exception(event_doc: Any, exc: Exception) -> dict[str, Any]:
     detail = str(exc) or exc.__class__.__name__
     if isinstance(exc, WooAPIError):
         if exc.status_code in TRANSIENT_HTTP_STATUS_CODES:
+            if event_doc.direction == "Outbound":
+                _record_outbound_circuit_breaker_failure(detail)
             if int(getattr(event_doc, "attempt_count", 0) or 0) >= int(getattr(event_doc, "max_attempts", 1) or 1):
                 return _mark_dead_letter(event_doc, None, detail)
             return _schedule_retry(event_doc, error_text=detail)
@@ -639,6 +1028,8 @@ def _handle_exception(event_doc: Any, exc: Exception) -> dict[str, Any]:
         return _mark_dead_letter(event_doc, None, detail)
     if _classify_text_reason(detail) == "review":
         return _mark_needs_review(event_doc, None, detail)
+    if event_doc.direction == "Outbound":
+        _record_outbound_circuit_breaker_failure(detail)
     return _schedule_retry(event_doc, error_text=detail)
 
 
@@ -690,6 +1081,8 @@ def _apply_outbound_result(event_doc: Any, result: Any) -> dict[str, Any]:
             return _mark_skipped(event_doc, result, str(result.get("reason") or "skipped"))
         if result.get("status") == "error" or result.get("success") is False:
             detail = str(result.get("detail") or result.get("error") or result.get("reason") or "error")
+            if _classify_text_reason(detail) == "retry":
+                _record_outbound_circuit_breaker_failure(detail)
             return _handle_failure(event_doc, result=result, detail=detail)
     return _mark_success(event_doc, result)
 
@@ -717,11 +1110,7 @@ def _apply_inbound_result(event_doc: Any, result: Any) -> dict[str, Any]:
     return _mark_success(event_doc, result)
 
 
-def process_sync_event(event_name: str) -> dict[str, Any]:
-    event_doc = _claim_sync_event(event_name)
-    if not event_doc:
-        return {"skipped": True, "reason": "not_due_or_already_claimed", "event_name": event_name}
-
+def _process_claimed_event(event_doc: Any) -> dict[str, Any]:
     payload = _from_json(getattr(event_doc, "payload_json", ""))
     if not isinstance(payload, dict):
         payload = {"raw": payload}
@@ -730,21 +1119,43 @@ def process_sync_event(event_name: str) -> dict[str, Any]:
         if event_doc.direction == "Outbound":
             result = _dispatch_outbound_event(event_doc, payload)
             outcome = _apply_outbound_result(event_doc, result)
+            if outcome.get("status") == "succeeded":
+                _clear_outbound_circuit_breaker()
         else:
             result = _dispatch_inbound_event(event_doc, payload)
             outcome = _apply_inbound_result(event_doc, result)
         frappe.db.commit()
-        return {"event_name": event_name, **outcome}
+        return {"event_name": event_doc.name, **outcome}
     except Exception as exc:  # noqa: BLE001
         LOGGER.error({
             "event": "woo_sync_event_process_error",
-            "event_name": event_name,
+            "event_name": event_doc.name,
             "traceback": frappe.get_traceback(),
         })
         outcome = _handle_exception(event_doc, exc)
         event_doc.db_set({"traceback": frappe.get_traceback()}, update_modified=False)
         frappe.db.commit()
-        return {"event_name": event_name, **outcome}
+        return {"event_name": event_doc.name, **outcome}
+
+
+def process_sync_event(event_name: str) -> dict[str, Any]:
+    settings = WooCommerceSettings.get_settings()
+    open_until = _get_outbound_circuit_breaker_open_until(settings)
+    if open_until:
+        row = frappe.db.get_value(EVENT_DOCTYPE, event_name, ["name", "direction", "status"], as_dict=True)
+        if row and row.get("direction") == "Outbound" and row.get("status") in PROCESSING_STATUSES:
+            _defer_single_event_for_breaker(event_name, open_until)
+            return {
+                "skipped": True,
+                "reason": "breaker_open",
+                "event_name": event_name,
+                "retry_after": open_until.isoformat(),
+            }
+
+    event_doc = _claim_sync_event(event_name, settings=settings)
+    if not event_doc:
+        return {"skipped": True, "reason": "not_due_or_already_claimed", "event_name": event_name}
+    return _process_claimed_event(event_doc)
 
 
 def process_due_sync_events(batch_size: int | None = None) -> dict[str, Any]:  # pragma: no cover
@@ -756,24 +1167,28 @@ def process_due_sync_events(batch_size: int | None = None) -> dict[str, Any]:  #
         return {"skipped": True, "reason": "worker_disabled"}
 
     effective_batch_size = max(1, int(batch_size or cfg.batch_size))
-    now = now_datetime()
-    rows = frappe.db.sql(
-        """
-        SELECT name
-        FROM `tabWooCommerce Sync Event`
-        WHERE status IN ('Pending', 'RetryScheduled')
-          AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
-          AND (locked_until IS NULL OR locked_until < %s)
-        ORDER BY priority ASC, first_seen_on ASC
-        LIMIT %s
-        """,
-        (now, now, effective_batch_size),
-        as_dict=True,
+    recovered = _recover_stale_processing_events()
+    open_until = _get_outbound_circuit_breaker_open_until(settings)
+    deferred = _defer_outbound_events_for_breaker(open_until) if open_until else 0
+    rows = _claim_due_sync_events(
+        batch_size=effective_batch_size,
+        settings=settings,
+        allow_outbound=not bool(open_until),
     )
 
-    summary = {"processed": 0, "succeeded": 0, "skipped": 0, "retry": 0, "needs_review": 0, "dead_letter": 0}
-    for row in rows:
-        result = process_sync_event(row["name"])
+    summary = {
+        "processed": 0,
+        "succeeded": 0,
+        "skipped": 0,
+        "retry": 0,
+        "needs_review": 0,
+        "dead_letter": 0,
+        "recovered_stale": recovered,
+        "deferred_by_breaker": deferred,
+        "breaker_open_until": open_until.isoformat() if open_until else None,
+    }
+    for event_doc in rows:
+        result = _process_claimed_event(event_doc)
         summary["processed"] += 1
         outcome = str(result.get("status") or "").lower()
         if outcome == "succeeded":
