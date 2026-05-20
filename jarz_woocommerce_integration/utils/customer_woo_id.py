@@ -61,11 +61,17 @@ def normalize_woo_customer_id(value: Any) -> str | None:
 
 def get_customer_woo_id(customer: Any) -> str | None:
     if isinstance(customer, str):
-        value = frappe.db.get_value("Customer", customer, "woo_customer_id")
+        try:
+            value = frappe.db.get_value("Customer", customer, "woo_customer_id")
+        except Exception:
+            value = None
     else:
         value = getattr(customer, "woo_customer_id", None)
         if value is None and getattr(customer, "name", None):
-            value = frappe.db.get_value("Customer", customer.name, "woo_customer_id")
+            try:
+                value = frappe.db.get_value("Customer", customer.name, "woo_customer_id")
+            except Exception:
+                value = None
     return normalize_woo_customer_id(value)
 
 
@@ -78,11 +84,17 @@ def get_legacy_customer_woo_id(customer: Any) -> str | None:
         return None
 
     if isinstance(customer, str):
-        value = frappe.db.get_value("Customer", customer, "custom_woo_customer_id")
+        try:
+            value = frappe.db.get_value("Customer", customer, "custom_woo_customer_id")
+        except Exception:
+            value = None
     else:
         value = getattr(customer, "custom_woo_customer_id", None)
         if value is None and getattr(customer, "name", None):
-            value = frappe.db.get_value("Customer", customer.name, "custom_woo_customer_id")
+            try:
+                value = frappe.db.get_value("Customer", customer.name, "custom_woo_customer_id")
+            except Exception:
+                value = None
     return normalize_woo_customer_id(value)
 
 

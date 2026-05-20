@@ -453,13 +453,21 @@ def _safe_insert_customer(
     the order_id and retried once before raising.
     """
     sp = "woo_cust_ins"
+    savepoint = getattr(frappe.db, "savepoint", None)
+    release_savepoint = getattr(frappe.db, "release_savepoint", None)
+    rollback = getattr(frappe.db, "rollback", None)
+    supports_savepoints = callable(savepoint) and callable(release_savepoint) and callable(rollback)
+
     try:
-        frappe.db.savepoint(sp)
+        if supports_savepoints:
+            savepoint(sp)
         doc.insert(ignore_permissions=True)
-        frappe.db.release_savepoint(sp)
+        if supports_savepoints:
+            release_savepoint(sp)
         return doc.name
     except frappe.DuplicateEntryError:
-        frappe.db.rollback(save_point=sp)
+        if supports_savepoints:
+            rollback(save_point=sp)
         frappe.logger("woo").info(
             f"recovered_from_race customer woo_cid={woo_customer_id} order={order_id}"
         )
