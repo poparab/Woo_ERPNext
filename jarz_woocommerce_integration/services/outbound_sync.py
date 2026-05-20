@@ -1060,7 +1060,7 @@ def _is_bundle_parent_item(
     product_identifier: str | None,
     registered_bundle_product_ids: set[str],
 ) -> bool:
-    if getattr(item, "is_bundle_parent", 0):
+    if _is_truthy_flag(getattr(item, "is_bundle_parent", 0)):
         return True
 
     product_id, variation_id = _parse_product_identifier(product_identifier)
@@ -1070,11 +1070,16 @@ def _is_bundle_parent_item(
     if str(product_id) not in registered_bundle_product_ids:
         return False
 
+    price_list_rate = flt(_get_doc_value(item, "price_list_rate", 0))
+    rate = flt(_get_doc_value(item, "rate", 0))
+    amount = flt(_get_doc_value(item, "amount", 0))
+    discount_percentage = flt(_get_doc_value(item, "discount_percentage", 0))
+
     return (
-        flt(getattr(item, "price_list_rate", 0)) > 0
-        and flt(getattr(item, "rate", 0)) <= 0
-        and flt(getattr(item, "amount", 0)) <= 0
-        and flt(getattr(item, "discount_percentage", 0)) >= 100
+        price_list_rate > 0
+        and rate <= 0
+        and amount <= 0
+        and discount_percentage >= 100
     )
 
 
@@ -1092,6 +1097,9 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
         qty = flt(item.qty)
         if qty <= 0:
             continue
+        price_list_rate = flt(_get_doc_value(item, "price_list_rate", 0))
+        rate = flt(_get_doc_value(item, "rate", 0))
+        amount = flt(_get_doc_value(item, "amount", 0))
         product_row = _get_item_product_row(item.item_code, cache=item_product_rows)
         product_identifier = (product_row or {}).get("woo_product_id")
         product_id, variation_id = _parse_product_identifier(product_identifier)
@@ -1124,12 +1132,12 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
         ):
             continue
 
-        subtotal_base = item.price_list_rate or item.rate
-        subtotal = subtotal_base * qty if subtotal_base else item.amount
+        subtotal_base = price_list_rate or rate
+        subtotal = subtotal_base * qty if subtotal_base else amount
         entry = {
             "quantity": int(qty),
             "subtotal": _format_money(subtotal),
-            "total": _format_money(item.amount),
+            "total": _format_money(amount),
             "name": item.item_name or item.item_code,
             "meta_data": [
                 {"key": "erpnext_item_code", "value": item.item_code},
@@ -1139,8 +1147,9 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
             entry["product_id"] = product_id
         if variation_id:
             entry["variation_id"] = variation_id
-        if getattr(item, "discount_percentage", None):
-            entry["meta_data"].append({"key": "discount_percentage", "value": flt(item.discount_percentage)})
+        discount_percentage = flt(_get_doc_value(item, "discount_percentage", 0))
+        if discount_percentage:
+            entry["meta_data"].append({"key": "discount_percentage", "value": discount_percentage})
 
         if _is_explicit_bundle_child_item(item):
             parent_product_id = explicit_bundle_parent_product_ids.get(_get_bundle_link_key(item))
@@ -1319,10 +1328,10 @@ def _should_enqueue_invoice_event(
         return True
     if method != "on_update_after_submit":
         return True
-    if _has_missing_or_stale_woo_order_mapping(invoice):
-        return True
     if _should_skip_acceptance_only_update(invoice, method=method, cancel=cancel):
         return False
+    if _has_missing_or_stale_woo_order_mapping(invoice):
+        return True
     if _has_approved_invoice_status_change(invoice, cancel=cancel):
         return True
     if _has_any_value_changed(invoice, _INVOICE_OUTBOUND_DELIVERY_FIELDS):
@@ -1894,6 +1903,7 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
 
     original_woo_order_id = getattr(invoice, "woo_order_id", None)
     woo_order_id = original_woo_order_id or _recover_amended_invoice_woo_order_id(invoice)
+    recovered_amended_order_id = bool(woo_order_id and not original_woo_order_id)
     existing_order: Optional[Dict[str, Any]] = None
     if woo_order_id:
         try:
@@ -1925,7 +1935,13 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         _mark_invoice_status(invoice_name, status="error", error=str(exc))
         return {"status": "error", "detail": str(exc)}
 
-    if order_map_exists and woo_order_id and existing_order and not _order_payload_requires_update(existing_order, payload):
+    if (
+        order_map_exists
+        and woo_order_id
+        and existing_order
+        and not recovered_amended_order_id
+        and not _order_payload_requires_update(existing_order, payload)
+    ):
         _mark_invoice_status(invoice_name, status="Synced")
         LOGGER.info({
             "event": "woo_outbound_invoice_already_in_sync",
