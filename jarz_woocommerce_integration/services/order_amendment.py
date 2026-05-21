@@ -78,6 +78,18 @@ def run_woo_amendment_job(
             return {"status": "skipped", "reason": "locked", "woo_order_id": woo_order_id}
 
         settings = frappe.get_single(settings_name)
+        if not bool(int(getattr(settings, "enable_inbound_amendment", 0) or 0)):
+            _write_sync_log(
+                "WooAmendment",
+                "Skipped",
+                "auto amendment disabled by WooCommerce Settings",
+                woo_order_id,
+            )
+            return {
+                "status": "skipped",
+                "reason": "auto_amendment_disabled",
+                "woo_order_id": woo_order_id,
+            }
 
         # ── 2. Locate source Sales Invoice via Order Map ──────────────────────
         LINK_FIELD = _resolve_link_field()
@@ -495,14 +507,10 @@ def _find_existing_replacement(source_si_name: str, new_hash: str) -> str | None
         return None
     candidate = rows[0]["name"]
     # Check Order Map hash — if hash already matches, the amendment is idempotent.
-    from jarz_woocommerce_integration.services.order_sync import _compute_order_hash  # noqa: F401 — already imported above but kept for clarity
+    link_field = _resolve_link_field()
     stored_hash = frappe.db.get_value(
         "WooCommerce Order Map",
-        {"erpnext_sales_invoice": candidate},
-        "hash",
-    ) or frappe.db.get_value(
-        "WooCommerce Order Map",
-        {"sales_invoice": candidate},
+        {link_field: candidate},
         "hash",
     ) or ""
     if stored_hash == new_hash:

@@ -6,7 +6,7 @@ Tests for the item-edit detection and amendment-orchestration flow introduced
 in Phase 2 of the Woo-driven invoice amendment feature.
 
 Coverage:
-  - _compute_order_hash now includes per-line fingerprints, payment_method, shipping.
+    - _compute_order_hash includes financial/order-line fingerprints and ignores volatile Woo metadata.
   - process_order_phase1: OFD permanent hard-lock (custom_was_out_for_delivery).
   - process_order_phase1: item-edit detection via hash comparison.
   - process_order_phase1: enqueue amendment job when enable_inbound_amendment=1
@@ -20,6 +20,8 @@ Coverage:
 """
 from __future__ import annotations
 
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
@@ -98,6 +100,7 @@ def _make_fake_inv(
     was_ofd: int = 0,
     inv_state: str = "New",
     name: str = "ACC-SINV-99001",
+    items: list | None = None,
 ) -> SimpleNamespace:
     inv = SimpleNamespace(
         doctype="Sales Invoice",
@@ -112,6 +115,7 @@ def _make_fake_inv(
         customer="Test Customer",
         company="_Test Company",
         posting_date="2026-06-01",
+        items=items or [],
         flags=SimpleNamespace(),
     )
     inv.set = lambda field, val: None
@@ -175,6 +179,20 @@ def _setup_submitted_mocks(monkeypatch, *, fake_inv, stored_hash: str = ""):
     monkeypatch.setattr(order_sync.frappe, "enqueue", MagicMock())
     monkeypatch.setattr(order_sync, "_check_and_repair_submitted_invoice_drift", lambda *a, **kw: None)
     monkeypatch.setattr(order_sync, "_flag_order_map_for_manual_review", MagicMock())
+    monkeypatch.setattr(
+        order_sync,
+        "ensure_customer_with_addresses",
+        lambda order, settings, **kwargs: ("Test Customer", "Billing-001", "Shipping-001"),
+    )
+    monkeypatch.setattr(
+        order_sync,
+        "_build_invoice_items",
+        lambda order, price_list=None, cache=None, is_historical=False: (
+            [{"item_code": "ITEM-001", "qty": 2, "rate": 100.0}],
+            [],
+            {},
+        ),
+    )
     monkeypatch.setattr(order_sync.frappe.utils, "now_datetime", lambda: "2026-06-01 12:00:00")
 
     return sync_log_inserts
@@ -207,10 +225,15 @@ class TestComputeOrderHash:
         ])
         assert _compute_order_hash(order_a) != _compute_order_hash(order_b)
 
-    def test_different_payment_method_different_hash(self):
+    def test_different_payment_method_same_hash(self):
         order_a = _make_woo_order(payment_method="cod")
         order_b = _make_woo_order(payment_method="instapay")
-        assert _compute_order_hash(order_a) != _compute_order_hash(order_b)
+        assert _compute_order_hash(order_a) == _compute_order_hash(order_b)
+
+    def test_different_modified_date_same_hash(self):
+        order_a = _make_woo_order(date_modified="2026-06-01T10:00:00")
+        order_b = _make_woo_order(date_modified="2026-06-01T12:00:00")
+        assert _compute_order_hash(order_a) == _compute_order_hash(order_b)
 
     def test_different_shipping_total_different_hash(self):
         order_a = _make_woo_order(shipping_lines=[{"total": "20.00"}])
@@ -301,6 +324,18 @@ class TestItemEditDetection:
         call_kwargs = order_sync.frappe.enqueue.call_args
         assert "order_amendment.run_woo_amendment_job" in call_kwargs[0][0]
 
+    def test_hash_changed_but_lines_match_refreshes_hash_without_amendment(self, monkeypatch):
+        order = _make_woo_order(status="processing", date_modified="2026-06-01T12:00:00")
+        fake_inv = _make_fake_inv(items=[{"item_code": "ITEM-001", "qty": 2, "rate": 100.0}])
+        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="legacy-volatile-hash")
+
+        result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "submitted_frozen"
+        order_sync.frappe.enqueue.assert_not_called()
+        order_sync.frappe.db.set_value.assert_called()
+
     def test_hash_changed_flag_on_ineligible_status_flags_manual_review(self, monkeypatch):
         order = _make_woo_order(status="completed")
         fake_inv = _make_fake_inv()
@@ -310,12 +345,14 @@ class TestItemEditDetection:
         assert result["reason"] == "needs_manual_review"
         order_sync._flag_order_map_for_manual_review.assert_called_once()
 
-    def test_on_hold_status_also_enqueues(self, monkeypatch):
+    def test_on_hold_status_is_skipped_before_amendment(self, monkeypatch):
         order = _make_woo_order(status="on-hold")
         fake_inv = _make_fake_inv()
         _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
         result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
-        assert result["status"] == "queued"
+        assert result["status"] == "skipped"
+        assert result["reason"] == "pending_payment"
+        order_sync.frappe.enqueue.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +364,7 @@ class TestRunWooAmendmentJobGuards:
 
     def _patch_frappe(self, monkeypatch, *, order_map_row=None, source_si=None,
                        sql_returns=None, eligibility=None,
-                       amend_depth=0, period_block=None):
+                       amend_depth=0, period_block=None, enable_amendment=1):
         import jarz_woocommerce_integration.services.order_amendment as oa
 
         normalized_order_map_row = vars(order_map_row) if isinstance(order_map_row, SimpleNamespace) else order_map_row
@@ -347,7 +384,7 @@ class TestRunWooAmendmentJobGuards:
         monkeypatch.setattr(oa.frappe.db, "set_value", MagicMock())
 
         def _fake_get_single(name):
-            return SimpleNamespace(name=name, enable_inbound_amendment=1)
+            return SimpleNamespace(name=name, enable_inbound_amendment=enable_amendment)
 
         monkeypatch.setattr(oa.frappe, "get_single", _fake_get_single)
 
@@ -371,6 +408,17 @@ class TestRunWooAmendmentJobGuards:
         monkeypatch.setattr(oa, "_write_sync_log", MagicMock())
         monkeypatch.setattr(oa, "_resolve_link_field", lambda: "erpnext_sales_invoice")
 
+        manager_module = types.ModuleType("jarz_pos.api.manager")
+        manager_module.get_invoice_amendment_eligibility = lambda inv: eligibility or {
+            "can_amend": True,
+            "amendment_block_code": None,
+            "amendment_block_reason": None,
+        }
+        manager_module._find_submitted_payment_entries = lambda invoice_name: []
+        manager_module._mark_source_invoice_as_amended = MagicMock()
+        manager_module._add_invoice_audit_comment = MagicMock()
+        monkeypatch.setitem(sys.modules, "jarz_pos.api.manager", manager_module)
+
         return oa
 
     def test_advisory_lock_fail_returns_skipped(self, monkeypatch):
@@ -390,6 +438,12 @@ class TestRunWooAmendmentJobGuards:
         result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
         assert result["status"] == "skipped"
         assert result["reason"] == "no_order_map"
+
+    def test_auto_amendment_disabled_returns_skipped_before_lookup(self, monkeypatch):
+        oa = self._patch_frappe(monkeypatch, order_map_row=None, enable_amendment=0)
+        result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
+        assert result["status"] == "skipped"
+        assert result["reason"] == "auto_amendment_disabled"
 
     def test_ofd_hard_lock_blocks(self, monkeypatch):
         order_map_row = SimpleNamespace(

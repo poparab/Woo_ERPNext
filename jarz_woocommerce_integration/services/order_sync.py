@@ -606,22 +606,52 @@ def _compute_order_hash(order: dict) -> str:
     shipping_total = sum(
         float(s.get("total") or 0) for s in shipping_lines if s.get("total")
     )
-    billing = order.get("billing") or {}
-    shipping = order.get("shipping") or {}
     payload = {
         "id": order.get("id"),
         "total": order.get("total"),
         "currency": order.get("currency"),
-        "status": order.get("status"),
-        "payment_method": order.get("payment_method"),
         "shipping_total": f"{shipping_total:.2f}",
-        "billing_postcode": billing.get("postcode"),
-        "shipping_postcode": shipping.get("postcode"),
         "lines": line_fingerprints,
-        "updated": order.get("date_modified") or order.get("date_created"),
     }
     b = _json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(b).hexdigest()
+
+
+def _stable_line_value(value: Any, *, places: int = 6) -> Any:
+    if value in (None, ""):
+        return None
+    try:
+        return round(float(value), places)
+    except Exception:
+        return str(value).strip()
+
+
+def _invoice_line_signature(row: Any) -> tuple[Any, ...]:
+    rate = _row_value(row, "rate", 0) or 0
+    price_list_rate = _row_value(row, "price_list_rate", None)
+    if price_list_rate in (None, ""):
+        price_list_rate = rate
+    return (
+        str(_row_value(row, "item_code", "") or ""),
+        _stable_line_value(_row_value(row, "qty", 0) or 0),
+        _stable_line_value(rate, places=4),
+        _stable_line_value(price_list_rate, places=4),
+        _stable_line_value(_row_value(row, "discount_percentage", 0) or 0, places=4),
+        _stable_line_value(_row_value(row, "discount_amount", 0) or 0, places=4),
+        int(float(_row_value(row, "is_bundle_parent", 0) or 0)),
+        int(float(_row_value(row, "is_bundle_child", 0) or 0)),
+        str(_row_value(row, "bundle_code", "") or ""),
+        str(_row_value(row, "parent_bundle", "") or ""),
+    )
+
+
+def _submitted_invoice_matches_target_lines(inv: Any, target_lines: list[dict]) -> bool:
+    invoice_lines = list(inv.get("items", []) or [])
+    if len(invoice_lines) != len(target_lines):
+        return False
+    invoice_signature = sorted(_invoice_line_signature(row) for row in invoice_lines)
+    target_signature = sorted(_invoice_line_signature(row) for row in target_lines)
+    return invoice_signature == target_signature
 
 
 def _get_line_meta_value(meta_data_list: list[dict] | None, target_key: str) -> Any | None:
@@ -2584,10 +2614,38 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 new_hash = _compute_order_hash(order)
                 stored_hash = (existing_map or {}).get("hash") or ""
                 hash_changed = new_hash != stored_hash
+                item_lines_changed = not _submitted_invoice_matches_target_lines(inv, lines)
+
+                if hash_changed and not item_lines_changed:
+                    if existing_map and existing_map.get("name"):
+                        frappe.db.set_value(
+                            "WooCommerce Order Map",
+                            existing_map["name"],
+                            {
+                                "hash": new_hash,
+                                "status": order.get("status"),
+                                "synced_on": frappe.utils.now_datetime(),
+                            },
+                            update_modified=True,
+                        )
+                    create_sync_log_entry(
+                        "InboundSkip",
+                        "Skipped",
+                        f"submitted_frozen: {inv.name} is submitted; "
+                        "volatile Woo metadata changed but invoice items still match",
+                        woo_order_id=woo_id,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "submitted_frozen",
+                        "woo_order_id": woo_id,
+                        "invoice": inv.name,
+                    }
 
                 amendment_statuses = {"processing", "on-hold"}
                 can_auto_amend = (
                     hash_changed
+                    and item_lines_changed
                     and woo_status in amendment_statuses
                     and bool(int(getattr(settings, "enable_inbound_amendment", None) or 0))
                 )
