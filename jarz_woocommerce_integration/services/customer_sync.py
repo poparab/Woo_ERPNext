@@ -860,6 +860,7 @@ def _create_address(customer: str, address_type: str, data: dict, phone: str | N
             }
         ],
     })
+    addr.flags.ignore_woo_outbound = True
     # Best-effort Redis lock to minimise duplicate insert attempts before
     # falling through to the savepoint-based recovery in _safe_insert_address.
     _alock = None
@@ -878,7 +879,8 @@ def _create_address(customer: str, address_type: str, data: dict, phone: str | N
             _recheck = _find_existing_address_for_customer(customer, address_type, data)
             if _recheck:
                 return _recheck
-        return _safe_insert_address(addr, customer=customer, data=data, order_id=order_id)
+        with _suppress_woo_outbound():
+            return _safe_insert_address(addr, customer=customer, data=data, order_id=order_id)
     finally:
         if _alock is not None and _alock_acquired:
             try:

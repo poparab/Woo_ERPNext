@@ -2,6 +2,7 @@
 
 Covers _safe_insert_address and the Redis lock + re-check path in _create_address.
 """
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -132,9 +133,6 @@ class TestCreateAddressRedisLock(unittest.TestCase):
              patch.object(customer_sync, "_find_existing_address_for_customer",
                           return_value="ADDR-CONCURRENT") as find_existing, \
              patch.object(customer_sync, "_safe_insert_address") as safe_insert, \
-             patch("jarz_woocommerce_integration.services.customer_sync."
-                   "_create_address.__code__",  # keep patch scoped to module-level import
-                   customer_sync._create_address.__code__), \
              patch("frappe.utils.background_jobs.get_redis_conn",
                    return_value=mock_redis):
             result = customer_sync._create_address(
@@ -169,6 +167,33 @@ class TestCreateAddressRedisLock(unittest.TestCase):
 
         safe_insert.assert_called_once()
         self.assertEqual(result, "ADDR-NEW")
+
+    def test_safe_insert_runs_with_outbound_suppressed(self):
+        """Inbound address inserts must not trigger outbound customer push hooks."""
+        data = self._billing()
+        addr_doc = _make_addr_doc("ADDR-NEW")
+
+        def _assert_suppressed(addr, *, customer, data, order_id):
+            self.assertTrue(getattr(addr.flags, "ignore_woo_outbound", False))
+            self.assertTrue(getattr(customer_sync.frappe.flags, "ignore_woo_outbound", False))
+            return "ADDR-NEW"
+
+        with patch.object(customer_sync.frappe, "get_doc", return_value=addr_doc), \
+             patch.object(customer_sync.frappe, "flags", SimpleNamespace()), \
+             patch.object(customer_sync, "_resolve_country", return_value="Egypt"), \
+             patch.object(customer_sync, "_find_existing_address_for_customer",
+                          return_value=None), \
+             patch.object(customer_sync, "_safe_insert_address",
+                          side_effect=_assert_suppressed) as safe_insert, \
+             patch("frappe.utils.background_jobs.get_redis_conn",
+                   side_effect=Exception("Redis down")):
+            result = customer_sync._create_address(
+                "Ahmed Mohamed", "Billing", data, "01012345678", "ahmed@example.com", 14476
+            )
+
+        safe_insert.assert_called_once()
+        self.assertEqual(result, "ADDR-NEW")
+        self.assertFalse(getattr(customer_sync.frappe.flags, "ignore_woo_outbound", False))
 
     def test_redis_unavailable_falls_through_to_safe_insert(self):
         """When Redis raises, the lock is skipped and _safe_insert_address is still called."""
