@@ -727,6 +727,50 @@ class TestOutboundStatusSync(unittest.TestCase):
             "meta_data": [{"key": "_orddd_delivery_date", "value": "Wednesday, May 06, 2026"}],
         })])
 
+    def test_sync_sales_invoice_updates_paid_state_even_when_status_matches(self):
+        invoice = DummyInvoice(sales_invoice_state="Recieved")
+        client = DummyResponseClient(
+            existing_order={
+                "id": 14500,
+                "status": "processing",
+                "payment_method": "cod",
+                "payment_method_title": "Cash",
+                "date_paid": None,
+                "date_paid_gmt": None,
+            },
+            response={
+                "id": 14500,
+                "number": "14500",
+                "status": "processing",
+                "payment_method": "cod",
+                "payment_method_title": "Cash",
+                "date_paid": "2026-05-03T12:00:00",
+                "date_paid_gmt": "2026-05-03T09:00:00",
+            },
+        )
+        payload = {
+            "status": "processing",
+            "payment_method": "cod",
+            "payment_method_title": "Cash",
+            "set_paid": True,
+        }
+        mock_set_value = unittest.mock.MagicMock()
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings") as mock_get_settings, \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value=payload), \
+             unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc") as mock_get_doc, \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True, set_value=mock_set_value)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)):
+            mock_get_settings.return_value = (SimpleNamespace(), _outbound_cfg())
+            mock_get_doc.side_effect = lambda doctype, name: invoice if doctype == "Sales Invoice" else SimpleNamespace(name=invoice.customer, woo_customer_id="88")
+
+            result = outbound_sync.sync_sales_invoice(invoice.name, reason="test")
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 14500})
+        self.assertEqual(client.put_calls, [("orders/14500", payload)])
+
     def test_resolve_customer_shipping_address_name_prefers_linked_shipping_address(self):
         customer = SimpleNamespace(name="CUST-TEST-001", customer_primary_address="ADDR-BILL-001")
 

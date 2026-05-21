@@ -1647,6 +1647,23 @@ def _order_payload_requires_update(existing_order: dict, payload: dict) -> bool:
     if current_status != desired_status:
         return True
 
+    payload_payment_method = str(payload.get("payment_method") or "").strip().lower()
+    if payload_payment_method:
+        current_payment_method = str(existing_order.get("payment_method") or "").strip().lower()
+        if current_payment_method != payload_payment_method:
+            return True
+
+    payload_payment_title = str(payload.get("payment_method_title") or "").strip().lower()
+    if payload_payment_title:
+        current_payment_title = str(existing_order.get("payment_method_title") or "").strip().lower()
+        if current_payment_title != payload_payment_title:
+            return True
+
+    if bool(payload.get("set_paid")):
+        current_paid = bool(existing_order.get("date_paid") or existing_order.get("date_paid_gmt"))
+        if not current_paid:
+            return True
+
     payload_customer_id = payload.get("customer_id")
     if payload_customer_id and str(existing_order.get("customer_id") or "") != str(payload_customer_id):
         return True
