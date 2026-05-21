@@ -56,36 +56,27 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
         self.assertEqual(updates[0][2]["woo_customer_id"], "3095")
 
     def test_update_customer_identity_overwrites_core_fields_for_customer_webhook(self):
-        saved = []
+        updates = []
 
-        class DummyDoc:
-            def __init__(self):
-                self.name = "CUST-0001"
-                self.customer_name = "Old Customer"
-                self.woo_customer_id = "111"
-                self.woo_username = "old-user"
-                self.mobile_no = "01000000000"
-                self.email_id = "old@example.com"
-                self.disabled = 0
-                self.flags = SimpleNamespace(ignore_woo_outbound=False)
+        def fake_get_value(doctype, name_or_filters, fieldname):
+            if doctype != "Customer" or isinstance(name_or_filters, dict):
+                return None
+            current_values = {
+                "disabled": 0,
+                "customer_name": "Old Customer",
+                "woo_username": "old-user",
+                "mobile_no": "01000000000",
+                "email_id": "old@example.com",
+            }
+            return current_values.get(fieldname)
 
-            def save(self, ignore_permissions=True):
-                saved.append(
-                    {
-                        "ignore_permissions": ignore_permissions,
-                        "customer_name": self.customer_name,
-                        "woo_customer_id": self.woo_customer_id,
-                        "woo_username": self.woo_username,
-                        "mobile_no": self.mobile_no,
-                        "email_id": self.email_id,
-                        "ignore_woo_outbound": self.flags.ignore_woo_outbound,
-                    }
-                )
+        def fake_set_value(doctype, name, values, update_modified=False):
+            updates.append((doctype, name, values, update_modified))
 
-        dummy_doc = DummyDoc()
+        fake_db = SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value)
 
-        with unittest.mock.patch.object(customer_sync.frappe, "get_doc", return_value=dummy_doc), \
-             unittest.mock.patch.object(customer_sync.frappe, "flags", SimpleNamespace()), \
+        with unittest.mock.patch.object(customer_sync.frappe, "db", fake_db), \
+             unittest.mock.patch.object(customer_sync, "get_customer_woo_id", return_value="111"), \
              unittest.mock.patch.object(customer_sync, "_field_exists", side_effect=lambda doctype, field: field in {"woo_customer_id", "woo_username"}):
             customer_sync._update_customer_identity(
                 "CUST-0001",
@@ -98,13 +89,15 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
                 overwrite_existing=True,
             )
 
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0]["customer_name"], "New Customer")
-        self.assertEqual(saved[0]["woo_customer_id"], "3095")
-        self.assertEqual(saved[0]["woo_username"], "woo-user")
-        self.assertEqual(saved[0]["mobile_no"], "+201000000001")
-        self.assertEqual(saved[0]["email_id"], "new@example.com")
-        self.assertTrue(saved[0]["ignore_woo_outbound"])
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(updates[0][0], "Customer")
+        self.assertEqual(updates[0][1], "CUST-0001")
+        self.assertEqual(updates[0][2]["customer_name"], "New Customer")
+        self.assertEqual(updates[0][2]["woo_customer_id"], "3095")
+        self.assertEqual(updates[0][2]["woo_username"], "woo-user")
+        self.assertEqual(updates[0][2]["mobile_no"], "+201000000001")
+        self.assertEqual(updates[0][2]["email_id"], "new@example.com")
+        self.assertFalse(updates[0][3])
 
     def test_ensure_customer_create_path_forces_disabled_zero(self):
         created_docs = []
