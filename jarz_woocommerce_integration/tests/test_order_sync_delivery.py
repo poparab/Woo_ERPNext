@@ -574,6 +574,63 @@ def test_build_invoice_items_does_not_retry_default_bundle_when_explicit_selecti
     ]
 
 
+def test_extract_order_contact_snapshot_prefers_shipping_recipient_and_normalizes_phone():
+    order = {
+        "id": 14504,
+        "customer_id": 991,
+        "customer_email": "billing@example.com",
+        "billing": {
+            "first_name": "Account",
+            "last_name": "Holder",
+            "email": "billing@example.com",
+            "phone": "0100 123 4567",
+        },
+        "shipping": {
+            "first_name": "Delivery",
+            "last_name": "Recipient",
+            "phone": "+20 100 123 4567",
+        },
+    }
+
+    snapshot = order_sync._extract_order_contact_snapshot(order)
+
+    assert snapshot["customer_name"] == "Delivery Recipient"
+    assert snapshot["woo_order_display_name"] == "Delivery Recipient"
+    assert snapshot["woo_billing_name"] == "Account Holder"
+    assert snapshot["woo_shipping_name"] == "Delivery Recipient"
+    assert snapshot["woo_order_phone"] == "+20 100 123 4567"
+    assert snapshot["woo_order_phone_normalized"] == "+201001234567"
+    assert snapshot["woo_order_email"] == "billing@example.com"
+    assert snapshot["woo_customer_id_snapshot"] == "991"
+    assert len(snapshot["woo_contact_hash"]) == 64
+
+
+def test_apply_contact_snapshot_to_invoice_values_sets_display_fields():
+    order = {
+        "id": 20001,
+        "customer_email": "guest@example.com",
+        "billing": {
+            "email": "Guest@Example.com",
+        },
+        "shipping": {},
+    }
+    values = {
+        "doctype": "Sales Invoice",
+        "customer": "CUST-0001",
+    }
+
+    order_sync._apply_contact_snapshot_to_invoice_values(
+        values,
+        order_sync._extract_order_contact_snapshot(order),
+    )
+
+    assert values["customer_name"] == "guest@example.com"
+    assert values["woo_order_display_name"] == "guest@example.com"
+    assert values["woo_order_email"] == "guest@example.com"
+    assert values["woo_order_phone"] == ""
+    assert values["woo_contact_hash"]
+
+
 def test_enqueue_delivery_charge_repost_uses_delete_cancelled_entries(monkeypatch):
     captured = {}
 

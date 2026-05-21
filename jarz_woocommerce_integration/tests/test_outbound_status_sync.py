@@ -1380,6 +1380,26 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(metadata["_orddd_time_slot"], "19:00")
         self.assertEqual(metadata["Time Slot"], "19:00")
 
+    def test_build_order_payload_prefers_invoice_snapshot_contact_names(self):
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.customer_name = "Canonical Customer Name"
+        invoice.woo_order_display_name = "Snapshot Display"
+        invoice.woo_billing_name = "Billing Snapshot"
+        invoice.woo_shipping_name = "Shipping Snapshot"
+        invoice.woo_order_phone = "0111222333"
+        invoice.woo_order_email = "snapshot@example.com"
+
+        payload = _build_payload_for_delivery_test(invoice)
+
+        self.assertEqual(payload["billing"]["first_name"], "Billing")
+        self.assertEqual(payload["billing"]["last_name"], "Snapshot")
+        self.assertEqual(payload["billing"]["company"], "Billing Snapshot")
+        self.assertEqual(payload["shipping"]["first_name"], "Shipping")
+        self.assertEqual(payload["shipping"]["last_name"], "Snapshot")
+        self.assertEqual(payload["shipping"]["company"], "Shipping Snapshot")
+        self.assertEqual(payload["billing"]["phone"], "0111222333")
+        self.assertEqual(payload["shipping"]["email"], "snapshot@example.com")
+
     def test_build_order_payload_sets_paid_meta_for_paid_cod_orders(self):
         invoice = DummyInvoice(sales_invoice_state="Recieved")
         invoice.outstanding_amount = 0

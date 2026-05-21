@@ -244,6 +244,30 @@ def _get_address_payload(address_name: str | None, *, fallback_name: str, phone:
     }
 
 
+def _get_invoice_order_fallback_name(
+    invoice: frappe.model.document.Document,
+    customer: frappe.model.document.Document,
+    *fieldnames: str,
+) -> str:
+    for fieldname in fieldnames:
+        value = str(getattr(invoice, fieldname, "") or "").strip()
+        if value:
+            return value
+    invoice_customer_name = str(getattr(invoice, "customer_name", "") or "").strip()
+    if invoice_customer_name:
+        return invoice_customer_name
+    return str(getattr(customer, "customer_name", "") or "").strip()
+
+
+def _apply_address_contact_name(address: dict, fallback_name: str) -> None:
+    if not address or not fallback_name:
+        return
+    first, last = _split_contact_name(fallback_name)
+    address["first_name"] = first
+    address["last_name"] = last
+    address["company"] = fallback_name
+
+
 def _get_any_address_for_customer(customer_name: str) -> dict:
     """Fetch first available Address linked to a customer as a generic fallback."""
     try:
@@ -1792,15 +1816,31 @@ def _build_order_payload(
     payment_method, payment_title = _map_payment_method(invoice, cfg)
     set_paid = flt(getattr(invoice, "outstanding_amount", 0)) <= 0.01
     woo_status = _determine_status(invoice, cancel=cancel)
+    billing_fallback_name = _get_invoice_order_fallback_name(
+        invoice,
+        customer_doc,
+        "woo_billing_name",
+        "woo_order_display_name",
+    )
+    shipping_fallback_name = _get_invoice_order_fallback_name(
+        invoice,
+        customer_doc,
+        "woo_shipping_name",
+        "woo_order_display_name",
+    )
+    snapshot_email = str(getattr(invoice, "woo_order_email", "") or "").strip()
+    snapshot_phone = str(getattr(invoice, "woo_order_phone", "") or "").strip()
 
     # Prefer invoice addresses for both billing and shipping (order address must populate both)
     default_email = (
-        (customer_payload.get("billing") or {}).get("email")
+        snapshot_email
+        or (customer_payload.get("billing") or {}).get("email")
         or (customer_payload.get("shipping") or {}).get("email")
         or (getattr(customer_doc, "email_id", "") or "").strip()
     )
     default_phone = (
-        (customer_payload.get("billing") or {}).get("phone")
+        snapshot_phone
+        or (customer_payload.get("billing") or {}).get("phone")
         or (customer_payload.get("shipping") or {}).get("phone")
         or (getattr(customer_doc, "mobile_no", "") or getattr(customer_doc, "phone", "") or "").strip()
     )
@@ -1813,14 +1853,14 @@ def _build_order_payload(
     if invoice_billing_address:
         billing_address = _get_address_payload(
             invoice_billing_address,
-            fallback_name=customer_doc.customer_name,
+            fallback_name=billing_fallback_name,
             phone=default_phone,
             email=default_email,
         )
     if invoice_shipping_address:
         shipping_address = _get_address_payload(
             invoice_shipping_address,
-            fallback_name=customer_doc.customer_name,
+            fallback_name=shipping_fallback_name,
             phone=default_phone,
             email=default_email,
         )
@@ -1837,10 +1877,19 @@ def _build_order_payload(
     elif shipping_address.get("address_1") and not billing_address.get("address_1"):
         billing_address = dict(shipping_address)
 
-    if default_phone:
+    _apply_address_contact_name(billing_address, billing_fallback_name)
+    _apply_address_contact_name(shipping_address, shipping_fallback_name)
+
+    if snapshot_phone:
+        billing_address["phone"] = snapshot_phone
+        shipping_address["phone"] = snapshot_phone
+    elif default_phone:
         billing_address.setdefault("phone", default_phone)
         shipping_address.setdefault("phone", default_phone)
-    if default_email:
+    if snapshot_email:
+        billing_address["email"] = snapshot_email
+        shipping_address["email"] = snapshot_email
+    elif default_email:
         billing_address.setdefault("email", default_email)
         shipping_address.setdefault("email", default_email)
 

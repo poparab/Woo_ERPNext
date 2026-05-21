@@ -17,6 +17,14 @@
   "field_order": [
     "woo_order_id",
     "woo_order_number",
+    "woo_order_display_name",
+    "woo_billing_name",
+    "woo_shipping_name",
+    "woo_order_phone",
+    "woo_order_phone_normalized",
+    "woo_order_email",
+    "woo_customer_id_snapshot",
+    "woo_contact_hash",
     "erpnext_sales_invoice",
     "status",
     "currency",
@@ -33,6 +41,14 @@
   "fields": [
   {"fieldname": "woo_order_id", "fieldtype": "Int", "label": "Woo Order ID", "reqd": 1, "unique": 1},
   {"fieldname": "woo_order_number", "fieldtype": "Data", "label": "Woo Order Number"},
+  {"fieldname": "woo_order_display_name", "fieldtype": "Data", "label": "Woo Order Display Name", "read_only": 1},
+  {"fieldname": "woo_billing_name", "fieldtype": "Data", "label": "Woo Billing Name", "read_only": 1},
+  {"fieldname": "woo_shipping_name", "fieldtype": "Data", "label": "Woo Shipping Name", "read_only": 1},
+  {"fieldname": "woo_order_phone", "fieldtype": "Data", "label": "Woo Order Phone", "read_only": 1},
+  {"fieldname": "woo_order_phone_normalized", "fieldtype": "Data", "label": "Woo Order Phone Normalized", "read_only": 1},
+  {"fieldname": "woo_order_email", "fieldtype": "Data", "label": "Woo Order Email", "read_only": 1},
+  {"fieldname": "woo_customer_id_snapshot", "fieldtype": "Data", "label": "Woo Customer ID Snapshot", "read_only": 1},
+  {"fieldname": "woo_contact_hash", "fieldtype": "Data", "label": "Woo Contact Hash", "read_only": 1},
   {"fieldname": "erpnext_sales_invoice", "fieldtype": "Link", "label": "ERPNext Sales Invoice", "options": "Sales Invoice"},
     {"fieldname": "status", "fieldtype": "Data", "label": "Woo Status"},
     {"fieldname": "currency", "fieldtype": "Data", "label": "Currency"},
@@ -55,5 +71,5 @@
   "autoname": "WOOMAP-.#####",
   "sort_field": "modified",
   "sort_order": "DESC",
-  "search_fields": "woo_order_id,woo_order_number,erpnext_sales_invoice,status"
+  "search_fields": "woo_order_id,woo_order_number,woo_order_display_name,woo_order_phone,erpnext_sales_invoice,status"
 }

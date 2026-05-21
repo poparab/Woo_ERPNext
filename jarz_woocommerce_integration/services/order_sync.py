@@ -584,6 +584,140 @@ def _resolve_posting_date(order: dict, is_historical: bool) -> str:
     return frappe.utils.today()
 
 
+ORDER_CONTACT_SNAPSHOT_FIELDS = (
+    "woo_order_display_name",
+    "woo_billing_name",
+    "woo_shipping_name",
+    "woo_order_phone",
+    "woo_order_phone_normalized",
+    "woo_order_email",
+    "woo_customer_id_snapshot",
+    "woo_contact_hash",
+)
+
+
+def _normalize_order_contact_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _normalize_order_contact_email(value: Any) -> str:
+    return _normalize_order_contact_text(value).lower()
+
+
+def _normalize_order_contact_phone(value: Any) -> str:
+    raw = _normalize_order_contact_text(value)
+    if not raw:
+        return ""
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if not digits:
+        return ""
+    return f"+{digits}" if raw.startswith("+") else digits
+
+
+def _compose_order_contact_name(address: dict) -> str:
+    first_name = _normalize_order_contact_text(address.get("first_name"))
+    last_name = _normalize_order_contact_text(address.get("last_name"))
+    if first_name or last_name:
+        return " ".join(part for part in (first_name, last_name) if part)
+    return _normalize_order_contact_text(address.get("company"))
+
+
+def _compute_contact_hash(snapshot: dict[str, Any]) -> str:
+    import hashlib
+
+    payload = {
+        "woo_order_display_name": snapshot.get("woo_order_display_name") or "",
+        "woo_billing_name": snapshot.get("woo_billing_name") or "",
+        "woo_shipping_name": snapshot.get("woo_shipping_name") or "",
+        "woo_order_phone_normalized": snapshot.get("woo_order_phone_normalized") or "",
+        "woo_order_email": snapshot.get("woo_order_email") or "",
+        "woo_customer_id_snapshot": snapshot.get("woo_customer_id_snapshot") or "",
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _extract_order_contact_snapshot(order: dict) -> dict[str, Any]:
+    billing = order.get("billing") or {}
+    shipping = order.get("shipping") or {}
+    billing_name = _compose_order_contact_name(billing)
+    shipping_name = _compose_order_contact_name(shipping)
+    order_display_name = (
+        shipping_name
+        or billing_name
+        or _normalize_order_contact_email(billing.get("email") or order.get("customer_email"))
+        or f"Woo Guest {order.get('id')}"
+    )
+    raw_phone = _normalize_order_contact_text(shipping.get("phone") or billing.get("phone"))
+    customer_id = order.get("customer_id")
+
+    snapshot = {
+        "customer_name": order_display_name,
+        "woo_order_display_name": order_display_name,
+        "woo_billing_name": billing_name,
+        "woo_shipping_name": shipping_name,
+        "woo_order_phone": raw_phone,
+        "woo_order_phone_normalized": _normalize_order_contact_phone(raw_phone),
+        "woo_order_email": _normalize_order_contact_email(billing.get("email") or order.get("customer_email")),
+        "woo_customer_id_snapshot": str(customer_id) if customer_id not in (None, "", 0, "0") else "",
+    }
+    snapshot["woo_contact_hash"] = _compute_contact_hash(snapshot)
+    return snapshot
+
+
+def _apply_contact_snapshot_to_invoice_values(values: dict[str, Any], snapshot: dict[str, Any]) -> None:
+    values["customer_name"] = snapshot.get("customer_name") or values.get("customer_name") or ""
+    for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
+        values[fieldname] = snapshot.get(fieldname) or ""
+
+
+def _apply_contact_snapshot_to_invoice_doc(inv: Any, snapshot: dict[str, Any]) -> None:
+    inv.customer_name = snapshot.get("customer_name") or getattr(inv, "customer_name", "")
+    for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
+        try:
+            setattr(inv, fieldname, snapshot.get(fieldname) or "")
+        except Exception:
+            continue
+
+
+def _build_order_map_snapshot_values(
+    order: dict,
+    snapshot: dict[str, Any],
+    *,
+    link_field: str | None = None,
+    invoice_name: str | None = None,
+    order_hash: str | None = None,
+    needs_territory_recheck: int | None = None,
+) -> dict[str, Any]:
+    values = {
+        "woo_order_number": order.get("number"),
+        "status": order.get("status"),
+        "currency": order.get("currency"),
+        "total": order.get("total"),
+        "payment_method": order.get("payment_method"),
+        "synced_on": frappe.utils.now_datetime(),
+    }
+    if order_hash is not None:
+        values["hash"] = order_hash
+    if link_field and invoice_name:
+        values[link_field] = invoice_name
+    if needs_territory_recheck is not None:
+        values["needs_territory_recheck"] = needs_territory_recheck
+    for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
+        values[fieldname] = snapshot.get(fieldname) or ""
+    return values
+
+
+def _collect_changed_values(current_values: dict[str, Any] | None, desired_values: dict[str, Any]) -> dict[str, Any]:
+    changed: dict[str, Any] = {}
+    current_values = current_values or {}
+    for fieldname, desired_value in desired_values.items():
+        current_value = current_values.get(fieldname)
+        if str(current_value or "") != str(desired_value or ""):
+            changed[fieldname] = desired_value
+    return changed
+
+
 def _compute_order_hash(order: dict) -> str:
     import hashlib
     import json as _json
@@ -2284,6 +2418,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         except Exception:
             existing_map = None
     order_hash = _compute_order_hash(order)
+    contact_snapshot = _extract_order_contact_snapshot(order)
+    if existing_map is not None and "woo_contact_hash" not in existing_map:
+        try:
+            existing_map["woo_contact_hash"] = frappe.db.get_value(
+                "WooCommerce Order Map",
+                {"woo_order_id": woo_id},
+                "woo_contact_hash",
+            )
+        except Exception:
+            existing_map["woo_contact_hash"] = None
 
     # Skip if order hasn't changed since last sync (hash match + valid invoice link
     # AND the linked Sales Invoice is already in the target state).
@@ -2293,7 +2437,11 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         linked_docstatus = frappe.db.get_value("Sales Invoice", existing_map[LINK_FIELD], "docstatus")
         if linked_docstatus is not None and int(linked_docstatus) != 2:
             target_docstatus = _map_status(order.get("status")).get("docstatus", 0)
-            if target_docstatus != 2:
+            contact_hash_matches = (
+                str((existing_map or {}).get("woo_contact_hash") or "")
+                == str(contact_snapshot.get("woo_contact_hash") or "")
+            )
+            if target_docstatus != 2 and contact_hash_matches:
                 return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
             # target is cancellation but SI is active — fall through to cancel it
 
@@ -2347,6 +2495,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     LINK_FIELD: linked_invoice_name,
                     "hash": order_hash,
                     "status": order.get("status"),
+                    "woo_contact_hash": contact_snapshot.get("woo_contact_hash"),
                 }
             except Exception:
                 if not existing_map:
@@ -2506,7 +2655,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "synced_on": frappe.utils.now_datetime(),
             })
             map_doc.insert(ignore_permissions=True)
-            existing_map = {"name": map_doc.name, LINK_FIELD: None, "hash": None, "status": "processing"}
+            existing_map = {
+                "name": map_doc.name,
+                LINK_FIELD: None,
+                "hash": None,
+                "status": "processing",
+                "woo_contact_hash": None,
+            }
         except Exception as map_err:
             # If a duplicate map already exists, avoid creating another invoice.
             try:
@@ -2562,6 +2717,23 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             # ERPNext is the source of truth from submission onwards; all status/delivery
             # changes flow outbound to Woo via outbound_sync.py hooks.
             if inv.docstatus == 1:
+                if existing_map and existing_map.get("name"):
+                    existing_contact_hash = str((existing_map or {}).get("woo_contact_hash") or "")
+                    target_contact_hash = str(contact_snapshot.get("woo_contact_hash") or "")
+                    if existing_contact_hash != target_contact_hash:
+                        frappe.db.set_value(
+                            "WooCommerce Order Map",
+                            existing_map["name"],
+                            _build_order_map_snapshot_values(
+                                order,
+                                contact_snapshot,
+                                link_field=LINK_FIELD,
+                                invoice_name=inv.name,
+                                order_hash=order_hash,
+                            ),
+                            update_modified=True,
+                        )
+                        existing_map["woo_contact_hash"] = target_contact_hash
                 # Before skipping, check for warehouse drift and self-heal if possible.
                 _check_and_repair_submitted_invoice_drift(
                     inv, woo_id, territory_name=territory_name, pos_profile=pos_profile,
@@ -2623,11 +2795,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         frappe.db.set_value(
                             "WooCommerce Order Map",
                             existing_map["name"],
-                            {
-                                "hash": new_hash,
-                                "status": order.get("status"),
-                                "synced_on": frappe.utils.now_datetime(),
-                            },
+                            _build_order_map_snapshot_values(
+                                order,
+                                contact_snapshot,
+                                link_field=LINK_FIELD,
+                                invoice_name=inv.name,
+                                order_hash=new_hash,
+                            ),
                             update_modified=True,
                         )
                     create_sync_log_entry(
@@ -2739,6 +2913,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 pass
             if inv.docstatus != 2:
                 if inv.docstatus == 0:
+                    _apply_contact_snapshot_to_invoice_doc(inv, contact_snapshot)
                     inv.set("items", [])
                     for it in lines:
                         if default_warehouse:
@@ -2872,6 +3047,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "shipping_address_name": shipping_addr or billing_addr,
                 "items": lines,
             }
+            _apply_contact_snapshot_to_invoice_values(inv_data, contact_snapshot)
             # Prevent ERPNext pricing rules from overriding the rates set by
             # BundleProcessor (or any other rate logic) during insert/save.
             inv_data["ignore_pricing_rule"] = 1
@@ -2981,30 +3157,28 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         map_name = existing_map.get("name") if existing_map else None
         if map_name:
             map_doc = frappe.get_doc("WooCommerce Order Map", map_name)
-            map_doc.update({
-                "woo_order_number": order.get("number"),
-                LINK_FIELD: inv.name,
-                "status": order.get("status"),
-                "currency": order.get("currency"),
-                "total": order.get("total"),
-                "payment_method": order.get("payment_method"),
-                "synced_on": frappe.utils.now_datetime(),
-                "hash": order_hash,
-                "needs_territory_recheck": 1 if _territory_fallback_used else 0,
-            })
+            map_doc.update(
+                _build_order_map_snapshot_values(
+                    order,
+                    contact_snapshot,
+                    link_field=LINK_FIELD,
+                    invoice_name=inv.name,
+                    order_hash=order_hash,
+                    needs_territory_recheck=1 if _territory_fallback_used else 0,
+                )
+            )
             map_doc.save(ignore_permissions=True)
         else:
             frappe.get_doc({
                 "doctype": "WooCommerce Order Map",
                 "woo_order_id": woo_id,
-                "woo_order_number": order.get("number"),
-                LINK_FIELD: inv.name,
-                "status": order.get("status"),
-                "currency": order.get("currency"),
-                "total": order.get("total"),
-                "payment_method": order.get("payment_method"),
-                "synced_on": frappe.utils.now_datetime(),
-                "hash": order_hash,
+                **_build_order_map_snapshot_values(
+                    order,
+                    contact_snapshot,
+                    link_field=LINK_FIELD,
+                    invoice_name=inv.name,
+                    order_hash=order_hash,
+                ),
             }).insert(ignore_permissions=True)
 
         # Keep cache fresh so reruns benefit from O(1) skip
@@ -3359,6 +3533,148 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
         result.get("status") == "skipped" and result.get("reason") in skipped_success_reasons
     )
     return result
+
+
+def refresh_order_contact_snapshot(order_id: int | str, *, dry_run: bool = False) -> dict[str, Any]:
+    settings = frappe.get_single("WooCommerce Settings")
+    ensure_custom_fields()
+    client = WooClient(
+        base_url=settings.base_url,
+        consumer_key=settings.consumer_key,
+        consumer_secret=settings.get_password("consumer_secret"),
+    )
+    order = client.get_order(order_id)
+    if not order:
+        return {"status": "skipped", "reason": "order_not_found", "woo_order_id": order_id}
+
+    woo_id = order.get("id") or order_id
+    snapshot = _extract_order_contact_snapshot(order)
+    link_field = "erpnext_sales_invoice"
+    try:
+        cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
+        if link_field not in cols and "sales_invoice" in cols:
+            link_field = "sales_invoice"
+    except Exception:
+        pass
+
+    map_row = frappe.db.get_value(
+        "WooCommerce Order Map",
+        {"woo_order_id": woo_id},
+        ["name", link_field],
+        as_dict=True,
+    )
+    if not map_row:
+        return {"status": "skipped", "reason": "not_mapped", "woo_order_id": woo_id}
+
+    invoice_name = map_row.get(link_field)
+    if not invoice_name:
+        return {
+            "status": "skipped",
+            "reason": "no_invoice_link",
+            "woo_order_id": woo_id,
+            "order_map": map_row.get("name"),
+        }
+
+    invoice_values = {"customer_name": snapshot.get("customer_name") or ""}
+    for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
+        invoice_values[fieldname] = snapshot.get(fieldname) or ""
+
+    current_invoice = frappe.db.get_value(
+        "Sales Invoice",
+        invoice_name,
+        list(invoice_values.keys()),
+        as_dict=True,
+    )
+    invoice_updates = _collect_changed_values(current_invoice, invoice_values)
+
+    map_values = _build_order_map_snapshot_values(
+        order,
+        snapshot,
+        link_field=link_field,
+        invoice_name=invoice_name,
+    )
+    map_values.pop("synced_on", None)
+    current_map = frappe.db.get_value(
+        "WooCommerce Order Map",
+        map_row["name"],
+        list(map_values.keys()),
+        as_dict=True,
+    )
+    map_updates = _collect_changed_values(current_map, map_values)
+
+    result = {
+        "status": "updated" if invoice_updates or map_updates else "skipped",
+        "reason": None if invoice_updates or map_updates else "unchanged",
+        "woo_order_id": woo_id,
+        "invoice": invoice_name,
+        "order_map": map_row["name"],
+        "dry_run": dry_run,
+        "invoice_fields_updated": sorted(invoice_updates.keys()),
+        "map_fields_updated": sorted(map_updates.keys()),
+    }
+    if dry_run or (not invoice_updates and not map_updates):
+        return result
+
+    if invoice_updates:
+        frappe.db.set_value(
+            "Sales Invoice",
+            invoice_name,
+            invoice_updates,
+            update_modified=False,
+        )
+    if map_updates:
+        map_updates["synced_on"] = frappe.utils.now_datetime()
+        frappe.db.set_value(
+            "WooCommerce Order Map",
+            map_row["name"],
+            map_updates,
+            update_modified=True,
+        )
+    frappe.db.commit()
+    return result
+
+
+def backfill_order_contact_snapshots_by_ids(
+    order_ids: list[int | str] | tuple[int | str, ...] | str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if isinstance(order_ids, str):
+        parsed_ids = [part.strip() for part in order_ids.split(",") if part.strip()]
+    else:
+        parsed_ids = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
+
+    results: list[dict[str, Any]] = []
+    summary = {
+        "requested": len(parsed_ids),
+        "processed": 0,
+        "updated": 0,
+        "skipped": 0,
+        "errors": 0,
+        "results": results,
+        "dry_run": dry_run,
+    }
+
+    for order_id in parsed_ids:
+        try:
+            result = refresh_order_contact_snapshot(order_id, dry_run=dry_run)
+        except Exception:
+            result = {
+                "status": "error",
+                "reason": frappe.get_traceback(),
+                "woo_order_id": order_id,
+                "dry_run": dry_run,
+            }
+        results.append(result)
+        summary["processed"] += 1
+        if result.get("status") == "updated":
+            summary["updated"] += 1
+        elif result.get("status") == "error":
+            summary["errors"] += 1
+        else:
+            summary["skipped"] += 1
+
+    return summary
 
 
 def backfill_orders_by_ids_phase1(

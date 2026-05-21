@@ -100,6 +100,154 @@ def test_backfill_orders_by_ids_phase1_aggregates_statuses(monkeypatch):
     assert summary["skipped"] == 0
 
 
+def test_refresh_order_contact_snapshot_updates_invoice_and_map(monkeypatch):
+    settings = SimpleNamespace(
+        base_url="https://example.com",
+        consumer_key="ck_test",
+        get_password=lambda fieldname: "cs_test",
+    )
+    order = {
+        "id": 14504,
+        "number": "14504",
+        "status": "processing",
+        "currency": "EGP",
+        "total": "250.00",
+        "payment_method": "cod",
+        "customer_id": 991,
+        "customer_email": "billing@example.com",
+        "billing": {
+            "first_name": "Account",
+            "last_name": "Holder",
+            "email": "billing@example.com",
+        },
+        "shipping": {
+            "first_name": "Delivery",
+            "last_name": "Recipient",
+            "phone": "01001234567",
+        },
+    }
+    updates = []
+    commit_calls = []
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_order(self, order_id):
+            assert str(order_id) == "14504"
+            return dict(order)
+
+    def fake_get_value(doctype, name_or_filters, fieldname=None, as_dict=False):
+        if doctype == "WooCommerce Order Map" and name_or_filters == {"woo_order_id": 14504}:
+            return {"name": "WOOMAP-0001", "erpnext_sales_invoice": "ACC-SINV-0001"}
+        if doctype == "Sales Invoice" and name_or_filters == "ACC-SINV-0001":
+            current = {field: "" for field in fieldname}
+            current["customer_name"] = "Canonical Customer"
+            return current
+        if doctype == "WooCommerce Order Map" and name_or_filters == "WOOMAP-0001":
+            current = {field: "" for field in fieldname}
+            current["woo_order_number"] = "14504"
+            current["erpnext_sales_invoice"] = "ACC-SINV-0001"
+            return current
+        raise AssertionError((doctype, name_or_filters, fieldname, as_dict))
+
+    def fake_set_value(doctype, name, values, update_modified=False):
+        updates.append((doctype, name, dict(values), update_modified))
+
+    monkeypatch.setattr(order_sync, "WooClient", DummyClient)
+    monkeypatch.setattr(order_sync, "ensure_custom_fields", lambda: None)
+    monkeypatch.setattr(order_sync.frappe, "get_single", lambda doctype: settings)
+    monkeypatch.setattr(order_sync.frappe.db, "get_value", fake_get_value)
+    monkeypatch.setattr(order_sync.frappe.db, "set_value", fake_set_value)
+    monkeypatch.setattr(order_sync.frappe.db, "commit", lambda: commit_calls.append(True))
+    monkeypatch.setattr(order_sync.frappe.db, "get_table_columns", lambda doctype: ["erpnext_sales_invoice"])
+    monkeypatch.setattr(order_sync.frappe.utils, "now_datetime", lambda: "2026-05-21 12:00:00")
+
+    result = order_sync.refresh_order_contact_snapshot("14504")
+
+    assert result["status"] == "updated"
+    assert result["invoice"] == "ACC-SINV-0001"
+    assert "customer_name" in result["invoice_fields_updated"]
+    assert updates[0][0] == "Sales Invoice"
+    assert updates[0][1] == "ACC-SINV-0001"
+    assert updates[0][2]["customer_name"] == "Delivery Recipient"
+    assert updates[1][0] == "WooCommerce Order Map"
+    assert updates[1][2]["woo_order_display_name"] == "Delivery Recipient"
+    assert updates[1][2]["synced_on"] == "2026-05-21 12:00:00"
+    assert commit_calls == [True]
+
+
+def test_refresh_order_contact_snapshot_dry_run_reports_without_writing(monkeypatch):
+    settings = SimpleNamespace(
+        base_url="https://example.com",
+        consumer_key="ck_test",
+        get_password=lambda fieldname: "cs_test",
+    )
+    order = {
+        "id": 14505,
+        "number": "14505",
+        "status": "processing",
+        "currency": "EGP",
+        "total": "250.00",
+        "payment_method": "cod",
+        "billing": {"email": "guest@example.com"},
+        "shipping": {},
+    }
+    writes = []
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_order(self, order_id):
+            return dict(order)
+
+    def fake_get_value(doctype, name_or_filters, fieldname=None, as_dict=False):
+        if doctype == "WooCommerce Order Map" and name_or_filters == {"woo_order_id": 14505}:
+            return {"name": "WOOMAP-0002", "erpnext_sales_invoice": "ACC-SINV-0002"}
+        if doctype == "Sales Invoice" and name_or_filters == "ACC-SINV-0002":
+            return {field: "" for field in fieldname}
+        if doctype == "WooCommerce Order Map" and name_or_filters == "WOOMAP-0002":
+            return {field: "" for field in fieldname}
+        raise AssertionError((doctype, name_or_filters, fieldname, as_dict))
+
+    monkeypatch.setattr(order_sync, "WooClient", DummyClient)
+    monkeypatch.setattr(order_sync, "ensure_custom_fields", lambda: None)
+    monkeypatch.setattr(order_sync.frappe, "get_single", lambda doctype: settings)
+    monkeypatch.setattr(order_sync.frappe.db, "get_value", fake_get_value)
+    monkeypatch.setattr(order_sync.frappe.db, "set_value", lambda *args, **kwargs: writes.append((args, kwargs)))
+    monkeypatch.setattr(order_sync.frappe.db, "commit", lambda: writes.append("commit"))
+    monkeypatch.setattr(order_sync.frappe.db, "get_table_columns", lambda doctype: ["erpnext_sales_invoice"])
+
+    result = order_sync.refresh_order_contact_snapshot("14505", dry_run=True)
+
+    assert result["status"] == "updated"
+    assert result["dry_run"] is True
+    assert writes == []
+
+
+def test_backfill_order_contact_snapshots_by_ids_aggregates_statuses(monkeypatch):
+    results = {
+        "14504": {"status": "updated", "woo_order_id": 14504},
+        "14505": {"status": "skipped", "reason": "unchanged", "woo_order_id": 14505},
+        "14506": {"status": "error", "woo_order_id": 14506},
+    }
+
+    monkeypatch.setattr(
+        order_sync,
+        "refresh_order_contact_snapshot",
+        lambda order_id, dry_run=False: results[str(order_id)],
+    )
+
+    summary = order_sync.backfill_order_contact_snapshots_by_ids("14504,14505,14506")
+
+    assert summary["requested"] == 3
+    assert summary["processed"] == 3
+    assert summary["updated"] == 1
+    assert summary["skipped"] == 1
+    assert summary["errors"] == 1
+
+
 def test_reconcile_recent_orders_phase1_uses_modified_after_window(monkeypatch):
     captured = {}
     settings = SimpleNamespace(
