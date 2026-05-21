@@ -366,6 +366,23 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(event_enqueue_calls, [])
         self.assertEqual(len(shadow_failures), 1)
 
+    def test_enqueue_linked_invoice_sync_for_payment_entry_enqueues_unique_sales_invoices(self):
+        payment_entry = SimpleNamespace(references=[
+            SimpleNamespace(reference_doctype="Sales Invoice", reference_name="ACC-SINV-TEST-001"),
+            SimpleNamespace(reference_doctype="Sales Invoice", reference_name="ACC-SINV-TEST-001"),
+            SimpleNamespace(reference_doctype="Sales Invoice", reference_name="ACC-SINV-TEST-002"),
+            SimpleNamespace(reference_doctype="Journal Entry", reference_name="ACC-JV-TEST-001"),
+        ])
+        enqueue_calls = []
+
+        with unittest.mock.patch.object(outbound_sync, "enqueue_invoice_sync", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_linked_invoice_sync_for_payment_entry(payment_entry, method="on_submit")
+
+        self.assertEqual(enqueue_calls, [
+            (("ACC-SINV-TEST-001",), {"reason": "payment_entry_on_submit"}),
+            (("ACC-SINV-TEST-002",), {"reason": "payment_entry_on_submit"}),
+        ])
+
     def test_enqueue_customer_sync_skips_when_customer_flag_marks_inbound(self):
         customer = DummyCustomer()
         customer.flags.ignore_woo_outbound = True

@@ -969,6 +969,19 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
     )
 
 
+def enqueue_linked_invoice_sync_for_payment_entry(payment_entry: frappe.model.document.Document, method: str | None = None) -> None:
+    reason = f"payment_entry_{method}" if method else "payment_entry"
+    seen_invoices: set[str] = set()
+    for row in getattr(payment_entry, "references", []) or []:
+        if str(getattr(row, "reference_doctype", "") or "") != "Sales Invoice":
+            continue
+        invoice_name = str(getattr(row, "reference_name", "") or "").strip()
+        if not invoice_name or invoice_name in seen_invoices:
+            continue
+        seen_invoices.add(invoice_name)
+        enqueue_invoice_sync(invoice_name, reason=reason)
+
+
 def _mark_invoice_status(invoice_name: str, *, status: str, error: str | None = None) -> None:
     updates = {
         "woo_outbound_status": _normalize_outbound_status(status),

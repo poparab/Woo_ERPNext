@@ -161,6 +161,9 @@ doc_events = {
 		"on_update_after_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
 		"on_cancel": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
 	},
+	"Payment Entry": {
+		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_invoice_sync_for_payment_entry",
+	},
 }
 
 # Scheduled Tasks
