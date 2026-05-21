@@ -74,6 +74,20 @@ class DummyClient:
         return {"id": 14500, "number": "14500"}
 
 
+class DummyResponseClient(DummyClient):
+    def __init__(self, *, response=None, existing_order=None):
+        super().__init__(existing_order=existing_order)
+        self.response = dict(response or {"id": 14500, "number": "14500", "status": "processing", "payment_method": "cod"})
+
+    def put(self, path, payload):
+        self.put_calls.append((path, payload))
+        return dict(self.response)
+
+    def post(self, path, payload):
+        self.post_calls.append((path, payload))
+        return dict(self.response)
+
+
 class DummyMissingOrderClient(DummyClient):
     def __init__(self, *, created_order_id=16600):
         super().__init__(existing_order=None)
@@ -978,6 +992,95 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(mock_set_value.call_args_list[1].args[0], "WooCommerce Order Map")
         self.assertEqual(mock_set_value.call_args_list[1].args[1], "WOO-MAP-001")
         self.assertEqual(mock_set_value.call_args_list[1].args[2]["erpnext_sales_invoice"], invoice.name)
+
+    def test_sync_sales_invoice_creates_missing_order_map_for_new_outbound_order(self):
+        invoice = DummyInvoice(sales_invoice_state="Ready", woo_order_id=None)
+        invoice.grand_total = 280
+        client = DummyResponseClient(response={
+            "id": 16600,
+            "number": "16600",
+            "status": "processing",
+            "payment_method": "cod",
+            "line_items": [],
+        })
+        mock_set_value = unittest.mock.MagicMock()
+        inserted_maps = []
+
+        def fake_get_doc(doctype_or_dict, name=None):
+            if doctype_or_dict == "Sales Invoice":
+                return invoice
+            if doctype_or_dict == "Customer":
+                return SimpleNamespace(name=invoice.customer, woo_customer_id="88")
+            if isinstance(doctype_or_dict, dict) and doctype_or_dict.get("doctype") == "WooCommerce Order Map":
+                doc = unittest.mock.MagicMock()
+                doc.insert.side_effect = lambda ignore_permissions=True: inserted_maps.append(dict(doctype_or_dict)) or doc
+                return doc
+            raise AssertionError(f"Unexpected get_doc call: {doctype_or_dict!r}")
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "processing", "payment_method": "cod"}), \
+             unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc", side_effect=fake_get_doc), \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=False, set_value=mock_set_value, get_value=lambda *args, **kwargs: None)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(order_sync, "_compute_order_hash", return_value="hash-16600"):
+            result = outbound_sync.sync_sales_invoice(invoice.name, reason="test")
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 16600})
+        self.assertEqual(len(inserted_maps), 1)
+        self.assertEqual(inserted_maps[0]["woo_order_id"], 16600)
+        self.assertEqual(inserted_maps[0]["erpnext_sales_invoice"], invoice.name)
+        self.assertEqual(inserted_maps[0]["status"], "processing")
+        self.assertEqual(inserted_maps[0]["payment_method"], "cod")
+        self.assertEqual(inserted_maps[0]["hash"], "hash-16600")
+
+    def test_sync_sales_invoice_creates_missing_order_map_for_amended_invoice(self):
+        invoice = DummyInvoice(sales_invoice_state="Ready", woo_order_id=None, amended_from="ACC-SINV-OLD-001")
+        invoice.grand_total = 400
+        client = DummyResponseClient(response={
+            "id": 14500,
+            "number": "14500",
+            "status": "processing",
+            "payment_method": "cod",
+            "line_items": [],
+        }, existing_order={"id": 14500, "status": "processing", "line_items": []})
+        mock_set_value = unittest.mock.MagicMock()
+        inserted_maps = []
+
+        def fake_get_value(doctype, name_or_filters, fieldname=None, as_dict=False):
+            if doctype == "Sales Invoice" and name_or_filters == "ACC-SINV-OLD-001" and fieldname == "woo_order_id":
+                return 14500
+            if doctype == "WooCommerce Order Map" and name_or_filters == {"woo_order_id": 14500} and fieldname == "name":
+                return None
+            return None
+
+        def fake_get_doc(doctype_or_dict, name=None):
+            if doctype_or_dict == "Sales Invoice":
+                return invoice
+            if doctype_or_dict == "Customer":
+                return SimpleNamespace(name=invoice.customer, woo_customer_id="88")
+            if isinstance(doctype_or_dict, dict) and doctype_or_dict.get("doctype") == "WooCommerce Order Map":
+                doc = unittest.mock.MagicMock()
+                doc.insert.side_effect = lambda ignore_permissions=True: inserted_maps.append(dict(doctype_or_dict)) or doc
+                return doc
+            raise AssertionError(f"Unexpected get_doc call: {doctype_or_dict!r}")
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "processing", "payment_method": "cod"}), \
+             unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc", side_effect=fake_get_doc), \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=False, get_value=fake_get_value, set_value=mock_set_value)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(order_sync, "_compute_order_hash", return_value="hash-14500"):
+            result = outbound_sync.sync_sales_invoice(invoice.name, reason="test")
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 14500})
+        self.assertEqual(len(inserted_maps), 1)
+        self.assertEqual(inserted_maps[0]["woo_order_id"], 14500)
+        self.assertEqual(inserted_maps[0]["erpnext_sales_invoice"], invoice.name)
+        self.assertEqual(inserted_maps[0]["hash"], "hash-14500")
 
     def test_map_status_supports_out_for_delivery(self):
         self.assertEqual(order_sync._map_status("out-for-delivery"), {

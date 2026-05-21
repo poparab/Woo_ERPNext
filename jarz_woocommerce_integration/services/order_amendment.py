@@ -270,7 +270,7 @@ def run_woo_amendment_job(
 
         # ── 11-19. Execute amendment ──────────────────────────────────────────
         request_id = _build_request_id(woo_order_id, new_hash)
-        save_point = f"woo_amend_{request_id[:10]}"
+        save_point = _build_savepoint_name(request_id)
         prev_outbound_flag = getattr(frappe.flags, "ignore_woo_outbound", False)
 
         try:
@@ -475,6 +475,11 @@ def _build_request_id(woo_order_id: int, new_hash: str) -> str:
         ).encode("utf-8")
     ).hexdigest()
     return f"woo-amd-{woo_order_id}-{digest[:12]}"
+
+
+def _build_savepoint_name(request_id: str) -> str:
+    token = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:16]
+    return f"woo_amend_{token}"
 
 
 def _find_existing_replacement(source_si_name: str, new_hash: str) -> str | None:

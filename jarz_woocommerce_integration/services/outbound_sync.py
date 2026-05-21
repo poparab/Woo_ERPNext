@@ -1452,25 +1452,51 @@ def _recover_amended_invoice_woo_order_id(invoice: frappe.model.document.Documen
         return None
 
 
-def _relink_order_map_to_invoice(woo_order_id: int | str | None, invoice_name: str) -> None:
+def _relink_order_map_to_invoice(
+    woo_order_id: int | str | None,
+    invoice_name: str,
+    *,
+    currency: str | None = None,
+    total: float | None = None,
+    status: str | None = None,
+    payment_method: str | None = None,
+    hash_value: str | None = None,
+) -> None:
     if not woo_order_id or not invoice_name:
         return
 
     link_field = _resolve_order_map_link_field()
+    map_updates = {
+        link_field: invoice_name,
+        "currency": currency or "",
+        "total": flt(total or 0),
+        "status": status or "",
+        "payment_method": payment_method or "",
+        "synced_on": now_datetime(),
+    }
+    if hash_value:
+        map_updates["hash"] = hash_value
+
     try:
         map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_order_id}, "name")
     except Exception:
         map_name = None
-    if not map_name:
-        return
 
     try:
-        frappe.db.set_value(
-            "WooCommerce Order Map",
-            map_name,
-            {link_field: invoice_name},
-            update_modified=False,
-        )
+        if map_name:
+            frappe.db.set_value(
+                "WooCommerce Order Map",
+                map_name,
+                map_updates,
+                update_modified=False,
+            )
+            return
+
+        frappe.get_doc({
+            "doctype": "WooCommerce Order Map",
+            "woo_order_id": cint(woo_order_id),
+            **map_updates,
+        }).insert(ignore_permissions=True)
     except Exception:
         LOGGER.warning({
             "event": "woo_outbound_order_map_relink_failed",
@@ -2055,7 +2081,26 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     if woo_number:
         updates["woo_order_number"] = woo_number
     frappe.db.set_value("Sales Invoice", invoice_name, updates, update_modified=False)
-    _relink_order_map_to_invoice(woo_id or woo_order_id, invoice_name)
+    response_status = response.get("status") if isinstance(response, dict) else None
+    response_payment_method = response.get("payment_method") if isinstance(response, dict) else None
+    response_hash = None
+    if isinstance(response, dict):
+        try:
+            from jarz_woocommerce_integration.services.order_sync import _compute_order_hash
+
+            response_hash = _compute_order_hash(response)
+        except Exception:
+            response_hash = None
+
+    _relink_order_map_to_invoice(
+        woo_id or woo_order_id,
+        invoice_name,
+        currency=getattr(invoice, "currency", None),
+        total=flt(getattr(invoice, "grand_total", 0) or 0),
+        status=response_status or desired_woo_status,
+        payment_method=response_payment_method or payload.get("payment_method"),
+        hash_value=response_hash,
+    )
 
     LOGGER.info({
         "event": "woo_outbound_invoice_synced",

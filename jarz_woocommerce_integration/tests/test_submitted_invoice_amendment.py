@@ -143,7 +143,7 @@ def _setup_submitted_mocks(monkeypatch, *, fake_inv, stored_hash: str = ""):
     def _fake_db_get_value(doctype, filters_or_name=None, fieldname=None, *args, **kwargs):
         if doctype == "WooCommerce Order Map":
             if isinstance(fieldname, list):
-                return SimpleNamespace(name="WOOMAP-00001", erpnext_sales_invoice=inv_name, hash=stored_hash)
+                return {"name": "WOOMAP-00001", "erpnext_sales_invoice": inv_name, "hash": stored_hash}
             return stored_hash
         return None
 
@@ -330,6 +330,8 @@ class TestRunWooAmendmentJobGuards:
                        amend_depth=0, period_block=None):
         import jarz_woocommerce_integration.services.order_amendment as oa
 
+        normalized_order_map_row = vars(order_map_row) if isinstance(order_map_row, SimpleNamespace) else order_map_row
+
         # SQL advisory locks: always grant unless overridden
         sql_sequence = sql_returns or [[[1]], [[1]]]
         sql_call_count = [0]
@@ -340,7 +342,7 @@ class TestRunWooAmendmentJobGuards:
             return sql_sequence[idx]
 
         monkeypatch.setattr(oa.frappe.db, "sql", _fake_sql)
-        monkeypatch.setattr(oa.frappe.db, "get_value", lambda *a, **kw: order_map_row or None)
+        monkeypatch.setattr(oa.frappe.db, "get_value", lambda *a, **kw: normalized_order_map_row or None)
         monkeypatch.setattr(oa.frappe.db, "count", lambda *a, **kw: amend_depth)
         monkeypatch.setattr(oa.frappe.db, "set_value", MagicMock())
 
@@ -496,6 +498,16 @@ class TestRunWooAmendmentJobGuards:
             result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
         assert result["status"] == "skipped"
         assert result["reason"] == "period_closed"
+
+    def test_savepoint_name_is_sql_safe(self):
+        import jarz_woocommerce_integration.services.order_amendment as oa
+
+        request_id = oa._build_request_id(99001, "oldhash")
+        savepoint_name = oa._build_savepoint_name(request_id)
+
+        assert savepoint_name.startswith("woo_amend_")
+        assert "-" not in savepoint_name
+        assert all(char.isalnum() or char == "_" for char in savepoint_name)
 
 
 # ---------------------------------------------------------------------------
