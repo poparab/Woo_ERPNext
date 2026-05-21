@@ -2230,12 +2230,14 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     if cache and not allow_update and woo_id and int(woo_id) in cache.order_map_set:
         return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
 
-    # Prevent duplicate work when webhook and poller race on the same order
-    # Skip locks during historical migration (single worker, no races)
+    # Prevent duplicate work when webhook and poller race on the same order.
+    # The Woo amendment job already holds stronger per-order/invoice locks, so
+    # the replacement creation path must not re-enter the normal inbound locks.
+    # Skip locks during historical migration (single worker, no races).
     lock = None
     db_lock_key = f"woo-order-{woo_id}"
     db_lock_acquired = False
-    if not (is_historical and cache):
+    if not amended_from and not (is_historical and cache):
         try:
             lock = get_redis_conn().lock(f"woo-order-lock-{woo_id}", timeout=120, blocking_timeout=1)
             if not lock.acquire(blocking=False):

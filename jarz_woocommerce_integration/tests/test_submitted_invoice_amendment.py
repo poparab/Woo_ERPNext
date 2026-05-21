@@ -294,6 +294,32 @@ class TestOFDHardLock:
 # ---------------------------------------------------------------------------
 
 class TestItemEditDetection:
+    def test_amended_from_bypasses_inbound_locks(self, monkeypatch):
+        order = _make_woo_order(status="processing")
+        fake_inv = _make_fake_inv()
+        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+
+        fake_redis_conn = MagicMock()
+        fake_redis_conn.lock.side_effect = AssertionError("inbound redis lock should be skipped")
+        monkeypatch.setattr(order_sync, "get_redis_conn", lambda: fake_redis_conn)
+
+        def _unexpected_sql(query, values=None, *args, **kwargs):
+            if "GET_LOCK" in query:
+                raise AssertionError("inbound db lock should be skipped")
+            return [[1]]
+
+        monkeypatch.setattr(order_sync.frappe.db, "sql", _unexpected_sql)
+
+        result = order_sync.process_order_phase1(
+            order,
+            _make_settings(enable_amendment=1),
+            amended_from="ACC-SINV-OLD",
+        )
+
+        assert result["status"] == "queued"
+        assert result["reason"] == "amendment_enqueued"
+        order_sync.frappe.enqueue.assert_called_once()
+
     def test_hash_unchanged_returns_submitted_frozen(self, monkeypatch):
         order = _make_woo_order()
         current_hash = _compute_order_hash(order)
