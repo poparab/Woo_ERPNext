@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - allow type checkers without frappe
 
 cint = getattr(_frappe_utils, "cint")
 flt = getattr(_frappe_utils, "flt")
+get_datetime = getattr(_frappe_utils, "get_datetime", None)
 now_datetime = getattr(_frappe_utils, "now_datetime")
 
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
@@ -1255,6 +1256,66 @@ def _map_payment_method(invoice: frappe.model.document.Document, cfg: OutboundCo
     return cfg.payment_cod or "cod", str(raw_method or "Cash on Delivery")
 
 
+def _coerce_datetime_value(raw: Any) -> datetime | None:
+    if not raw:
+        return None
+    if callable(get_datetime):
+        try:
+            value = get_datetime(raw)
+            if isinstance(value, datetime):
+                return value
+            if isinstance(value, dt_date):
+                return datetime.combine(value, dt_time.min)
+        except Exception:
+            pass
+    if isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, dt_date):
+        return datetime.combine(raw, dt_time.min)
+    if isinstance(raw, str):
+        value = raw.strip()
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d",
+        ):
+            try:
+                parsed = datetime.strptime(value, fmt)
+                if fmt == "%Y-%m-%d":
+                    return datetime.combine(parsed.date(), dt_time.min)
+                return parsed
+            except ValueError:
+                continue
+    return None
+
+
+def _build_paid_metadata(
+    invoice: frappe.model.document.Document,
+    *,
+    payment_method: str,
+    set_paid: bool,
+    cfg: OutboundConfig,
+) -> list[dict[str, str]]:
+    if not set_paid:
+        return []
+    if str(payment_method or "").strip().lower() != str(cfg.payment_cod or "cod").strip().lower():
+        return []
+
+    paid_at = _coerce_datetime_value(getattr(invoice, "modified", None))
+    if not paid_at:
+        paid_at = _coerce_datetime_value(now_datetime())
+    if not paid_at:
+        return []
+
+    paid_at_value = paid_at.replace(microsecond=0).isoformat(timespec="seconds")
+    return [
+        {"key": "_date_paid", "value": paid_at_value},
+        {"key": "_date_paid_gmt", "value": paid_at_value},
+    ]
+
+
 def _normalize_invoice_state(raw_state: Any) -> str:
     return re.sub(r"[\s_]+", "-", str(raw_state or "").strip().lower())
 
@@ -1809,6 +1870,7 @@ def _build_order_payload(
     if payload_line_items:
         payload["line_items"] = payload_line_items
     payload["meta_data"].extend(_build_delivery_metadata(invoice))
+    payload["meta_data"].extend(_build_paid_metadata(invoice, payment_method=payment_method, set_paid=bool(set_paid), cfg=cfg))
     
     woo_customer_id = get_customer_woo_id(customer_doc)
     if woo_customer_id:

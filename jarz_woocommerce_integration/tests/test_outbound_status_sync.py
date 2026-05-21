@@ -1379,3 +1379,27 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(metadata["_orddd_timestamp"], "1777680000")
         self.assertEqual(metadata["_orddd_time_slot"], "19:00")
         self.assertEqual(metadata["Time Slot"], "19:00")
+
+    def test_build_order_payload_sets_paid_meta_for_paid_cod_orders(self):
+        invoice = DummyInvoice(sales_invoice_state="Recieved")
+        invoice.outstanding_amount = 0
+        invoice.custom_payment_method = "Cash"
+        invoice.modified = "2026-05-03 12:34:56"
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["_date_paid"], "2026-05-03T12:34:56")
+        self.assertEqual(metadata["_date_paid_gmt"], "2026-05-03T12:34:56")
+
+    def test_build_order_payload_skips_paid_meta_for_paid_non_cod_orders(self):
+        invoice = DummyInvoice(sales_invoice_state="Recieved")
+        invoice.outstanding_amount = 0
+        invoice.custom_payment_method = "Instapay"
+        invoice.modified = "2026-05-03 12:34:56"
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertNotIn("_date_paid", metadata)
+        self.assertNotIn("_date_paid_gmt", metadata)
