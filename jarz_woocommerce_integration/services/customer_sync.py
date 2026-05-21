@@ -111,21 +111,31 @@ def _update_customer_identity(
     phone_norm: Optional[str],
     email: Optional[str],
     customer_cache: dict | None,
+    display_name: Optional[str] = None,
+    overwrite_existing: bool = False,
 ) -> None:
     normalized_woo_customer_id = normalize_woo_customer_id(woo_customer_id)
+    normalized_display_name = (display_name or "").strip()
 
     try:
         if customer_cache is not None:
             updates: dict[str, Any] = {}
             if frappe.db.get_value("Customer", name, "disabled"):
                 updates["disabled"] = 0
-            if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and not get_customer_woo_id(name):
+            current_customer_name = str(frappe.db.get_value("Customer", name, "customer_name") or "")
+            if normalized_display_name and (overwrite_existing or not current_customer_name) and current_customer_name != normalized_display_name:
+                updates["customer_name"] = normalized_display_name
+            current_woo_customer_id = get_customer_woo_id(name)
+            if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and (overwrite_existing or not current_woo_customer_id) and current_woo_customer_id != normalized_woo_customer_id:
                 updates["woo_customer_id"] = normalized_woo_customer_id
-            if username and _field_exists("Customer", "woo_username") and not frappe.db.get_value("Customer", name, "woo_username"):
+            current_username = str(frappe.db.get_value("Customer", name, "woo_username") or "") if _field_exists("Customer", "woo_username") else ""
+            if username and _field_exists("Customer", "woo_username") and (overwrite_existing or not current_username) and current_username != username:
                 updates["woo_username"] = username
-            if phone_norm and not frappe.db.get_value("Customer", name, "mobile_no"):
+            current_mobile = str(frappe.db.get_value("Customer", name, "mobile_no") or "")
+            if phone_norm and (overwrite_existing or not current_mobile) and current_mobile != phone_norm:
                 updates["mobile_no"] = phone_norm
-            if email and not frappe.db.get_value("Customer", name, "email_id"):
+            current_email = str(frappe.db.get_value("Customer", name, "email_id") or "")
+            if email and (overwrite_existing or not current_email) and current_email != email:
                 updates["email_id"] = email
             if updates:
                 frappe.db.set_value("Customer", name, updates, update_modified=False)
@@ -136,16 +146,20 @@ def _update_customer_identity(
         if getattr(cust, "disabled", 0):
             cust.disabled = 0
             changed = True
-        if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and not get_customer_woo_id(cust):
+        if normalized_display_name and (overwrite_existing or not getattr(cust, "customer_name", None)) and getattr(cust, "customer_name", None) != normalized_display_name:
+            cust.customer_name = normalized_display_name
+            changed = True
+        current_woo_customer_id = get_customer_woo_id(cust)
+        if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and (overwrite_existing or not current_woo_customer_id) and current_woo_customer_id != normalized_woo_customer_id:
             cust.woo_customer_id = normalized_woo_customer_id
             changed = True
-        if username and _field_exists("Customer", "woo_username") and not getattr(cust, "woo_username", None):
+        if username and _field_exists("Customer", "woo_username") and (overwrite_existing or not getattr(cust, "woo_username", None)) and getattr(cust, "woo_username", None) != username:
             cust.woo_username = username
             changed = True
-        if phone_norm and not getattr(cust, "mobile_no", None):
+        if phone_norm and (overwrite_existing or not getattr(cust, "mobile_no", None)) and getattr(cust, "mobile_no", None) != phone_norm:
             cust.mobile_no = phone_norm
             changed = True
-        if email and not getattr(cust, "email_id", None):
+        if email and (overwrite_existing or not getattr(cust, "email_id", None)) and getattr(cust, "email_id", None) != email:
             cust.email_id = email
             changed = True
         if changed:
@@ -1035,6 +1049,16 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
         username=username,
         phone=phone,
         woo_customer_id=woo_cust_id,
+    )
+    _update_customer_identity(
+        customer_name,
+        woo_customer_id=woo_cust_id,
+        username=username,
+        phone_norm=_normalize_phone(phone),
+        email=email,
+        customer_cache=None,
+        display_name=_normalize_name(first_name, last_name, email, None),
+        overwrite_existing=True,
     )
 
     def _upsert_address(kind: str, data: dict) -> Optional[str]:
