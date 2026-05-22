@@ -48,6 +48,39 @@ def _field_exists(doctype: str, fieldname: str) -> bool:
     return result
 
 
+def _is_duplicate_key_error(exc: BaseException) -> bool:
+    duplicate_error_types = tuple(
+        error_type
+        for error_type in (
+            getattr(frappe, "DuplicateEntryError", None),
+            getattr(frappe, "UniqueValidationError", None),
+        )
+        if isinstance(error_type, type)
+    )
+    if duplicate_error_types and isinstance(exc, duplicate_error_types):
+        return True
+
+    fragments = [str(exc)]
+    for arg in getattr(exc, "args", ()) or ():
+        if isinstance(arg, BaseException):
+            if _is_duplicate_key_error(arg):
+                return True
+            fragments.append(str(arg))
+        else:
+            fragments.append(str(arg))
+
+    normalized = " ".join(fragment for fragment in fragments if fragment).lower()
+    return (
+        "duplicate entry" in normalized
+        or ("1062" in normalized and "duplicate" in normalized)
+        or ("integrityerror" in normalized and "duplicate" in normalized)
+        or (
+            "unique" in normalized
+            and ("constraint" in normalized or "validation" in normalized or "primary" in normalized)
+        )
+    )
+
+
 def _normalize_phone(p: Optional[str]) -> Optional[str]:
     if not p:
         return None
@@ -451,7 +484,9 @@ def _safe_insert_customer(
         if supports_savepoints:
             release_savepoint(sp)
         return doc.name
-    except frappe.DuplicateEntryError:
+    except Exception as exc:
+        if not _is_duplicate_key_error(exc):
+            raise
         if supports_savepoints:
             rollback(save_point=sp)
         frappe.logger("woo").info(
@@ -479,6 +514,7 @@ def _safe_insert_customer(
         # Genuine non-race collision on the generated name — suffix once and retry.
         suffix = f"-{order_id}" if order_id else "-dup"
         doc.customer_name = f"{doc.customer_name}{suffix}"
+        doc.name = None
         doc.insert(ignore_permissions=True)
         frappe.logger("woo").warning(
             f"customer_name_suffix_applied customer='{doc.name}' order={order_id}"
@@ -799,13 +835,23 @@ def _safe_insert_address(
     address_title is suffixed once and retried before raising.
     """
     sp = "woo_addr_ins"
+    savepoint = getattr(frappe.db, "savepoint", None)
+    release_savepoint = getattr(frappe.db, "release_savepoint", None)
+    rollback = getattr(frappe.db, "rollback", None)
+    supports_savepoints = callable(savepoint) and callable(release_savepoint) and callable(rollback)
+
     try:
-        frappe.db.savepoint(sp)
+        if supports_savepoints:
+            savepoint(sp)
         addr_doc.insert(ignore_permissions=True)
-        frappe.db.release_savepoint(sp)
+        if supports_savepoints:
+            release_savepoint(sp)
         return addr_doc.name
-    except frappe.DuplicateEntryError:
-        frappe.db.rollback(save_point=sp)
+    except Exception as exc:
+        if not _is_duplicate_key_error(exc):
+            raise
+        if supports_savepoints:
+            rollback(save_point=sp)
         frappe.logger("woo").info(
             f"recovered_from_race address customer={customer} order={order_id}"
         )
@@ -815,6 +861,7 @@ def _safe_insert_address(
         # Genuine collision — suffix address_title once and retry.
         suffix = f"-{order_id}" if order_id else "-dup"
         addr_doc.address_title = f"{addr_doc.address_title}{suffix}"
+        addr_doc.name = None
         addr_doc.insert(ignore_permissions=True)
         frappe.logger("woo").warning(
             f"address_title_suffix_applied address='{addr_doc.name}' order={order_id}"

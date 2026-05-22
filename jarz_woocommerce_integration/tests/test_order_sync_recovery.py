@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import frappe
+
 from jarz_woocommerce_integration.services import order_sync
 
 
@@ -11,6 +13,38 @@ class FrozenDateTime(datetime):
         if tz is None:
             return base.replace(tzinfo=None)
         return base.astimezone(tz)
+
+
+def _patch_customer_failure_path(monkeypatch, exc):
+    class DummyLock:
+        def acquire(self, blocking=False):
+            return True
+
+        def release(self):
+            return None
+
+    class DummyRedis:
+        def lock(self, *args, **kwargs):
+            return DummyLock()
+
+    def fake_sql(query, params=None, as_dict=False):
+        del params, as_dict
+        if "GET_LOCK" in query:
+            return [(1,)]
+        if "RELEASE_LOCK" in query:
+            return [(1,)]
+        raise AssertionError(query)
+
+    monkeypatch.setattr(order_sync, "get_redis_conn", lambda: DummyRedis())
+    monkeypatch.setattr(order_sync.frappe.db, "sql", fake_sql)
+    monkeypatch.setattr(order_sync.frappe.db, "get_table_columns", lambda doctype: ["erpnext_sales_invoice"])
+    monkeypatch.setattr(order_sync.frappe.db, "get_value", lambda *args, **kwargs: None)
+    monkeypatch.setattr(order_sync.frappe, "get_all", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        order_sync,
+        "ensure_customer_with_addresses",
+        lambda *args, **kwargs: (_ for _ in ()).throw(exc),
+    )
 
 
 def test_minutes_ago_for_woo_uses_real_utc(monkeypatch):
@@ -98,6 +132,69 @@ def test_backfill_orders_by_ids_phase1_aggregates_statuses(monkeypatch):
     assert summary["updated"] == 1
     assert summary["errors"] == 1
     assert summary["skipped"] == 0
+
+
+def test_pull_single_order_phase1_locked_skip_is_not_success(monkeypatch):
+    settings = SimpleNamespace(
+        base_url="https://example.com",
+        consumer_key="ck_test",
+        get_password=lambda fieldname: "cs_test",
+    )
+    order = {"id": 14763, "status": "processing", "line_items": []}
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_order(self, order_id):
+            assert order_id == 14763
+            return dict(order)
+
+    monkeypatch.setattr(order_sync, "WooClient", DummyClient)
+    monkeypatch.setattr(order_sync, "ensure_custom_fields", lambda: None)
+    monkeypatch.setattr(order_sync.frappe, "get_single", lambda doctype: settings)
+    monkeypatch.setattr(
+        order_sync,
+        "process_order_phase1",
+        lambda *args, **kwargs: {"status": "skipped", "reason": "locked", "woo_order_id": 14763},
+    )
+
+    result = order_sync.pull_single_order_phase1(14763)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "locked"
+    assert result["success"] is False
+
+
+def test_process_order_phase1_normalizes_duplicate_customer_error(monkeypatch):
+    duplicate = frappe.UniqueValidationError(
+        "Customer",
+        "CUST-0042",
+        Exception("Duplicate entry 'CUST-0042' for key 'PRIMARY'"),
+    )
+    _patch_customer_failure_path(monkeypatch, duplicate)
+
+    result = order_sync.process_order_phase1(
+        {"id": 15010, "status": "processing", "billing": {}, "shipping": {}},
+        SimpleNamespace(),
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "customer_error:duplicate_key_race"
+    assert "Duplicate entry" in result["detail"]
+
+
+def test_process_order_phase1_normalizes_internal_customer_error(monkeypatch):
+    _patch_customer_failure_path(monkeypatch, RuntimeError("boom"))
+
+    result = order_sync.process_order_phase1(
+        {"id": 15011, "status": "processing", "billing": {}, "shipping": {}},
+        SimpleNamespace(),
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "customer_error:internal_error"
+    assert result["detail"] == "boom"
 
 
 def test_refresh_order_contact_snapshot_updates_invoice_and_map(monkeypatch):

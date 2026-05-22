@@ -54,6 +54,57 @@ class TestSyncEvents(unittest.TestCase):
 		self.assertEqual(result["status"], "retry")
 		self.assertTrue(any(update.get("status") == "RetryScheduled" for update in updates))
 
+	def test_process_sync_event_retries_locked_order_even_when_result_has_success_true(self):
+		event_doc, updates = _event_doc(
+			direction="Inbound",
+			object_type="Order",
+			payload_json=json.dumps({"id": 123}),
+			source_id="123",
+			woo_order_id=123,
+		)
+
+		with unittest.mock.patch.object(sync_events, "_claim_sync_event", return_value=event_doc), \
+			 unittest.mock.patch.object(sync_events, "_dispatch_inbound_event", return_value={"status": "skipped", "reason": "locked", "success": True}), \
+			 unittest.mock.patch.object(sync_events.frappe.db, "commit", return_value=None):
+			result = sync_events.process_sync_event(event_doc.name)
+
+		self.assertEqual(result["status"], "retry")
+		self.assertTrue(any(update.get("status") == "RetryScheduled" for update in updates))
+
+	def test_process_sync_event_retries_customer_duplicate_error(self):
+		event_doc, updates = _event_doc(
+			direction="Inbound",
+			object_type="Order",
+			payload_json=json.dumps({"id": 15010}),
+			source_id="15010",
+			woo_order_id=15010,
+		)
+
+		with unittest.mock.patch.object(sync_events, "_claim_sync_event", return_value=event_doc), \
+			 unittest.mock.patch.object(sync_events, "_dispatch_inbound_event", return_value={"status": "skipped", "reason": "customer_error:duplicate_key_race", "success": False}), \
+			 unittest.mock.patch.object(sync_events.frappe.db, "commit", return_value=None):
+			result = sync_events.process_sync_event(event_doc.name)
+
+		self.assertEqual(result["status"], "retry")
+		self.assertTrue(any(update.get("status") == "RetryScheduled" for update in updates))
+
+	def test_process_sync_event_marks_unmapped_items_needs_review(self):
+		event_doc, updates = _event_doc(
+			direction="Inbound",
+			object_type="Order",
+			payload_json=json.dumps({"id": 15011}),
+			source_id="15011",
+			woo_order_id=15011,
+		)
+
+		with unittest.mock.patch.object(sync_events, "_claim_sync_event", return_value=event_doc), \
+			 unittest.mock.patch.object(sync_events, "_dispatch_inbound_event", return_value={"status": "skipped", "reason": "unmapped_items", "success": False}), \
+			 unittest.mock.patch.object(sync_events.frappe.db, "commit", return_value=None):
+			result = sync_events.process_sync_event(event_doc.name)
+
+		self.assertEqual(result["status"], "needs_review")
+		self.assertTrue(any(update.get("status") == "NeedsReview" for update in updates))
+
 	def test_process_due_sync_events_skips_when_worker_disabled(self):
 		cfg = sync_events.SyncEventConfig(
 			enabled=True,

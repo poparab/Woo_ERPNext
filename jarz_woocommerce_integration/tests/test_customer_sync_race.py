@@ -66,6 +66,25 @@ class TestSafeInsertCustomer(unittest.TestCase):
         find_woo.assert_called_once_with(99)
         self.assertEqual(result, "CUST-0042")
 
+    def test_recovers_via_woo_customer_id_on_unique_validation_duplicate(self):
+        """Frappe may wrap duplicate DB inserts in UniqueValidationError."""
+        doc = _make_customer_doc()
+        duplicate = frappe.UniqueValidationError(
+            "Customer",
+            "CUST-0042",
+            Exception("Duplicate entry 'CUST-0042' for key 'PRIMARY'"),
+        )
+
+        with patch.object(customer_sync.frappe.db, "savepoint"), \
+             patch.object(customer_sync.frappe.db, "rollback"), \
+             patch.object(doc, "insert", side_effect=duplicate), \
+             patch.object(customer_sync, "_field_exists", return_value=True), \
+             patch.object(customer_sync, "find_customer_by_woo_id", return_value="CUST-0042") as find_woo:
+            result = self._call(doc, woo_customer_id=99)
+
+        find_woo.assert_called_once_with(99)
+        self.assertEqual(result, "CUST-0042")
+
     def test_recovers_via_phone_when_woo_id_not_found(self):
         """Falls through to phone lookup if woo_id lookup returns nothing."""
         doc = _make_customer_doc()
@@ -138,6 +157,30 @@ class TestSafeInsertCustomer(unittest.TestCase):
         self.assertEqual(insert_call_count["n"], 2)
         self.assertIn("14476", doc.customer_name)
         self.assertEqual(result, "CUST-SUFFIXED")
+
+    def test_suffix_retry_clears_failed_primary_key_before_reinsert(self):
+        """A retry must clear doc.name so Frappe does not reuse the duplicate key."""
+        doc = _make_customer_doc("Ahmed Mohamed")
+        doc.customer_name = "Ahmed Mohamed"
+        seen_names = []
+
+        def _insert_side_effect(*_a, **_kw):
+            seen_names.append(doc.name)
+            if len(seen_names) == 1:
+                raise frappe.DuplicateEntryError("duplicate")
+            doc.name = "Ahmed Mohamed-14476"
+
+        with patch.object(customer_sync.frappe.db, "savepoint"), \
+             patch.object(customer_sync.frappe.db, "rollback"), \
+             patch.object(doc, "insert", side_effect=_insert_side_effect), \
+             patch.object(customer_sync, "_field_exists", return_value=False), \
+             patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
+             patch.object(customer_sync.frappe.db, "get_value", return_value=None):
+            result = self._call(doc, woo_customer_id=None, phone_norm=None,
+                                username=None, email=None, order_id=14476)
+
+        self.assertEqual(seen_names, ["Ahmed Mohamed", None])
+        self.assertEqual(result, "Ahmed Mohamed-14476")
 
     def test_non_duplicate_exception_is_reraised(self):
         """Exceptions other than DuplicateEntryError propagate unchanged."""

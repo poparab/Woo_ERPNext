@@ -42,6 +42,11 @@ RETRYABLE_REASON_TOKENS = (
     "db_locked",
     "deadlock",
     "lock wait",
+    "duplicate",
+    "duplicate_key",
+    "duplicate entry",
+    "integrityerror",
+    "internal_error",
 )
 REVIEW_REASON_TOKENS = (
     "invalid_payload",
@@ -59,6 +64,9 @@ REVIEW_REASON_TOKENS = (
     "amendment depth",
     "territory",
     "validation",
+    "unmapped_items",
+    "no_lines",
+    "order_not_found",
 )
 SKIP_REASON_TOKENS = (
     "already_mapped",
@@ -1034,6 +1042,22 @@ def _classify_text_reason(text: str | None) -> str:
     return "review"
 
 
+def _classify_inbound_order_skip_reason(reason: str | None) -> str:
+    normalized = (reason or "").strip().lower()
+    if not normalized:
+        return "review"
+    if normalized in RETRYABLE_ORDER_REASONS:
+        return "retry"
+    if normalized.startswith("customer_error:"):
+        return _classify_text_reason(normalized.partition(":")[2])
+    classification = _classify_text_reason(normalized)
+    if classification == "skip":
+        return "skip"
+    if classification == "retry":
+        return "retry"
+    return "review"
+
+
 def _handle_failure(event_doc: Any, *, result: Any = None, detail: str | None = None) -> dict[str, Any]:
     classification = _classify_text_reason(detail)
     if classification == "skip":
@@ -1121,15 +1145,24 @@ def _apply_outbound_result(event_doc: Any, result: Any) -> dict[str, Any]:
 
 def _apply_inbound_result(event_doc: Any, result: Any) -> dict[str, Any]:
     if event_doc.object_type == "Order" and isinstance(result, dict):
-        if result.get("success") is True or result.get("status") in {"created", "updated"}:
-            return _mark_success(event_doc, result)
         if result.get("status") == "skipped":
             reason = str(result.get("reason") or "skipped")
-            if reason in RETRYABLE_ORDER_REASONS:
+            classification = _classify_inbound_order_skip_reason(reason)
+            if classification == "retry":
                 return _handle_failure(event_doc, result=result, detail=reason)
+            if classification == "review":
+                return _mark_needs_review(event_doc, result, reason)
             return _mark_skipped(event_doc, result, reason)
+        if result.get("success") is True or result.get("status") in {"created", "updated"}:
+            return _mark_success(event_doc, result)
         if result.get("status") == "error":
-            detail = str(result.get("detail") or result.get("reason") or result.get("message") or "error")
+            detail = str(result.get("detail") or result.get("reason") or result.get("message") or result.get("error") or "error")
+            return _handle_failure(event_doc, result=result, detail=detail)
+        if result.get("success") is False:
+            detail = str(result.get("detail") or result.get("reason") or result.get("message") or result.get("error") or "error")
+            return _handle_failure(event_doc, result=result, detail=detail)
+        if result.get("reason") or result.get("detail") or result.get("message") or result.get("error"):
+            detail = str(result.get("detail") or result.get("reason") or result.get("message") or result.get("error") or "error")
             return _handle_failure(event_doc, result=result, detail=detail)
     if event_doc.object_type == "Customer" and isinstance(result, dict):
         if result.get("status") == "success":
@@ -1139,6 +1172,9 @@ def _apply_inbound_result(event_doc: Any, result: Any) -> dict[str, Any]:
             return _handle_failure(event_doc, result=result, detail=detail)
     if isinstance(result, dict) and result.get("success") is True:
         return _mark_success(event_doc, result)
+    if isinstance(result, dict) and (result.get("status") == "error" or result.get("success") is False):
+        detail = str(result.get("detail") or result.get("error") or result.get("reason") or result.get("message") or "error")
+        return _handle_failure(event_doc, result=result, detail=detail)
     return _mark_success(event_doc, result)
 
 

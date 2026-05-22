@@ -12,7 +12,7 @@ import frappe
 
 from jarz_woocommerce_integration.utils.http_client import WooClient
 from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_fields
-from jarz_woocommerce_integration.services.customer_sync import ensure_customer_with_addresses
+from jarz_woocommerce_integration.services.customer_sync import ensure_customer_with_addresses, _is_duplicate_key_error
 
 
 DEFAULT_LIVE_ORDER_OVERLAP_MINUTES = 15
@@ -56,6 +56,27 @@ ORDER_SYNC_CURSOR_FIELDS = {
         "synced_on": "cancelled_order_cursor_synced_on",
     },
 }
+
+
+def _normalize_customer_error_code(reason: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(reason or "").strip().lower()).strip("_")
+    return normalized or "internal_error"
+
+
+def _build_customer_error_result(
+    woo_order_id: Any,
+    reason: Any,
+    *,
+    detail: Any | None = None,
+) -> dict[str, Any]:
+    result = {
+        "status": "skipped",
+        "reason": f"customer_error:{_normalize_customer_error_code(reason)}",
+        "woo_order_id": woo_order_id,
+    }
+    if detail not in (None, ""):
+        result["detail"] = str(detail)[:500]
+    return result
 
 
 class MigrationCache:
@@ -2537,9 +2558,11 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         reason = str(ve)
         if reason == "no_address":
             return {"status": "skipped", "reason": "no_address", "woo_order_id": woo_id}
-        return {"status": "skipped", "reason": f"customer_error:{reason}", "woo_order_id": woo_id}
+        return _build_customer_error_result(woo_id, reason, detail=ve)
     except Exception as ce:  # noqa
-        return {"status": "skipped", "reason": f"customer_error:{ce}", "woo_order_id": woo_id}
+        if _is_duplicate_key_error(ce):
+            return _build_customer_error_result(woo_id, "duplicate_key_race", detail=ce)
+        return _build_customer_error_result(woo_id, "internal_error", detail=ce)
 
     # Resolve Territory -> POS Profile -> warehouse.
     # Warehouse is ALWAYS derived from POS Profile.warehouse — never from settings.default_warehouse.
@@ -3525,8 +3548,6 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
         "unchanged",
         "pending_payment",
         "processing",
-        "locked",
-        "db_locked",
         "submitted_frozen",  # PROD-WOO-001: submitted SI is intentionally frozen
     }
     result["success"] = result.get("status") in ("created", "updated") or (
