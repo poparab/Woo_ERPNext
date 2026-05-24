@@ -556,7 +556,7 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         self.assertEqual(enqueue_calls, [])
 
-    def test_enqueue_invoice_sync_skips_payment_method_only_updates(self):
+    def test_enqueue_invoice_sync_keeps_payment_method_only_updates(self):
         previous = DummyInvoice(sales_invoice_state="Out for Delivery")
         previous.custom_payment_method = "Cash"
         current = DummyInvoice(sales_invoice_state="Out for Delivery")
@@ -570,7 +570,42 @@ class TestOutboundStatusSync(unittest.TestCase):
              unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
             outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
 
-        self.assertEqual(enqueue_calls, [])
+        self.assertEqual(len(enqueue_calls), 1)
+        self.assertEqual(enqueue_calls[0][1]["invoice_name"], current.name)
+
+    def test_enqueue_invoice_sync_keeps_shipping_address_only_updates(self):
+        previous = DummyInvoice(sales_invoice_state="Out for Delivery")
+        previous.shipping_address_name = "ADDR-SHIP-001"
+        current = DummyInvoice(sales_invoice_state="Out for Delivery")
+        current.shipping_address_name = "ADDR-SHIP-002"
+        current._before_save = previous
+        enqueue_calls = []
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
+
+        self.assertEqual(len(enqueue_calls), 1)
+        self.assertEqual(enqueue_calls[0][1]["invoice_name"], current.name)
+
+    def test_enqueue_invoice_sync_keeps_outstanding_amount_only_updates(self):
+        previous = DummyInvoice(sales_invoice_state="Recieved")
+        previous.outstanding_amount = 10
+        current = DummyInvoice(sales_invoice_state="Recieved")
+        current.outstanding_amount = 0
+        current._before_save = previous
+        enqueue_calls = []
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+               unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=True)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
+            outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
+
+        self.assertEqual(len(enqueue_calls), 1)
+        self.assertEqual(enqueue_calls[0][1]["invoice_name"], current.name)
 
     def test_enqueue_invoice_sync_keeps_delivery_window_updates(self):
         previous = DummyInvoice(sales_invoice_state="Out for Delivery")

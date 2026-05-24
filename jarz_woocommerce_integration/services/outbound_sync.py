@@ -112,6 +112,17 @@ _INVOICE_OUTBOUND_DELIVERY_FIELDS = frozenset({
     "delivery_time",
 })
 
+_INVOICE_OUTBOUND_PAYLOAD_FIELDS = frozenset({
+    "customer",
+    "currency",
+    "outstanding_amount",
+    "custom_payment_method",
+    "mode_of_payment",
+    "customer_address",
+    "shipping_address_name",
+    "woo_order_id",
+})
+
 _APPROVED_INVOICE_OUTBOUND_STATUSES = frozenset({
     "out-for-delivery",
     "completed",
@@ -1477,6 +1488,8 @@ def _should_enqueue_invoice_event(
     if _has_missing_or_stale_woo_order_mapping(invoice):
         return True
     if _has_approved_invoice_status_change(invoice, cancel=cancel):
+        return True
+    if _has_any_value_changed(invoice, _INVOICE_OUTBOUND_PAYLOAD_FIELDS):
         return True
     if _has_any_value_changed(invoice, _INVOICE_OUTBOUND_DELIVERY_FIELDS):
         return True
