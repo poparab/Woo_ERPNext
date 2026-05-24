@@ -759,6 +759,92 @@ class TestEvaluatePaidAmendment:
         assert result["status"] == "skipped"
         assert result["reason"] == "paid_amendment_disabled"
 
+    def test_paid_lane_recreates_replacement_payment_before_verify(self, monkeypatch):
+        order_map_row = SimpleNamespace(
+            name="WOOMAP-00001",
+            erpnext_sales_invoice="ACC-SINV-99001",
+            hash="oldhash",
+        )
+        source_si = _make_fake_inv(
+            name="ACC-SINV-99001",
+            outstanding_amount=0.0,
+            grand_total=200.0,
+        )
+        source_si.custom_payment_method = "Cash"
+        replacement_si = _make_fake_inv(
+            name="ACC-SINV-99001-1",
+            outstanding_amount=200.0,
+            grand_total=200.0,
+            amended_from="ACC-SINV-99001",
+        )
+        replacement_si.custom_payment_method = "Cash"
+        eligibility = {"can_amend": True, "amendment_block_code": None, "amendment_block_reason": None}
+
+        oa = self._patch_frappe(
+            monkeypatch,
+            order_map_row=order_map_row,
+            source_si=source_si,
+            eligibility=eligibility,
+            enable_paid_amendment=1,
+        )
+
+        payment_entry_doc = SimpleNamespace(docstatus=1, flags=SimpleNamespace(), cancel=MagicMock())
+        created_payment_entries = []
+
+        def _fake_get_doc(doctype, name=None, *args, **kwargs):
+            if doctype == "Sales Invoice" and name == "ACC-SINV-99001":
+                return source_si
+            if doctype == "Sales Invoice" and name == "ACC-SINV-99001-1":
+                return replacement_si
+            if doctype == "Payment Entry" and name == "ACC-PAY-0001":
+                return payment_entry_doc
+            raise AssertionError(f"unexpected get_doc({doctype!r}, {name!r})")
+
+        monkeypatch.setattr(oa.frappe, "get_doc", _fake_get_doc)
+        monkeypatch.setattr(oa.frappe.db, "savepoint", MagicMock())
+        monkeypatch.setattr(oa.frappe.db, "rollback", MagicMock())
+        monkeypatch.setattr(oa.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))
+        monkeypatch.setattr(oa, "_find_existing_replacement", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            oa,
+            "_evaluate_paid_amendment",
+            lambda source_si, order_payload, settings: {
+                "requires_paid_lane": True,
+                "can_auto_amend": True,
+                "payment_entries": ["ACC-PAY-0001"],
+                "allocated_total": 200.0,
+                "invoice_total": 200.0,
+                "incoming_total": 200.0,
+            },
+        )
+        monkeypatch.setattr(
+            "jarz_woocommerce_integration.services.order_amendment.get_invoice_amendment_eligibility",
+            lambda inv: eligibility,
+        )
+        monkeypatch.setattr(
+            order_sync,
+            "process_order_phase1",
+            lambda *a, **kw: {"invoice": "ACC-SINV-99001-1"},
+        )
+
+        def _fake_create_payment_entry(invoice_name, payment_method, posting_date=None, cache=None):
+            created_payment_entries.append((invoice_name, payment_method, posting_date))
+            replacement_si.outstanding_amount = 0.0
+            return "ACC-PAY-0002"
+
+        monkeypatch.setattr(order_sync, "_create_payment_entry", _fake_create_payment_entry)
+        monkeypatch.setattr(
+            oa,
+            "_verify_paid_replacement",
+            lambda *a, **kw: {"ok": True, "replacement_payment_entries": ["ACC-PAY-0002"]},
+        )
+
+        result = oa.run_woo_amendment_job(99001, _make_woo_order(total="200.00"), "WooCommerce Settings")
+
+        assert result["status"] == "success"
+        assert created_payment_entries == [("ACC-SINV-99001-1", "Cash", "2026-06-01")]
+        payment_entry_doc.cancel.assert_called_once()
+
     def test_savepoint_name_is_sql_safe(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
 

@@ -673,6 +673,21 @@ def run_woo_amendment_job(
             replacement_si = frappe.get_doc("Sales Invoice", replacement_si_name)
             replacement_payment_entries: list[str] = []
             if paid_amendment.get("requires_paid_lane"):
+                if _coerce_float(replacement_si.get("outstanding_amount") or 0) > _MONEY_TOLERANCE:
+                    from jarz_woocommerce_integration.services.order_sync import _create_payment_entry
+
+                    replacement_payment_method = (
+                        str(replacement_si.get("custom_payment_method") or "").strip()
+                        or str(source_si.get("custom_payment_method") or "").strip()
+                        or None
+                    )
+                    _create_payment_entry(
+                        replacement_si_name,
+                        replacement_payment_method,
+                        posting_date=replacement_si.get("posting_date") or source_si.get("posting_date"),
+                    )
+                    replacement_si = frappe.get_doc("Sales Invoice", replacement_si_name)
+
                 replacement_check = _verify_paid_replacement(
                     source_si,
                     replacement_si,
