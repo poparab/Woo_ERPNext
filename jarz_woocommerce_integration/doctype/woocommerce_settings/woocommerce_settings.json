@@ -16,6 +16,7 @@
   "section_inbound",
   "enable_inbound_orders",
   "enable_inbound_amendment",
+  "enable_pre_ofd_paid_amendment",
   "default_pos_profile",
     "live_order_overlap_minutes",
     "live_order_max_pages",
@@ -136,6 +137,13 @@
    "fieldtype": "Check",
    "label": "Enable Inbound Order Amendment",
    "description": "When ON, item edits on WooCommerce orders will trigger a cancel + recreate of the ERPNext Sales Invoice. Keep OFF until the feature is tested in staging."
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_pre_ofd_paid_amendment",
+   "fieldtype": "Check",
+   "label": "Enable Pre-OFD Paid Amendment",
+   "description": "When ON, fully paid submitted invoices can auto-amend before Out for Delivery only when the linked Payment Entries are simple and the Woo order total stays unchanged. Keep OFF until the accounting path is validated in staging."
   },
   {
    "fieldname": "default_pos_profile",

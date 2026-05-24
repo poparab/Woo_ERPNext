@@ -91,6 +91,7 @@ def _make_settings(enable_amendment: int = 0):
         default_pos_profile=None,
         default_selling_price_list=None,
         enable_inbound_amendment=enable_amendment,
+        enable_pre_ofd_paid_amendment=0,
     )
 
 
@@ -101,6 +102,9 @@ def _make_fake_inv(
     inv_state: str = "New",
     name: str = "ACC-SINV-99001",
     items: list | None = None,
+    grand_total: float = 200.0,
+    outstanding_amount: float = 200.0,
+    amended_from: str | None = None,
 ) -> SimpleNamespace:
     inv = SimpleNamespace(
         doctype="Sales Invoice",
@@ -115,6 +119,9 @@ def _make_fake_inv(
         customer="Test Customer",
         company="_Test Company",
         posting_date="2026-06-01",
+        grand_total=grand_total,
+        outstanding_amount=outstanding_amount,
+        amended_from=amended_from,
         items=items or [],
         flags=SimpleNamespace(),
     )
@@ -390,7 +397,8 @@ class TestRunWooAmendmentJobGuards:
 
     def _patch_frappe(self, monkeypatch, *, order_map_row=None, source_si=None,
                        sql_returns=None, eligibility=None,
-                       amend_depth=0, period_block=None, enable_amendment=1):
+                       amend_depth=0, period_block=None, enable_amendment=1,
+                       enable_paid_amendment=0):
         import jarz_woocommerce_integration.services.order_amendment as oa
 
         normalized_order_map_row = vars(order_map_row) if isinstance(order_map_row, SimpleNamespace) else order_map_row
@@ -410,7 +418,11 @@ class TestRunWooAmendmentJobGuards:
         monkeypatch.setattr(oa.frappe.db, "set_value", MagicMock())
 
         def _fake_get_single(name):
-            return SimpleNamespace(name=name, enable_inbound_amendment=enable_amendment)
+            return SimpleNamespace(
+                name=name,
+                enable_inbound_amendment=enable_amendment,
+                enable_pre_ofd_paid_amendment=enable_paid_amendment,
+            )
 
         monkeypatch.setattr(oa.frappe, "get_single", _fake_get_single)
 
@@ -446,6 +458,136 @@ class TestRunWooAmendmentJobGuards:
         monkeypatch.setitem(sys.modules, "jarz_pos.api.manager", manager_module)
 
         return oa
+
+
+class TestEvaluatePaidAmendment:
+    def test_unpaid_invoice_skips_paid_lane(self, monkeypatch):
+        import jarz_woocommerce_integration.services.order_amendment as oa
+
+        source_si = _make_fake_inv(outstanding_amount=200.0, grand_total=200.0)
+        settings = _make_settings(enable_amendment=1)
+
+        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: [])
+        monkeypatch.setattr(oa, "_get_payment_entry_details", lambda invoice_name, payment_entry_names=None: [])
+
+        result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="200.00"), settings)
+
+        assert result["requires_paid_lane"] is False
+        assert result["can_auto_amend"] is True
+        assert result["block_code"] is None
+
+    def test_paid_invoice_requires_separate_flag(self, monkeypatch):
+        import jarz_woocommerce_integration.services.order_amendment as oa
+
+        source_si = _make_fake_inv(outstanding_amount=0.0, grand_total=200.0)
+        settings = _make_settings(enable_amendment=1)
+
+        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0001"])
+        monkeypatch.setattr(
+            oa,
+            "_get_payment_entry_details",
+            lambda invoice_name, payment_entry_names=None: [
+                {
+                    "name": "ACC-PAY-0001",
+                    "allocated_amount": 200.0,
+                    "unallocated_amount": 0.0,
+                    "clearance_date": None,
+                }
+            ],
+        )
+
+        result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="200.00"), settings)
+
+        assert result["requires_paid_lane"] is True
+        assert result["can_auto_amend"] is False
+        assert result["block_code"] == "paid_amendment_disabled"
+
+    def test_paid_invoice_blocks_on_amount_delta(self, monkeypatch):
+        import jarz_woocommerce_integration.services.order_amendment as oa
+        from jarz_woocommerce_integration.services import order_sync
+
+        source_si = _make_fake_inv(outstanding_amount=0.0, grand_total=200.0)
+        settings = _make_settings(enable_amendment=1)
+        settings.enable_pre_ofd_paid_amendment = 1
+
+        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0002"])
+        monkeypatch.setattr(
+            oa,
+            "_get_payment_entry_details",
+            lambda invoice_name, payment_entry_names=None: [
+                {
+                    "name": "ACC-PAY-0002",
+                    "allocated_amount": 200.0,
+                    "unallocated_amount": 0.0,
+                    "clearance_date": None,
+                }
+            ],
+        )
+        monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
+
+        result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="250.00"), settings)
+
+        assert result["requires_paid_lane"] is True
+        assert result["can_auto_amend"] is False
+        assert result["block_code"] == "paid_amendment_amount_delta"
+
+    def test_paid_invoice_same_total_simple_payment_passes(self, monkeypatch):
+        import jarz_woocommerce_integration.services.order_amendment as oa
+        from jarz_woocommerce_integration.services import order_sync
+
+        source_si = _make_fake_inv(outstanding_amount=0.0, grand_total=200.0)
+        settings = _make_settings(enable_amendment=1)
+        settings.enable_pre_ofd_paid_amendment = 1
+
+        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0003"])
+        monkeypatch.setattr(
+            oa,
+            "_get_payment_entry_details",
+            lambda invoice_name, payment_entry_names=None: [
+                {
+                    "name": "ACC-PAY-0003",
+                    "allocated_amount": 200.0,
+                    "unallocated_amount": 0.0,
+                    "clearance_date": None,
+                }
+            ],
+        )
+        monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
+
+        result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="200.00"), settings)
+
+        assert result["requires_paid_lane"] is True
+        assert result["can_auto_amend"] is True
+        assert result["block_code"] is None
+
+    def test_paid_invoice_with_clearance_date_blocks(self, monkeypatch):
+        import jarz_woocommerce_integration.services.order_amendment as oa
+        from jarz_woocommerce_integration.services import order_sync
+
+        source_si = _make_fake_inv(outstanding_amount=0.0, grand_total=200.0)
+        settings = _make_settings(enable_amendment=1)
+        settings.enable_pre_ofd_paid_amendment = 1
+
+        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0004"])
+        monkeypatch.setattr(
+            oa,
+            "_get_payment_entry_details",
+            lambda invoice_name, payment_entry_names=None: [
+                {
+                    "name": "ACC-PAY-0004",
+                    "allocated_amount": 200.0,
+                    "unallocated_amount": 0.0,
+                    "clearance_date": "2026-06-01",
+                }
+            ],
+        )
+        monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
+
+        result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="200.00"), settings)
+
+        assert result["requires_paid_lane"] is True
+        assert result["can_auto_amend"] is False
+        assert result["block_code"] == "paid_amendment_reconciled_payment"
 
     def test_advisory_lock_fail_returns_skipped(self, monkeypatch):
         import jarz_woocommerce_integration.services.order_amendment as oa
@@ -578,6 +720,46 @@ class TestRunWooAmendmentJobGuards:
             result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
         assert result["status"] == "skipped"
         assert result["reason"] == "period_closed"
+
+    def test_paid_invoice_blocked_when_paid_flag_is_off(self, monkeypatch):
+        order_map_row = SimpleNamespace(
+            name="WOOMAP-00001",
+            erpnext_sales_invoice="ACC-SINV-99001",
+            hash="oldhash",
+        )
+        source_si = _make_fake_inv(outstanding_amount=0.0, grand_total=200.0)
+        eligibility = {"can_amend": True, "amendment_block_code": None, "amendment_block_reason": None}
+        oa = self._patch_frappe(
+            monkeypatch,
+            order_map_row=order_map_row,
+            source_si=source_si,
+            eligibility=eligibility,
+            enable_paid_amendment=0,
+        )
+        monkeypatch.setattr(oa, "_find_existing_replacement", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            oa,
+            "_evaluate_paid_amendment",
+            lambda source_si, order_payload, settings: {
+                "requires_paid_lane": True,
+                "can_auto_amend": False,
+                "block_code": "paid_amendment_disabled",
+                "block_reason": "paid invoice amendment requires enable_pre_ofd_paid_amendment=1",
+                "payment_entries": ["ACC-PAY-0001"],
+                "allocated_total": 200.0,
+                "invoice_total": 200.0,
+                "incoming_total": 200.0,
+            },
+        )
+
+        with patch(
+            "jarz_woocommerce_integration.services.order_amendment.get_invoice_amendment_eligibility",
+            return_value=eligibility,
+        ):
+            result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "paid_amendment_disabled"
 
     def test_savepoint_name_is_sql_safe(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
