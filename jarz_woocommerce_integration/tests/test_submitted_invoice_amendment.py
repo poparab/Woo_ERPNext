@@ -25,8 +25,6 @@ import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
-import pytest
-
 from jarz_woocommerce_integration.services import order_sync
 from jarz_woocommerce_integration.services.order_sync import _compute_order_hash
 
