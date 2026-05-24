@@ -642,6 +642,8 @@ def run_woo_amendment_job(
                 cancelled_payment_entries.append(pe_name)
 
             # ── 14. Cancel source Sales Invoice ───────────────────────────────
+            # Payment Entry cancellation updates invoice accounting fields and modified.
+            source_si = frappe.get_doc("Sales Invoice", source_si_name)
             source_si.flags.ignore_permissions = True
             source_si.flags.ignore_woo_outbound = True
             source_si.cancel()
