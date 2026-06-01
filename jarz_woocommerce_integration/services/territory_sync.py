@@ -35,6 +35,7 @@ CODE_TO_DISPLAY = {
     "EGABBASSIYA": "Abbasiya - العباسيه",
     "EGHADAYEQ": "Hadayek El-Qobba - حدائق القبه",
     "EGZAWYA": "Zawya El-Hamra - الزاويه الحمرا",
+    "EGSHAMS": "Ain Shams - عين شمس",
     "EGMATARIYA": "Matareya - المطريه",
     "EGMASRJD": "Heliopolis - مصر الجديده",
     "EGNASRCITY": "Nasr City - مدينه نصر",

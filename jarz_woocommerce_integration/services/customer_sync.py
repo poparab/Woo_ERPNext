@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import re
 from typing import Any, Dict, Optional, Tuple
+import unicodedata
 
 import frappe
 from frappe.utils import get_datetime  # type: ignore[import]
@@ -719,6 +721,80 @@ def _resolve_country(raw: str | None) -> Optional[str]:
     return None
 
 
+_TERRITORY_LABEL_SEPARATOR_RE = re.compile(r"\s+-\s+")
+_TERRITORY_LOOKUP_FIELDS = (
+    "territory_name",
+    "custom_woo_code",
+    "woo_code",
+    "custom_territory_name_ar",
+)
+
+
+def _normalize_territory_lookup_text(value: Any) -> str:
+    text = unicodedata.normalize("NFC", str(value or "")).strip()
+    text = re.sub(r"\s+", " ", text)
+    return re.sub(r"\s*-\s*", " - ", text)
+
+
+def _territory_lookup_candidates(value: Any) -> list[str]:
+    normalized = _normalize_territory_lookup_text(value)
+    candidates: list[str] = []
+    for candidate in [normalized, *_TERRITORY_LABEL_SEPARATOR_RE.split(normalized, maxsplit=1)]:
+        candidate = _normalize_territory_lookup_text(candidate)
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _lookup_territory_by_field(fieldname: str, value: str) -> str | None:
+    if not value:
+        return None
+    try:
+        if fieldname == "name":
+            if frappe.db.exists("Territory", value):
+                return value
+            return None
+
+        if not _field_exists("Territory", fieldname):
+            return None
+
+        return (
+            frappe.db.get_value("Territory", {fieldname: value, "is_group": 0}, "name")
+            or frappe.db.get_value("Territory", {fieldname: value}, "name")
+        )
+    except Exception:
+        return None
+
+
+def _lookup_territory_from_db_candidates(candidates: list[str]) -> str | None:
+    for candidate in candidates:
+        territory = _lookup_territory_by_field("name", candidate)
+        if territory:
+            return territory
+
+    for candidate in candidates:
+        for fieldname in _TERRITORY_LOOKUP_FIELDS:
+            territory = _lookup_territory_by_field(fieldname, candidate)
+            if territory:
+                return territory
+    return None
+
+
+def _lookup_territory_from_code_map(candidates: list[str]) -> str | None:
+    from jarz_woocommerce_integration.services.territory_sync import CODE_TO_DISPLAY
+
+    normalized_candidates = {candidate.lower(): candidate for candidate in candidates}
+    for code, display in CODE_TO_DISPLAY.items():
+        display_candidates = _territory_lookup_candidates(display)
+        if any(candidate.lower() in normalized_candidates for candidate in display_candidates):
+            try:
+                if frappe.db.exists("Territory", code):
+                    return code
+            except Exception:
+                continue
+    return None
+
+
 def _resolve_territory_from_state(state_value: str | None, territory_state_cache: dict | None = None) -> str | None:
     """Extract territory from WooCommerce state field (which contains delivery zone).
     
@@ -732,90 +808,45 @@ def _resolve_territory_from_state(state_value: str | None, territory_state_cache
     Returns:
         Territory name (code) if found, None otherwise
     """
-    if not state_value:
+    candidates = _territory_lookup_candidates(state_value)
+    if not candidates:
         return None
-    
-    import unicodedata
-    state_value = unicodedata.normalize("NFC", state_value).strip()
-    if not state_value:
-        return None
+
+    cache_key = candidates[0]
 
     # Check in-memory cache first (historical migration)
-    if territory_state_cache is not None and state_value in territory_state_cache:
-        return territory_state_cache[state_value]
-    
-    # Import the mapping from territory_sync
-    from jarz_woocommerce_integration.services.territory_sync import CODE_TO_DISPLAY
-    
-    # Create reverse mapping (display -> code)
-    DISPLAY_TO_CODE = {v: k for k, v in CODE_TO_DISPLAY.items()}
-    
-    result = None
+    if territory_state_cache is not None and cache_key in territory_state_cache:
+        return territory_state_cache[cache_key]
 
-    # Try exact match in reverse mapping
-    if state_value in DISPLAY_TO_CODE:
-        territory_code = DISPLAY_TO_CODE[state_value]
-        if frappe.db.exists("Territory", territory_code):
-            result = territory_code
-    
-    if not result:
-        # Try matching just the English part (before the hyphen)
-        english_part = state_value.split(" - ")[0].strip() if " - " in state_value else state_value
-        
-        # Try finding by English part in the display values
-        for code, display in CODE_TO_DISPLAY.items():
-            display_english = display.split(" - ")[0].strip() if " - " in display else display
-            if english_part.lower() == display_english.lower():
-                if frappe.db.exists("Territory", code):
-                    result = code
-                    break
-    
-    if not result:
-        # Try matching against the Arabic part of the display value (e.g. "الهرم" matches "Haram - الهرم")
-        import unicodedata
-        state_normalized = unicodedata.normalize("NFC", state_value).strip()
-        for code, display in CODE_TO_DISPLAY.items():
-            parts = display.split(" - ")
-            for part in parts:
-                part_normalized = unicodedata.normalize("NFC", part).strip()
-                if state_normalized == part_normalized:
-                    if frappe.db.exists("Territory", code):
-                        result = code
-                        break
-            if result:
-                break
+    result = _lookup_territory_from_db_candidates(candidates)
 
     if not result:
-        # Try exact match against territory name directly (for territories not in CODE_TO_DISPLAY)
-        if frappe.db.exists("Territory", {"territory_name": state_value, "is_group": 0}):
-            result = frappe.db.get_value("Territory", {"territory_name": state_value, "is_group": 0}, "name")
-    
+        result = _lookup_territory_from_code_map(candidates)
+
     if not result:
-        # Try case-insensitive search on all territories
+        # Last real-match fallback: case-insensitive scan across available Territory aliases.
+        fields = ["name", "territory_name"]
+        for fieldname in ("custom_woo_code", "woo_code", "custom_territory_name_ar"):
+            if _field_exists("Territory", fieldname):
+                fields.append(fieldname)
         territories = frappe.get_all(
             "Territory",
             filters={"is_group": 0},
-            fields=["name", "territory_name"]
+            fields=fields,
         )
-        
-        state_lower = state_value.lower()
+        candidate_lowers = {candidate.lower() for candidate in candidates}
         for terr in territories:
-            if terr.territory_name and terr.territory_name.lower() == state_lower:
-                result = terr.name
+            for fieldname in fields:
+                value = terr.get(fieldname) if isinstance(terr, dict) else getattr(terr, fieldname, None)
+                if _normalize_territory_lookup_text(value).lower() in candidate_lowers:
+                    result = terr.get("name") if isinstance(terr, dict) else terr.name
+                    break
+            if result:
                 break
-
-    if not result:
-        # Final fallback: use global default territory if configured
-        try:
-            default_territory = frappe.defaults.get_global_default("territory")
-            if default_territory and frappe.db.exists("Territory", default_territory):
-                result = default_territory
-        except Exception:
-            pass
 
     # Populate cache for future lookups
     if territory_state_cache is not None:
-        territory_state_cache[state_value] = result
+        territory_state_cache[cache_key] = result
     
     return result
 
