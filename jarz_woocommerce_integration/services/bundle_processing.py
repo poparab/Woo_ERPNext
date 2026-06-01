@@ -48,9 +48,17 @@ class BundleProcessor:
 
         self.parent_item = frappe.get_doc("Item", self.bundle_doc.erpnext_item)
 
+        group_requirements: dict[str, int] = {}
+        group_order: list[str] = []
         for row in self.bundle_doc.items:
             item_group = row.item_group
-            required_qty = cint(row.quantity)
+            if item_group not in group_requirements:
+                group_requirements[item_group] = 0
+                group_order.append(item_group)
+            group_requirements[item_group] += cint(row.quantity)
+
+        for item_group in group_order:
+            required_qty = group_requirements[item_group]
 
             candidate_items = frappe.get_all(
                 "Item",

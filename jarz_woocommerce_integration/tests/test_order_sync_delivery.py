@@ -109,6 +109,80 @@ def _fake_frappe_for_delivery_rule(rule, customer_group="Retail"):
     )
 
 
+def test_bundle_processor_aggregates_duplicate_item_group_requirements(monkeypatch):
+    bundle_doc = SimpleNamespace(
+        erpnext_item="EID-BUNDLE-PARENT",
+        items=[
+            SimpleNamespace(item_group="Medium", quantity=4),
+            SimpleNamespace(item_group="Medium", quantity=1),
+        ],
+    )
+    item_docs = {
+        "EID-BUNDLE-PARENT": SimpleNamespace(
+            name="EID-BUNDLE-PARENT",
+            item_name="The Sweet Eid",
+            standard_rate=480,
+            valuation_rate=0,
+        ),
+        "BLUEBERRY-MEDIUM": SimpleNamespace(
+            name="BLUEBERRY-MEDIUM",
+            item_name="Blueberry Medium",
+            standard_rate=120,
+            valuation_rate=0,
+        ),
+        "CHOCO-MEDIUM": SimpleNamespace(
+            name="CHOCO-MEDIUM",
+            item_name="Chocolate Medium",
+            standard_rate=120,
+            valuation_rate=0,
+        ),
+    }
+
+    def fake_get_doc(doctype, name):
+        if doctype == bundle_processing.BUNDLE_DOCTYPE:
+            assert name == "EID-BUNDLE"
+            return bundle_doc
+        if doctype == "Item":
+            return item_docs[name]
+        raise AssertionError(f"unexpected get_doc({doctype!r}, {name!r})")
+
+    def fake_get_all(doctype, filters=None, fields=None, **kwargs):
+        assert doctype == "Item"
+        assert filters["item_group"] == "Medium"
+        return [{"name": "BLUEBERRY-MEDIUM"}, {"name": "CHOCO-MEDIUM"}]
+
+    monkeypatch.setattr(bundle_processing.frappe, "get_doc", fake_get_doc)
+    monkeypatch.setattr(bundle_processing.frappe, "get_all", fake_get_all)
+    monkeypatch.setattr(
+        bundle_processing.frappe,
+        "logger",
+        lambda *args, **kwargs: SimpleNamespace(
+            info=lambda *a, **k: None,
+            warning=lambda *a, **k: None,
+        ),
+    )
+
+    processor = bundle_processing.BundleProcessor(
+        "EID-BUNDLE",
+        selected_items={
+            "Medium": [
+                {"item_code": "BLUEBERRY-MEDIUM", "selected_qty": 4},
+                {"item_code": "CHOCO-MEDIUM", "selected_qty": 1},
+            ]
+        },
+    )
+
+    processor.load_bundle()
+
+    assert [
+        (entry["item"].name, entry["qty"], entry["item_group"])
+        for entry in processor.bundle_items
+    ] == [
+        ("BLUEBERRY-MEDIUM", 4, "Medium"),
+        ("CHOCO-MEDIUM", 1, "Medium"),
+    ]
+
+
 def test_resolve_delivery_charge_policy_uses_territory_only():
     cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
 
