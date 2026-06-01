@@ -274,6 +274,228 @@ def test_refresh_order_contact_snapshot_updates_invoice_and_map(monkeypatch):
     assert commit_calls == [True]
 
 
+def test_order_territory_snapshot_prefers_shipping_state(monkeypatch):
+    calls = []
+
+    def fake_resolve(state_value, territory_state_cache=None):
+        calls.append((state_value, territory_state_cache))
+        return {"EGNASRCITY": "EGNASRCITY", "EGZAWYA": "EGZAWYA"}.get(state_value)
+
+    cache = {}
+    monkeypatch.setattr(order_sync, "_resolve_territory_from_state", fake_resolve)
+
+    snapshot = order_sync._extract_order_territory_snapshot(
+        {
+            "billing": {"state": "EGZAWYA"},
+            "shipping": {"state": "EGNASRCITY"},
+        },
+        territory_state_cache=cache,
+    )
+
+    assert snapshot["woo_billing_state"] == "EGZAWYA"
+    assert snapshot["woo_shipping_state"] == "EGNASRCITY"
+    assert snapshot["resolved_order_territory"] == "EGNASRCITY"
+    assert snapshot["woo_territory_hash"]
+    assert calls == [("EGNASRCITY", cache)]
+
+
+def test_order_map_snapshot_values_include_territory_snapshot(monkeypatch):
+    monkeypatch.setattr(order_sync.frappe.utils, "now_datetime", lambda: "2026-06-01 10:00:00")
+    contact_snapshot = order_sync._extract_order_contact_snapshot(
+        {
+            "id": 15031,
+            "billing": {"first_name": "Billing", "email": "b@example.com"},
+            "shipping": {"first_name": "Shipping", "phone": "0100"},
+        }
+    )
+    territory_snapshot = {
+        "woo_billing_state": "EGZAWYA",
+        "woo_shipping_state": "EGNASRCITY",
+        "resolved_order_territory": "EGNASRCITY",
+        "woo_territory_hash": "hash-1",
+    }
+
+    values = order_sync._build_order_map_snapshot_values(
+        {"number": "15031", "status": "processing", "currency": "EGP", "payment_method": "cod"},
+        contact_snapshot,
+        link_field="erpnext_sales_invoice",
+        invoice_name="ACC-SINV-2026-16213",
+        order_hash="order-hash",
+        needs_territory_recheck=0,
+        territory_snapshot=territory_snapshot,
+    )
+
+    assert values["erpnext_sales_invoice"] == "ACC-SINV-2026-16213"
+    assert values["hash"] == "order-hash"
+    assert values["needs_territory_recheck"] == 0
+    assert values["woo_shipping_state"] == "EGNASRCITY"
+    assert values["resolved_order_territory"] == "EGNASRCITY"
+    assert values["woo_territory_hash"] == "hash-1"
+
+
+def test_process_order_phase1_sets_invoice_territory_from_order_state(monkeypatch):
+    created = {}
+    map_docs = {}
+
+    class DummyLock:
+        def acquire(self, blocking=False):
+            return True
+
+        def release(self):
+            return None
+
+    class DummyRedis:
+        def lock(self, *args, **kwargs):
+            return DummyLock()
+
+    class FakeMapDoc:
+        def __init__(self, values):
+            self.values = dict(values)
+            self.name = self.values.get("name") or "WOOMAP-NEW"
+
+        def insert(self, ignore_permissions=True):
+            map_docs[self.name] = self
+            return self
+
+        def update(self, values):
+            self.values.update(values)
+
+        def save(self, ignore_permissions=True):
+            map_docs[self.name] = self
+            return self
+
+    class FakeInvoice:
+        def __init__(self, values):
+            self.__dict__.update(values)
+            self.name = "ACC-SINV-NEW"
+            self.docstatus = 0
+            self.flags = SimpleNamespace()
+            self.items = list(values.get("items") or [])
+
+        def get(self, fieldname, default=None):
+            return getattr(self, fieldname, default)
+
+        def set(self, fieldname, value):
+            setattr(self, fieldname, value)
+
+        def append(self, fieldname, value):
+            getattr(self, fieldname).append(value)
+
+        def insert(self, ignore_permissions=True):
+            created["invoice"] = self
+            return self
+
+        def save(self, *args, **kwargs):
+            return self
+
+        def db_set(self, fieldname, value, commit=False):
+            setattr(self, fieldname, value)
+
+        def cancel(self):
+            self.docstatus = 2
+
+    def fake_sql(query, params=None, as_dict=False):
+        del params, as_dict
+        if "GET_LOCK" in query:
+            return [(1,)]
+        if "RELEASE_LOCK" in query:
+            return [(1,)]
+        raise AssertionError(query)
+
+    def fake_get_value(doctype, name_or_filters=None, fieldname=None, *args, **kwargs):
+        if doctype == "WooCommerce Order Map":
+            return None
+        if doctype == "Customer" and fieldname == "territory":
+            return "EGZAWYA"
+        if doctype == "Territory" and name_or_filters == "EGNASRCITY" and fieldname == "pos_profile":
+            return "Nasr city"
+        if doctype == "POS Profile" and name_or_filters == "Nasr city" and fieldname == "warehouse":
+            return "Nasr city - J"
+        if doctype == "POS Profile" and name_or_filters == "Nasr city" and fieldname == "selling_price_list":
+            return "Standard Selling"
+        if doctype == "Company" and name_or_filters == "_Test Company" and fieldname == "default_selling_price_list":
+            return "Standard Selling"
+        return None
+
+    def fake_get_doc(doctype_or_dict, name=None, *args, **kwargs):
+        if isinstance(doctype_or_dict, dict):
+            dt = doctype_or_dict.get("doctype")
+            if dt == "Sales Invoice":
+                return FakeInvoice(doctype_or_dict)
+            if dt == "WooCommerce Order Map":
+                return FakeMapDoc(doctype_or_dict)
+            doc = SimpleNamespace(name="LOG-0001")
+            doc.insert = lambda ignore_permissions=True: doc
+            return doc
+        if doctype_or_dict == "WooCommerce Order Map":
+            return map_docs[name]
+        raise AssertionError((doctype_or_dict, name))
+
+    settings = SimpleNamespace(
+        base_url="https://example.com",
+        consumer_key="ck_test",
+        get_password=lambda fieldname: "cs_test",
+        default_company="_Test Company",
+        default_currency="EGP",
+        default_pos_profile="Dokki",
+    )
+    order = {
+        "id": 15031,
+        "number": "15031",
+        "status": "processing",
+        "currency": "EGP",
+        "total": "240.00",
+        "payment_method": "cod",
+        "payment_method_title": "Cash",
+        "billing": {"first_name": "Billing", "state": "EGZAWYA", "email": "billing@example.com"},
+        "shipping": {"first_name": "Shipping", "state": "EGNASRCITY", "phone": "01001234567"},
+        "line_items": [{"product_id": 1, "variation_id": 0, "quantity": 1, "total": "240.00", "subtotal": "240.00"}],
+        "shipping_lines": [],
+        "fee_lines": [],
+        "tax_lines": [],
+        "meta_data": [],
+    }
+
+    monkeypatch.setattr(order_sync, "get_redis_conn", lambda: DummyRedis())
+    monkeypatch.setattr(order_sync.frappe.db, "sql", fake_sql)
+    monkeypatch.setattr(order_sync.frappe.db, "get_table_columns", lambda doctype: ["erpnext_sales_invoice"])
+    monkeypatch.setattr(order_sync.frappe.db, "get_value", fake_get_value)
+    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda doctype, name=None: False)
+    monkeypatch.setattr(order_sync.frappe.db, "commit", lambda: None)
+    monkeypatch.setattr(order_sync.frappe, "get_all", lambda *args, **kwargs: [])
+    monkeypatch.setattr(order_sync.frappe, "get_doc", fake_get_doc)
+    monkeypatch.setattr(order_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))
+    monkeypatch.setattr(order_sync.frappe.utils, "today", lambda: "2026-06-01")
+    monkeypatch.setattr(order_sync.frappe.utils, "now_datetime", lambda: "2026-06-01 12:00:00")
+    monkeypatch.setattr(
+        order_sync,
+        "ensure_customer_with_addresses",
+        lambda *args, **kwargs: ("Test Customer", "Billing-001", "Shipping-001"),
+    )
+    monkeypatch.setattr(
+        order_sync,
+        "_resolve_territory_from_state",
+        lambda state_value, territory_state_cache=None: {"EGNASRCITY": "EGNASRCITY", "EGZAWYA": "EGZAWYA"}.get(state_value),
+    )
+    monkeypatch.setattr(
+        order_sync,
+        "_build_invoice_items",
+        lambda *args, **kwargs: ([{"item_code": "ITEM-001", "qty": 1, "rate": 240.0}], [], {}),
+    )
+    monkeypatch.setattr(order_sync, "_apply_delivery_charge_policy", lambda *args, **kwargs: {"changed": False})
+    monkeypatch.setattr(order_sync, "_maybe_create_payment_entry_for_invoice", lambda *args, **kwargs: None)
+    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", lambda *args, **kwargs: None)
+
+    result = order_sync.process_order_phase1(order, settings)
+
+    assert result["status"] == "created"
+    assert created["invoice"].territory == "EGNASRCITY"
+    assert created["invoice"].pos_profile == "Nasr city"
+    assert created["invoice"].items[0]["warehouse"] == "Nasr city - J"
+    assert map_docs["WOOMAP-NEW"].values["resolved_order_territory"] == "EGNASRCITY"
+    assert map_docs["WOOMAP-NEW"].values["woo_shipping_state"] == "EGNASRCITY"
+
+
 def test_refresh_order_contact_snapshot_dry_run_reports_without_writing(monkeypatch):
     settings = SimpleNamespace(
         base_url="https://example.com",

@@ -12,7 +12,11 @@ import frappe
 
 from jarz_woocommerce_integration.utils.http_client import WooClient
 from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_fields
-from jarz_woocommerce_integration.services.customer_sync import ensure_customer_with_addresses, _is_duplicate_key_error
+from jarz_woocommerce_integration.services.customer_sync import (
+    ensure_customer_with_addresses,
+    _is_duplicate_key_error,
+    _resolve_territory_from_state,
+)
 
 
 DEFAULT_LIVE_ORDER_OVERLAP_MINUTES = 15
@@ -616,6 +620,13 @@ ORDER_CONTACT_SNAPSHOT_FIELDS = (
     "woo_contact_hash",
 )
 
+ORDER_TERRITORY_SNAPSHOT_FIELDS = (
+    "woo_billing_state",
+    "woo_shipping_state",
+    "resolved_order_territory",
+    "woo_territory_hash",
+)
+
 
 def _normalize_order_contact_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
@@ -686,6 +697,52 @@ def _extract_order_contact_snapshot(order: dict) -> dict[str, Any]:
     return snapshot
 
 
+def _compute_territory_hash(snapshot: dict[str, Any]) -> str:
+    import hashlib
+
+    payload = {
+        "woo_billing_state": snapshot.get("woo_billing_state") or "",
+        "woo_shipping_state": snapshot.get("woo_shipping_state") or "",
+        "resolved_order_territory": snapshot.get("resolved_order_territory") or "",
+    }
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _extract_order_territory_snapshot(
+    order: dict,
+    *,
+    territory_state_cache: dict | None = None,
+) -> dict[str, Any]:
+    billing = order.get("billing") or {}
+    shipping = order.get("shipping") or {}
+    billing_state = _normalize_order_contact_text(billing.get("state"))
+    shipping_state = _normalize_order_contact_text(shipping.get("state"))
+
+    resolved_order_territory = ""
+    for state_value in (shipping_state, billing_state):
+        if not state_value:
+            continue
+        try:
+            territory = _resolve_territory_from_state(
+                state_value,
+                territory_state_cache=territory_state_cache,
+            )
+        except Exception:
+            territory = None
+        if territory:
+            resolved_order_territory = territory
+            break
+
+    snapshot = {
+        "woo_billing_state": billing_state,
+        "woo_shipping_state": shipping_state,
+        "resolved_order_territory": resolved_order_territory,
+    }
+    snapshot["woo_territory_hash"] = _compute_territory_hash(snapshot)
+    return snapshot
+
+
 def _apply_contact_snapshot_to_invoice_values(values: dict[str, Any], snapshot: dict[str, Any]) -> None:
     values["customer_name"] = snapshot.get("customer_name") or values.get("customer_name") or ""
     for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
@@ -709,6 +766,7 @@ def _build_order_map_snapshot_values(
     invoice_name: str | None = None,
     order_hash: str | None = None,
     needs_territory_recheck: int | None = None,
+    territory_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     values = {
         "woo_order_number": order.get("number"),
@@ -726,6 +784,9 @@ def _build_order_map_snapshot_values(
         values["needs_territory_recheck"] = needs_territory_recheck
     for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
         values[fieldname] = snapshot.get(fieldname) or ""
+    territory_snapshot = territory_snapshot or {}
+    for fieldname in ORDER_TERRITORY_SNAPSHOT_FIELDS:
+        values[fieldname] = territory_snapshot.get(fieldname) or ""
     return values
 
 
@@ -2440,15 +2501,20 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             existing_map = None
     order_hash = _compute_order_hash(order)
     contact_snapshot = _extract_order_contact_snapshot(order)
-    if existing_map is not None and "woo_contact_hash" not in existing_map:
-        try:
-            existing_map["woo_contact_hash"] = frappe.db.get_value(
-                "WooCommerce Order Map",
-                {"woo_order_id": woo_id},
-                "woo_contact_hash",
-            )
-        except Exception:
-            existing_map["woo_contact_hash"] = None
+    territory_snapshot = _extract_order_territory_snapshot(
+        order,
+        territory_state_cache=cache.territory_state_cache if cache else None,
+    )
+    for snapshot_field in ("woo_contact_hash", "woo_territory_hash"):
+        if existing_map is not None and snapshot_field not in existing_map:
+            try:
+                existing_map[snapshot_field] = frappe.db.get_value(
+                    "WooCommerce Order Map",
+                    {"woo_order_id": woo_id},
+                    snapshot_field,
+                )
+            except Exception:
+                existing_map[snapshot_field] = None
 
     # Skip if order hasn't changed since last sync (hash match + valid invoice link
     # AND the linked Sales Invoice is already in the target state).
@@ -2462,7 +2528,11 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 str((existing_map or {}).get("woo_contact_hash") or "")
                 == str(contact_snapshot.get("woo_contact_hash") or "")
             )
-            if target_docstatus != 2 and contact_hash_matches:
+            territory_hash_matches = (
+                str((existing_map or {}).get("woo_territory_hash") or "")
+                == str(territory_snapshot.get("woo_territory_hash") or "")
+            )
+            if target_docstatus != 2 and contact_hash_matches and territory_hash_matches:
                 return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
             # target is cancellation but SI is active — fall through to cancel it
 
@@ -2503,6 +2573,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "synced_on": frappe.utils.now_datetime(),
                 "hash": order_hash,
             }
+            map_values.update(
+                _build_order_map_snapshot_values(
+                    order,
+                    contact_snapshot,
+                    link_field=LINK_FIELD,
+                    invoice_name=linked_invoice_name,
+                    order_hash=order_hash,
+                    territory_snapshot=territory_snapshot,
+                )
+            )
             try:
                 if existing_map and existing_map.get("name"):
                     map_doc = frappe.get_doc("WooCommerce Order Map", existing_map["name"])
@@ -2517,14 +2597,24 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     "hash": order_hash,
                     "status": order.get("status"),
                     "woo_contact_hash": contact_snapshot.get("woo_contact_hash"),
+                    "woo_territory_hash": territory_snapshot.get("woo_territory_hash"),
                 }
             except Exception:
                 if not existing_map:
-                    existing_map = {"name": None, LINK_FIELD: linked_invoice_name, "hash": order_hash, "status": order.get("status")}
+                    existing_map = {
+                        "name": None,
+                        LINK_FIELD: linked_invoice_name,
+                        "hash": order_hash,
+                        "status": order.get("status"),
+                        "woo_contact_hash": contact_snapshot.get("woo_contact_hash"),
+                        "woo_territory_hash": territory_snapshot.get("woo_territory_hash"),
+                    }
                 else:
                     existing_map[LINK_FIELD] = linked_invoice_name
                     existing_map["hash"] = order_hash
                     existing_map["status"] = order.get("status")
+                    existing_map["woo_contact_hash"] = contact_snapshot.get("woo_contact_hash")
+                    existing_map["woo_territory_hash"] = territory_snapshot.get("woo_territory_hash")
     if existing_map and not allow_update:
         # If map has a linked invoice, genuinely skip (already processed)
         if existing_map.get(LINK_FIELD):
@@ -2571,7 +2661,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     default_warehouse = None
     _territory_fallback_used = False
     try:
-        territory_name = frappe.db.get_value("Customer", customer, "territory")
+        territory_name = territory_snapshot.get("resolved_order_territory") or None
+        if not territory_name:
+            territory_name = frappe.db.get_value("Customer", customer, "territory")
         if cache and territory_name:
             td = cache.get_territory_data(territory_name)
             pos_profile = td.get("pos_profile")
@@ -2743,13 +2835,19 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 if existing_map and existing_map.get("name"):
                     existing_contact_hash = str((existing_map or {}).get("woo_contact_hash") or "")
                     target_contact_hash = str(contact_snapshot.get("woo_contact_hash") or "")
-                    if existing_contact_hash != target_contact_hash:
+                    existing_territory_hash = str((existing_map or {}).get("woo_territory_hash") or "")
+                    target_territory_hash = str(territory_snapshot.get("woo_territory_hash") or "")
+                    if (
+                        existing_contact_hash != target_contact_hash
+                        or existing_territory_hash != target_territory_hash
+                    ):
                         frappe.db.set_value(
                             "WooCommerce Order Map",
                             existing_map["name"],
                             _build_order_map_snapshot_values(
                                 order,
                                 contact_snapshot,
+                                territory_snapshot=territory_snapshot,
                                 link_field=LINK_FIELD,
                                 invoice_name=inv.name,
                                 order_hash=order_hash,
@@ -2757,6 +2855,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                             update_modified=True,
                         )
                         existing_map["woo_contact_hash"] = target_contact_hash
+                        existing_map["woo_territory_hash"] = target_territory_hash
                 # Before skipping, check for warehouse drift and self-heal if possible.
                 _check_and_repair_submitted_invoice_drift(
                     inv, woo_id, territory_name=territory_name, pos_profile=pos_profile,
@@ -2944,6 +3043,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         inv.append("items", it)
                     if price_list:
                         inv.selling_price_list = price_list
+                    if territory_name:
+                        inv.territory = territory_name
                     # Prevent ERPNext pricing rules from overriding bundle rates
                     inv.ignore_pricing_rule = 1
                     # Fix posting_date for backdated historical invoices
@@ -3070,6 +3171,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 "shipping_address_name": shipping_addr or billing_addr,
                 "items": lines,
             }
+            if territory_name:
+                inv_data["territory"] = territory_name
             _apply_contact_snapshot_to_invoice_values(inv_data, contact_snapshot)
             # Prevent ERPNext pricing rules from overriding the rates set by
             # BundleProcessor (or any other rate logic) during insert/save.
@@ -3188,6 +3291,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     invoice_name=inv.name,
                     order_hash=order_hash,
                     needs_territory_recheck=1 if _territory_fallback_used else 0,
+                    territory_snapshot=territory_snapshot,
                 )
             )
             map_doc.save(ignore_permissions=True)
@@ -3201,6 +3305,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     link_field=LINK_FIELD,
                     invoice_name=inv.name,
                     order_hash=order_hash,
+                    needs_territory_recheck=1 if _territory_fallback_used else 0,
+                    territory_snapshot=territory_snapshot,
                 ),
             }).insert(ignore_permissions=True)
 
