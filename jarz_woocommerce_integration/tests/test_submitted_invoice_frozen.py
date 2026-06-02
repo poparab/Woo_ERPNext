@@ -80,7 +80,16 @@ def _make_settings():
     )
 
 
-def _setup_common_mocks(monkeypatch, *, si_docstatus: int, woo_id: int = 14763):
+def _setup_common_mocks(
+    monkeypatch,
+    *,
+    si_docstatus: int,
+    woo_id: int = 14763,
+    map_hash: str | None = None,
+    map_status: str = "completed",
+    map_contact_hash: str | None = None,
+    map_territory_hash: str | None = None,
+):
     """
     Patch all frappe I/O needed to reach the candidate_doc branch inside
     process_order_phase1.  Returns (sync_log_inserts, fake_inv).
@@ -143,7 +152,27 @@ def _setup_common_mocks(monkeypatch, *, si_docstatus: int, woo_id: int = 14763):
     )
 
     # No existing WooCommerce Order Map → will be created fresh
-    monkeypatch.setattr(order_sync.frappe.db, "get_value", lambda *a, **kw: None)
+    def _fake_db_get_value(doctype, name_or_filters=None, fieldname=None, *args, **kwargs):
+        if doctype == "WooCommerce Order Map":
+            if isinstance(fieldname, list):
+                if map_hash is None:
+                    return None
+                return {
+                    "name": "WOO-MAP-00001",
+                    "erpnext_sales_invoice": inv_name,
+                    "hash": map_hash,
+                    "status": map_status,
+                }
+            if fieldname == "woo_contact_hash":
+                return map_contact_hash
+            if fieldname == "woo_territory_hash":
+                return map_territory_hash
+            return None
+        if doctype == "Sales Invoice" and name_or_filters == inv_name and fieldname == "docstatus":
+            return si_docstatus
+        return None
+
+    monkeypatch.setattr(order_sync.frappe.db, "get_value", _fake_db_get_value)
 
     # SI already exists in ERPNext
     def _fake_get_all(doctype, filters=None, fields=None, *args, **kwargs):
@@ -310,6 +339,60 @@ def test_draft_si_is_not_frozen(monkeypatch):
     assert not any(
         "submitted_frozen" in (e.get("message") or "") for e in sync_log_calls
     ), "No submitted_frozen sync log entry should be written for a draft SI"
+
+
+def test_matching_hash_draft_si_submits_when_target_is_submitted(monkeypatch):
+    order = _make_woo_order(woo_id=14763, status="completed")
+    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+    submit_guard = MagicMock()
+    _, fake_inv = _setup_common_mocks(
+        monkeypatch,
+        si_docstatus=0,
+        map_hash=order_sync._compute_order_hash(order),
+        map_status="preparing",
+        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+    )
+
+    monkeypatch.setattr(
+        order_sync,
+        "_apply_delivery_charge_policy",
+        lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
+    )
+    monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
+    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
+    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
+
+    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+    assert result["status"] == "updated"
+    assert result["woo_order_id"] == 14763
+    assert result.get("reason") != "unchanged"
+    submit_guard.assert_called_once()
+    fake_inv.save.assert_called_once()
+
+
+def test_matching_hash_submitted_si_skips_as_unchanged(monkeypatch):
+    order = _make_woo_order(woo_id=14763, status="completed")
+    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+    _, fake_inv = _setup_common_mocks(
+        monkeypatch,
+        si_docstatus=1,
+        map_hash=order_sync._compute_order_hash(order),
+        map_status="completed",
+        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+    )
+
+    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "unchanged"
+    fake_inv.save.assert_not_called()
+    fake_inv.db_set.assert_not_called()
+    fake_inv.cancel.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

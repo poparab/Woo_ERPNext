@@ -2532,7 +2532,12 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 str((existing_map or {}).get("woo_territory_hash") or "")
                 == str(territory_snapshot.get("woo_territory_hash") or "")
             )
-            if target_docstatus != 2 and contact_hash_matches and territory_hash_matches:
+            if (
+                int(linked_docstatus) == int(target_docstatus)
+                and target_docstatus != 2
+                and contact_hash_matches
+                and territory_hash_matches
+            ):
                 return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
             # target is cancellation but SI is active — fall through to cancel it
 

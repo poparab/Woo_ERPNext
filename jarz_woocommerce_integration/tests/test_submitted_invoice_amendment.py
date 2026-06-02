@@ -240,6 +240,11 @@ class TestComputeOrderHash:
         order_b = _make_woo_order(date_modified="2026-06-01T12:00:00")
         assert _compute_order_hash(order_a) == _compute_order_hash(order_b)
 
+    def test_different_status_same_hash(self):
+        order_a = _make_woo_order(status="processing")
+        order_b = _make_woo_order(status="completed")
+        assert _compute_order_hash(order_a) == _compute_order_hash(order_b)
+
     def test_different_shipping_total_different_hash(self):
         order_a = _make_woo_order(shipping_lines=[{"total": "20.00"}])
         order_b = _make_woo_order(shipping_lines=[{"total": "30.00"}])
