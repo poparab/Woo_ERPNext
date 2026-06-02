@@ -3040,6 +3040,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 pass
             if inv.docstatus != 2:
                 if inv.docstatus == 0:
+                    if customer and str(inv.get("customer") or "") != str(customer):
+                        inv.customer = customer
                     _apply_contact_snapshot_to_invoice_doc(inv, contact_snapshot)
                     inv.set("items", [])
                     for it in lines:

@@ -104,6 +104,7 @@ def _setup_common_mocks(
         doctype="Sales Invoice",
         name=inv_name,
         docstatus=si_docstatus,
+        customer="Legacy Customer",
         woo_order_id=woo_id,
         woo_order_number=str(woo_id),
         # Extra attributes needed when docstatus=0 path runs past the guard
@@ -405,6 +406,36 @@ def test_draft_si_preserves_posting_date_and_clamps_due_date_before_submit(monke
     assert fake_inv.posting_date == "2026-05-26"
     assert fake_inv.due_date == "2026-05-26"
     assert fake_inv.set_posting_time == 1
+    submit_guard.assert_called_once()
+
+
+def test_draft_si_repoints_customer_before_using_resolved_addresses(monkeypatch):
+    order = _make_woo_order(woo_id=14763, status="completed")
+    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+    submit_guard = MagicMock()
+    _, fake_inv = _setup_common_mocks(
+        monkeypatch,
+        si_docstatus=0,
+        map_hash=order_sync._compute_order_hash(order),
+        map_status="preparing",
+        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+    )
+
+    monkeypatch.setattr(
+        order_sync,
+        "_apply_delivery_charge_policy",
+        lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
+    )
+    monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
+    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
+    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
+
+    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+    assert result["status"] == "updated"
+    assert fake_inv.customer == "Customer 1"
     submit_guard.assert_called_once()
 
 
