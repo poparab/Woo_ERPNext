@@ -110,6 +110,7 @@ def _setup_common_mocks(
         selling_price_list=None,
         ignore_pricing_rule=0,
         posting_date=None,
+        due_date=None,
         set_posting_time=0,
         customer_address=None,
         shipping_address_name=None,
@@ -122,7 +123,7 @@ def _setup_common_mocks(
         flags=SimpleNamespace(),
     )
     fake_inv.set = lambda field, val: None
-    fake_inv.get = lambda field, default=None: [] if field == "taxes" else default
+    fake_inv.get = lambda field, default=None: [] if field == "taxes" else getattr(fake_inv, field, default)
     fake_inv.append = lambda field, val: None
     fake_inv.save = MagicMock()
     fake_inv.db_set = MagicMock()
@@ -371,6 +372,40 @@ def test_matching_hash_draft_si_submits_when_target_is_submitted(monkeypatch):
     assert result.get("reason") != "unchanged"
     submit_guard.assert_called_once()
     fake_inv.save.assert_called_once()
+
+
+def test_draft_si_preserves_posting_date_and_clamps_due_date_before_submit(monkeypatch):
+    order = _make_woo_order(woo_id=14763, status="completed")
+    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+    submit_guard = MagicMock()
+    _, fake_inv = _setup_common_mocks(
+        monkeypatch,
+        si_docstatus=0,
+        map_hash=order_sync._compute_order_hash(order),
+        map_status="preparing",
+        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+    )
+    fake_inv.posting_date = "2026-05-26"
+    fake_inv.due_date = "2026-05-25"
+
+    monkeypatch.setattr(
+        order_sync,
+        "_apply_delivery_charge_policy",
+        lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
+    )
+    monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
+    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
+    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
+
+    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+    assert result["status"] == "updated"
+    assert fake_inv.posting_date == "2026-05-26"
+    assert fake_inv.due_date == "2026-05-26"
+    assert fake_inv.set_posting_time == 1
+    submit_guard.assert_called_once()
 
 
 def test_matching_hash_submitted_si_skips_as_unchanged(monkeypatch):

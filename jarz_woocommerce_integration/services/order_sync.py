@@ -3052,10 +3052,22 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         inv.territory = territory_name
                     # Prevent ERPNext pricing rules from overriding bundle rates
                     inv.ignore_pricing_rule = 1
-                    # Fix posting_date for backdated historical invoices
-                    if is_historical:
-                        inv.posting_date = _resolve_posting_date(order, is_historical)
+                    resolved_posting_date = inv.get("posting_date") or _resolve_posting_date(order, is_historical)
+                    if resolved_posting_date:
+                        inv.posting_date = resolved_posting_date
+                        # Preserve the draft invoice's existing posting_date when it is finally
+                        # submitted later; otherwise ERPNext can advance posting_date to today
+                        # during submit() and leave a stale due_date behind.
                         inv.set_posting_time = 1
+                        current_due_date = inv.get("due_date")
+                        try:
+                            if (
+                                not current_due_date
+                                or frappe.utils.getdate(current_due_date) < frappe.utils.getdate(resolved_posting_date)
+                            ):
+                                inv.due_date = resolved_posting_date
+                        except Exception:
+                            inv.due_date = resolved_posting_date
                 if billing_addr or shipping_addr:
                     inv.customer_address = billing_addr or shipping_addr
                     inv.shipping_address_name = shipping_addr or billing_addr
