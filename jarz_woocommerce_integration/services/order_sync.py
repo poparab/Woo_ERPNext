@@ -3042,6 +3042,10 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 if inv.docstatus == 0:
                     if customer and str(inv.get("customer") or "") != str(customer):
                         inv.customer = customer
+                        try:
+                            inv.contact_person = None
+                        except Exception:
+                            pass
                     _apply_contact_snapshot_to_invoice_doc(inv, contact_snapshot)
                     inv.set("items", [])
                     for it in lines:

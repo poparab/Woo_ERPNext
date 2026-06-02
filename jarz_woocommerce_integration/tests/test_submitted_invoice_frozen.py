@@ -105,6 +105,7 @@ def _setup_common_mocks(
         name=inv_name,
         docstatus=si_docstatus,
         customer="Legacy Customer",
+        contact_person="Legacy Contact",
         woo_order_id=woo_id,
         woo_order_number=str(woo_id),
         # Extra attributes needed when docstatus=0 path runs past the guard
@@ -436,6 +437,7 @@ def test_draft_si_repoints_customer_before_using_resolved_addresses(monkeypatch)
 
     assert result["status"] == "updated"
     assert fake_inv.customer == "Customer 1"
+    assert fake_inv.contact_person is None
     submit_guard.assert_called_once()
 
 
