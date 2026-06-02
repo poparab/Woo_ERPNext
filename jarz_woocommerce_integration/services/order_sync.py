@@ -34,9 +34,11 @@ PROCESSING_EQUIVALENT_WOO_STATUSES = (
     "pre-nasrcity",
     "pre-ismailia",
     "pre-hadayk",
-    "pre-hadayek",
     "pre-dokki",
 )
+LEGACY_WOO_STATUS_ALIASES = {
+    "pre-hadayek": "pre-hadayk",
+}
 RECONCILE_TARGET_WOO_STATUSES = PROCESSING_EQUIVALENT_WOO_STATUSES + (
     "completed", "cancelled", "refunded", "failed"
 )
@@ -81,6 +83,13 @@ def _build_customer_error_result(
     if detail not in (None, ""):
         result["detail"] = str(detail)[:500]
     return result
+
+
+def _normalize_woo_status(woo_status: Any) -> str:
+    status = str(woo_status or "").strip().lower()
+    if status.startswith("wc-"):
+        status = status[3:]
+    return LEGACY_WOO_STATUS_ALIASES.get(status, status)
 
 
 class MigrationCache:
@@ -280,7 +289,7 @@ class MigrationCache:
 
 
 def _is_processing_equivalent_woo_status(woo_status: str | None) -> bool:
-    return (woo_status or "").strip().lower() in PROCESSING_EQUIVALENT_WOO_STATUSES
+    return _normalize_woo_status(woo_status) in PROCESSING_EQUIVALENT_WOO_STATUSES
 
 
 def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str, Any]:
@@ -291,7 +300,7 @@ def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str
         is_historical: If True, creates paid invoices for completed orders (historical migration)
                       If False, creates unpaid submitted invoices (live orders)
     """
-    s = (woo_status or "").lower()
+    s = _normalize_woo_status(woo_status)
     if s == "completed":
         if is_historical:
             # Historical: mark as paid (submitted + paid status)
@@ -352,7 +361,7 @@ def _should_treat_inbound_order_as_paid(
     is_historical: bool = False,
 ) -> bool:
     """Return whether inbound processing should settle the invoice with a Payment Entry."""
-    status = (woo_status or "").strip().lower()
+    status = _normalize_woo_status(woo_status)
     if status in NON_PAYABLE_WOO_STATUSES:
         return False
     if status_map and status_map.get("is_paid"):
@@ -2625,7 +2634,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         if existing_map.get(LINK_FIELD):
             return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
         # Orphan map entry (processing/error without invoice) — clean up and retry
-        map_status = (existing_map.get("status") or "").lower()
+        map_status = _normalize_woo_status(existing_map.get("status"))
         if map_status in ("processing", "error", ""):
             try:
                 frappe.delete_doc("WooCommerce Order Map", existing_map["name"], force=1, ignore_permissions=True)
@@ -2749,7 +2758,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         return {"status": "skipped", "reason": "no_lines", "woo_order_id": woo_id}
 
     # Check payment status for live orders
-    woo_status = (order.get("status") or "").lower()
+    woo_status = _normalize_woo_status(order.get("status"))
     if not is_historical:
         # For live orders, skip if pending payment
         if woo_status in {"pending", "on-hold"}:
@@ -3453,7 +3462,7 @@ def pull_recent_orders_phase1(
     if status_filter_set:
         orders = [
             o for o in orders
-            if (o.get("status") or "").strip().lower() in status_filter_set
+            if _normalize_woo_status(o.get("status")) in status_filter_set
         ]
     metrics: dict[str, Any] = {
         "orders_fetched": len(orders),
@@ -3570,7 +3579,7 @@ def _enqueue_order_window_events(
     if status_filter_set:
         orders = [
             item for item in orders
-            if (item.get("status") or "").strip().lower() in status_filter_set
+            if _normalize_woo_status(item.get("status")) in status_filter_set
         ]
 
     metrics: dict[str, Any] = {

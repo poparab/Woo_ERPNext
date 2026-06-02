@@ -395,6 +395,56 @@ class TestItemEditDetection:
 # run_woo_amendment_job — unit guards (pure mocking, no Frappe DB)
 # ---------------------------------------------------------------------------
 
+class TestPendingPaymentSkips:
+    def test_live_on_hold_order_skips_before_creating_map_or_invoice(self, monkeypatch):
+        order = _make_woo_order(status="on-hold")
+        created_doctypes: list[str] = []
+
+        fake_lock = MagicMock()
+        fake_lock.acquire.return_value = True
+        monkeypatch.setattr(order_sync, "get_redis_conn", lambda: MagicMock(lock=lambda *a, **kw: fake_lock))
+        monkeypatch.setattr(
+            order_sync,
+            "ensure_customer_with_addresses",
+            lambda *args, **kwargs: ("Test Customer", "Billing-001", "Shipping-001"),
+        )
+        monkeypatch.setattr(
+            order_sync,
+            "_build_invoice_items",
+            lambda *args, **kwargs: ([{"item_code": "ITEM-001", "qty": 1, "rate": 100.0}], [], {}),
+        )
+
+        def _fake_get_doc(doctype_or_dict, name=None, *args, **kwargs):
+            if isinstance(doctype_or_dict, dict):
+                created_doctypes.append(str(doctype_or_dict.get("doctype") or ""))
+            else:
+                created_doctypes.append(str(doctype_or_dict))
+            return MagicMock()
+
+        fake_frappe = SimpleNamespace(
+            db=SimpleNamespace(
+                sql=lambda query, values=None, *a, **kw: [[1]],
+                get_table_columns=lambda table: ["name", "erpnext_sales_invoice", "hash", "status"],
+                get_value=lambda *args, **kwargs: None,
+                commit=lambda: None,
+            ),
+            get_all=lambda *args, **kwargs: [],
+            get_doc=_fake_get_doc,
+            flags=SimpleNamespace(ignore_woo_outbound=False),
+            utils=SimpleNamespace(now_datetime=lambda: "2026-06-01 12:00:00"),
+            defaults=SimpleNamespace(get_global_default=lambda fieldname: None),
+        )
+        monkeypatch.setattr(order_sync, "frappe", fake_frappe)
+
+        result = order_sync.process_order_phase1(order, _make_settings())
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "pending_payment"
+        assert result["woo_status"] == "on-hold"
+        assert "WooCommerce Order Map" not in created_doctypes
+        assert "Sales Invoice" not in created_doctypes
+
+
 class TestRunWooAmendmentJobGuards:
     """Test the guard logic in run_woo_amendment_job using a monkeypatched frappe."""
 
