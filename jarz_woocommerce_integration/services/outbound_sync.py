@@ -713,7 +713,7 @@ def _build_customer_payload(
         sanitized_name = re.sub(r'[^a-zA-Z0-9]', '', customer.name.lower())
         if not sanitized_name:
             sanitized_name = 'customer'
-        email = f"{sanitized_name}@orderjarz.local"
+        email = f"{sanitized_name}@placeholder.com"
         LOGGER.info({
             "event": "woo_outbound_customer_default_email",
             "customer": customer.name,
