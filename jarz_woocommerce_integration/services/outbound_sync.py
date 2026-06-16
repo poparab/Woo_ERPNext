@@ -2235,6 +2235,20 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     if woo_number:
         updates["woo_order_number"] = woo_number
     frappe.db.set_value("Sales Invoice", invoice_name, updates, update_modified=False)
+    if "woo_order_id" in updates:
+        try:
+            frappe.publish_realtime(
+                "kanban_update",
+                {
+                    "invoice": invoice_name,
+                    "invoice_id": invoice_name,
+                    "woo_order_id": woo_id,
+                    "event": "woo_order_assigned",
+                },
+                user="*",
+            )
+        except Exception:
+            LOGGER.warning({"event": "woo_order_assigned_realtime_failed", "invoice": invoice_name})
     response_status = response.get("status") if isinstance(response, dict) else None
     response_payment_method = response.get("payment_method") if isinstance(response, dict) else None
     response_hash = None
