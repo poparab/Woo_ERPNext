@@ -3083,6 +3083,21 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                                 inv.due_date = resolved_posting_date
                         except Exception:
                             inv.due_date = resolved_posting_date
+                    # Promo codes (draft re-sync): refresh the coupon passthrough and reset
+                    # custom_promo_applied so the jarz_pos before_validate hook re-applies the
+                    # (possibly changed) coupons. We only pass raw Woo data — jarz_pos owns the math.
+                    try:
+                        coupon_lines = order.get("coupon_lines") or []
+                        codes = [str(c.get("code")).strip() for c in coupon_lines if c.get("code")]
+                        discount_total = order.get("discount_total")
+                        inv.custom_promo_codes = json.dumps(codes) if codes else None
+                        inv.custom_promo_woo_discount_total = float(discount_total or 0)
+                        inv.custom_promo_applied = 0
+                    except Exception as _promo_err:
+                        frappe.log_error(
+                            title=f"Woo: promo wiring failed (update) for order {woo_id}",
+                            message=str(_promo_err),
+                        )
                 if billing_addr or shipping_addr:
                     inv.customer_address = billing_addr or shipping_addr
                     inv.shipping_address_name = shipping_addr or billing_addr
@@ -3284,6 +3299,22 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             # replacement in a Woo-initiated amendment — Woo already has the latest state.
             if amended_from:
                 inv.flags.skip_woo_outbound_after_amend = True
+            # Promo codes: pass Woo coupon codes + the Woo discount total through to the
+            # invoice so the jarz_pos before_validate hook can apply/reconcile them.
+            # We only pass raw data here — we do NOT compute discounts (jarz_pos owns that).
+            # custom_promo_applied defaults to 0 on a fresh insert, so no reset is needed.
+            try:
+                coupon_lines = order.get("coupon_lines") or []
+                codes = [str(c.get("code")).strip() for c in coupon_lines if c.get("code")]
+                if codes:
+                    discount_total = order.get("discount_total")
+                    inv.custom_promo_codes = json.dumps(codes)
+                    inv.custom_promo_woo_discount_total = float(discount_total or 0)
+            except Exception as _promo_err:
+                frappe.log_error(
+                    title=f"Woo: promo wiring failed (create) for order {woo_id}",
+                    message=str(_promo_err),
+                )
             inv.insert(ignore_permissions=True)
             if status_map["docstatus"] == 1:
                 _submit_invoice_with_accounting_guards(inv, pos_profile=pos_profile)
@@ -3312,6 +3343,19 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         if woo_status == "failed" and inv:
             _add_payment_failure_comment(inv.name, woo_id)
 
+        # Best-effort: surface the jarz_pos-computed promo mismatch flag onto the order map.
+        # The invoice carries the authoritative flag (set by the jarz_pos before_validate hook);
+        # this is a convenience copy for filtering/reporting. We read it back from the in-memory
+        # invoice doc — no recomputation here (jarz_pos owns the math).
+        promo_map_values = {}
+        try:
+            _mismatch = getattr(inv, "custom_promo_discount_mismatch", None)
+            if _mismatch is not None:
+                promo_map_values["promo_mismatch"] = 1 if _mismatch else 0
+                promo_map_values["promo_mismatch_note"] = getattr(inv, "custom_promo_mismatch_note", None)
+        except Exception:
+            promo_map_values = {}
+
         map_name = existing_map.get("name") if existing_map else None
         if map_name:
             map_doc = frappe.get_doc("WooCommerce Order Map", map_name)
@@ -3326,6 +3370,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     territory_snapshot=territory_snapshot,
                 )
             )
+            if promo_map_values:
+                map_doc.update(promo_map_values)
             map_doc.save(ignore_permissions=True)
         else:
             frappe.get_doc({
@@ -3340,6 +3386,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     needs_territory_recheck=1 if _territory_fallback_used else 0,
                     territory_snapshot=territory_snapshot,
                 ),
+                **promo_map_values,
             }).insert(ignore_permissions=True)
 
         # Keep cache fresh so reruns benefit from O(1) skip
