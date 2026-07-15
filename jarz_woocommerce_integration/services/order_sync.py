@@ -10,7 +10,7 @@ from frappe.utils import get_datetime
 
 import frappe
 
-from jarz_woocommerce_integration.utils.http_client import WooClient
+from jarz_woocommerce_integration.utils.http_client import WooClient, WooTransientError
 from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_fields
 from jarz_woocommerce_integration.services.customer_sync import (
     ensure_customer_with_addresses,
@@ -600,6 +600,39 @@ def _list_orders_window(
         page += 1
 
     return orders, pages_fetched, total_pages
+
+
+def _transient_window_skip(
+    exc: WooTransientError,
+    *,
+    operation: str,
+    params: dict[str, Any],
+    max_pages: int,
+) -> dict[str, Any]:
+    """Record a transient Woo fetch failure as a soft skip.
+
+    The store answered in a way we cannot parse (HTML/WAF/rate-limit page, 429,
+    5xx) even after the HTTP client exhausted its retries. That is the store's
+    problem, not a bug here: log a warning, skip this window, and let the next
+    scheduled run pick it up again. The sync cursor is deliberately left where it
+    was, so nothing is silently lost.
+    """
+
+    detail = {
+        "event": "woo_order_window_transient_skip",
+        "operation": operation,
+        "status_code": getattr(exc, "status_code", None),
+        "url": getattr(exc, "url", None),  # already credential-sanitized by http_client
+        "message": str(exc)[:500],
+        "params": dict(params or {}),  # window bounds only — never credentials
+        "max_pages": max_pages,
+    }
+    try:
+        # warning, not error: transient upstream noise must not page us.
+        frappe.logger().warning(detail)
+    except Exception:  # noqa: BLE001
+        pass
+    return detail
 
 
 def _resolve_posting_date(order: dict, is_historical: bool) -> str:
@@ -3500,11 +3533,47 @@ def pull_recent_orders_phase1(
     if order:
         params["order"] = order
 
-    orders, pages_fetched, total_pages = _list_orders_window(
-        client,
-        params=params,
-        max_pages=max_pages,
-    )
+    try:
+        orders, pages_fetched, total_pages = _list_orders_window(
+            client,
+            params=params,
+            max_pages=max_pages,
+        )
+    except WooTransientError as exc:
+        detail = _transient_window_skip(
+            exc, operation="pull_recent_orders_phase1", params=params, max_pages=max_pages
+        )
+        return {
+            "orders_fetched": 0,
+            "orders_fetched_raw": 0,
+            "filtered_out": 0,
+            "pages_fetched": 0,
+            "total_pages": 0,
+            "processed": 0,
+            "created": 0,
+            "skipped": 0,
+            "errors": 1,
+            "results_sample": [],
+            "dry_run": dry_run,
+            "force": force,
+            "allow_update": allow_update,
+            "is_historical": is_historical,
+            "status": effective_status,
+            "after": after,
+            "before": before,
+            "modified_after": modified_after,
+            "modified_before": modified_before,
+            "orderby": orderby,
+            "order": order,
+            "max_pages": max_pages,
+            "skip_reasons": {},
+            "fetched_order_ids_sample": [],
+            # No orders were read, so leave the cursor untouched and retry next run.
+            "latest_seen_modified_gmt": None,
+            "latest_seen_order_id": None,
+            "transient_skip": True,
+            "transient_error": detail,
+        }
     orders_fetched_raw = len(orders)
     if status_filter_set:
         orders = [
@@ -3617,11 +3686,40 @@ def _enqueue_order_window_events(
     if order:
         params["order"] = order
 
-    orders, pages_fetched, total_pages = _list_orders_window(
-        client,
-        params=params,
-        max_pages=max_pages,
-    )
+    try:
+        orders, pages_fetched, total_pages = _list_orders_window(
+            client,
+            params=params,
+            max_pages=max_pages,
+        )
+    except WooTransientError as exc:
+        detail = _transient_window_skip(
+            exc, operation=f"enqueue_order_window_events:{event_type}", params=params, max_pages=max_pages
+        )
+        return {
+            "orders_fetched": 0,
+            "orders_fetched_raw": 0,
+            "filtered_out": 0,
+            "pages_fetched": 0,
+            "total_pages": 0,
+            "queued": 0,
+            "errors": 1,
+            "results_sample": [],
+            "status": status,
+            "after": after,
+            "before": before,
+            "modified_after": modified_after,
+            "modified_before": modified_before,
+            "orderby": orderby,
+            "order": order,
+            "max_pages": max_pages,
+            "fetched_order_ids_sample": [],
+            # No orders were read, so leave the cursor untouched and retry next run.
+            "latest_seen_modified_gmt": None,
+            "latest_seen_order_id": None,
+            "transient_skip": True,
+            "transient_error": detail,
+        }
     orders_fetched_raw = len(orders)
     if status_filter_set:
         orders = [

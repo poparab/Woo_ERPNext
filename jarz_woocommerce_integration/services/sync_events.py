@@ -14,7 +14,7 @@ from frappe.utils import now_datetime
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
 )
-from jarz_woocommerce_integration.utils.http_client import WooAPIError
+from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooTransientError
 
 EVENT_DOCTYPE = "WooCommerce Sync Event"
 DEFAULT_PRIORITY = 50
@@ -1072,7 +1072,10 @@ def _handle_failure(event_doc: Any, *, result: Any = None, detail: str | None = 
 def _handle_exception(event_doc: Any, exc: Exception) -> dict[str, Any]:
     detail = str(exc) or exc.__class__.__name__
     if isinstance(exc, WooAPIError):
-        if exc.status_code in TRANSIENT_HTTP_STATUS_CODES:
+        # WooTransientError already survived the HTTP client's retries and carries
+        # no useful status code (a 200 with an HTML/WAF body reports as 200), so
+        # classify it by type rather than letting text-token matching guess.
+        if isinstance(exc, WooTransientError) or exc.status_code in TRANSIENT_HTTP_STATUS_CODES:
             if event_doc.direction == "Outbound":
                 _record_outbound_circuit_breaker_failure(detail)
             if int(getattr(event_doc, "attempt_count", 0) or 0) >= int(getattr(event_doc, "max_attempts", 1) or 1):
