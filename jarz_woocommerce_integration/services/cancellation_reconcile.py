@@ -126,6 +126,10 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
     placeholders = ", ".join(["%s"] * len(woo_order_ids))
     link_field = _resolve_order_map_link_field()
 
+    # `IFNULL(si.is_return, 0) = 0` excludes credit notes. They inherit
+    # `woo_order_id` from the invoice they reverse, so a returned order would
+    # otherwise present a submitted (docstatus 1) row, classify as MATCH_ACTIVE,
+    # and be re-pulled from Woo on every reconcile run — forever.
     direct_rows = frappe.db.sql(
         f"""
         SELECT si.name AS invoice_name,
@@ -136,6 +140,7 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
                si.modified
         FROM `tabSales Invoice` si
         WHERE si.woo_order_id IN ({placeholders})
+          AND IFNULL(si.is_return, 0) = 0
         """,
         tuple(woo_order_ids),
         as_dict=True,
@@ -151,6 +156,7 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
         FROM `tabWooCommerce Order Map` wm
         JOIN `tabSales Invoice` si ON si.name = wm.{link_field}
         WHERE wm.woo_order_id IN ({placeholders})
+          AND IFNULL(si.is_return, 0) = 0
         """,
         tuple(woo_order_ids),
         as_dict=True,
@@ -169,6 +175,22 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
         bucket[invoice_name] = row
 
     return {woo_order_id: list(rows.values()) for woo_order_id, rows in matches.items()}
+
+
+def _pull_succeeded(result: dict[str, Any] | None) -> bool:
+    """Whether a ``pull_single_order_phase1`` result counts as a success.
+
+    Most of that function's early exits return ``{"status": "skipped", ...}``
+    with no ``success`` key at all, so a bare ``result.get("success")`` read
+    every deliberate skip as a failure and inflated the error count. A skip
+    means "nothing to do here", which is a fine outcome for a reconcile pass;
+    only a genuine exception is an error.
+    """
+    if not result:
+        return False
+    if "success" in result:
+        return bool(result.get("success"))
+    return str(result.get("status") or "") in {"skipped", "queued", "cancelled", "dry_run"}
 
 
 def _classify_order(rows: list[dict[str, Any]]) -> str:
@@ -416,7 +438,7 @@ def reconcile_cancelled_orders(
                             force=False,
                             allow_update=True,
                         )
-                        if result.get("success"):
+                        if _pull_succeeded(result):
                             frappe.db.commit()
                     except Exception:
                         try:
@@ -429,7 +451,7 @@ def reconcile_cancelled_orders(
                             "woo_order_id": woo_order_id,
                         }
 
-                if result.get("success"):
+                if _pull_succeeded(result):
                     if bucket == "MATCH_ACTIVE":
                         stats["reprocessed_active"] += 1
                     else:

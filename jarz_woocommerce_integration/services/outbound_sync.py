@@ -1477,6 +1477,13 @@ def _should_enqueue_invoice_event(
 ) -> bool:
     if _is_outbound_suppressed(invoice):
         return False
+    # Credit notes never sync outbound — see the guard in sync_sales_invoice.
+    # Checked before `force` so a forced resync cannot push one either.
+    try:
+        if int(invoice.get("is_return") or 0):
+            return False
+    except Exception:
+        pass
     if force:
         return True
     if cancel or method in {None, "on_submit", "on_cancel"}:
@@ -2084,6 +2091,16 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
 
     if getattr(invoice.flags, "ignore_woo_outbound", False) or getattr(frappe.flags, "ignore_woo_outbound", False):
         return {"skipped": True, "reason": "inbound"}
+
+    # A credit note is a local accounting correction, never a Woo order. It
+    # inherits `woo_order_id` from the invoice it reverses (the custom field is
+    # copyable), so without this guard submitting one would push a status update
+    # to the live store — re-opening a cancelled or completed order. And when the
+    # id is blank it is worse: the flow below would create a brand-new Woo order.
+    # Whether the customer-facing order should change on a return is decided by
+    # the return workflow, not by this hook.
+    if int(invoice.get("is_return") or 0):
+        return {"skipped": True, "reason": "credit_note"}
 
     # When the invoice was just created as the replacement half of a Woo-initiated
     # amendment, Woo already holds the authoritative state — suppress the outbound push.

@@ -50,6 +50,12 @@ RECONCILE_ORDER_STATUSES = ",".join(RECONCILE_TARGET_WOO_STATUSES)
 KASHIER_AUTO_PAY_METHODS = {"Kashier Card", "Kashier Wallet"}
 NON_PAYABLE_WOO_STATUSES = {"cancelled", "refunded", "failed"}
 
+#: Woo statuses that mean "this order is dead" and must reach ERPNext even when
+#: the invoice is already submitted. "failed" is deliberately excluded: it means
+#: payment failed, not that the customer cancelled, and an order can recover
+#: from it — cancelling on a payment blip would destroy a live order.
+TERMINAL_CANCELLATION_STATUSES = {"cancelled", "refunded"}
+
 ORDER_SYNC_CURSOR_FIELDS = {
     "live": {
         "modified": "live_order_cursor_modified_gmt",
@@ -2137,6 +2143,81 @@ def _enqueue_delivery_charge_repost(inv) -> None:
     repost_doc.submit()
 
 
+def _handle_terminal_status_on_submitted_invoice(*, inv, woo_id: int, woo_status: str) -> dict:
+    """Apply a Woo cancellation/refund to an already-submitted Sales Invoice.
+
+    Calls the standard ``inv.cancel()``. jarz_pos owns the policy through its
+    ``before_cancel`` hook: it permits a pre-dispatch cancel and throws for a
+    dispatched one. We never inspect dispatch state here — duplicating that rule
+    in this app is exactly how the two would drift apart.
+
+    A refusal is not an error. It means a human has to decide whether the order
+    needs the return workflow, so the Order Map is flagged for review and the
+    result is reported as a *successful* skip. That distinction matters:
+    ``cancellation_reconcile`` counts a result without a truthy ``success`` as a
+    failure, which is why these orders showed up as errors before.
+    """
+    cancellation_type = "WooCommerce Refunded" if woo_status == "refunded" else "WooCommerce Cancelled"
+    cancellation_reason = f"Order {woo_status} on WooCommerce (Order #{woo_id})"
+
+    try:
+        _meta = frappe.get_meta("Sales Invoice")
+        updates = {}
+        if _meta.get_field("custom_cancellation_type"):
+            updates["custom_cancellation_type"] = cancellation_type
+            updates["custom_cancellation_reason"] = cancellation_reason
+        if updates:
+            frappe.db.set_value("Sales Invoice", inv.name, updates, update_modified=False)
+    except Exception:
+        pass
+
+    try:
+        inv.flags.ignore_permissions = True
+        inv.flags.ignore_woo_outbound = True  # Woo already knows; don't echo back.
+        inv.cancel()
+    except Exception as cancel_err:
+        # The dispatch guard (or any other validation) refused. Surface it for a
+        # human instead of dropping the cancellation on the floor.
+        _flag_order_map_for_manual_review(
+            woo_id=woo_id,
+            invoice_name=inv.name,
+            reason=(
+                f"WooCommerce reports {woo_status!r} but the submitted invoice could not be "
+                f"cancelled: {cancel_err}. This order likely needs the return workflow."
+            ),
+        )
+        create_sync_log_entry(
+            "InboundSkip",
+            "NeedsReview",
+            f"needs_return_workflow: {inv.name} is {woo_status!r} on Woo but cannot be "
+            f"cancelled in ERPNext ({cancel_err})",
+            woo_order_id=woo_id,
+        )
+        return {
+            "success": True,
+            "status": "skipped",
+            "reason": "needs_return_workflow",
+            "woo_order_id": woo_id,
+            "invoice": inv.name,
+            "detail": str(cancel_err),
+        }
+
+    create_sync_log_entry(
+        "InboundCancel",
+        "Success",
+        f"woo_terminal_cancel: {inv.name} cancelled because WooCommerce reports {woo_status!r}",
+        woo_order_id=woo_id,
+    )
+    return {
+        "success": True,
+        "status": "cancelled",
+        "reason": "woo_terminal_status",
+        "woo_order_id": woo_id,
+        "invoice": inv.name,
+        "cancellation_type": cancellation_type,
+    }
+
+
 def _flag_order_map_for_manual_review(*, woo_id: int, invoice_name: str, reason: str) -> None:
     """Set needs_manual_review on the WooCommerce Order Map row for this order."""
     try:
@@ -2908,6 +2989,22 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     inv, woo_id, territory_name=territory_name, pos_profile=pos_profile,
                     default_warehouse=default_warehouse,
                 )
+
+                # --- Terminal Woo status on a submitted invoice ----------------------
+                # A cancellation is not an "update" to freeze out. The frozen guard
+                # below used to swallow it wholesale, so a customer cancelling on the
+                # website after ERPNext had submitted the invoice left the revenue
+                # standing on our books with nothing to reconcile it against.
+                #
+                # Policy stays in jarz_pos: we call the STANDARD `inv.cancel()` and its
+                # `before_cancel` hook decides. Pre-dispatch it permits the cancel;
+                # post-dispatch it refuses, and the order needs the return workflow —
+                # which is a human decision, so we flag it for review rather than
+                # silently dropping it. No cross-app import; domain isolation holds.
+                if woo_status in TERMINAL_CANCELLATION_STATUSES:
+                    return _handle_terminal_status_on_submitted_invoice(
+                        inv=inv, woo_id=woo_id, woo_status=woo_status,
+                    )
 
                 # --- OFD permanent hard-lock -----------------------------------------
                 # Once an invoice has ever reached "Out for Delivery", it may no longer
