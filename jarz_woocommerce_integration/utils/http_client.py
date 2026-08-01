@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlsplit, urlunsplit
 
 import requests  # third-party
 from requests.auth import HTTPBasicAuth
@@ -45,6 +45,18 @@ SENSITIVE_QUERY_KEYS = {
 REDACTED = "***REDACTED***"
 # Woo credentials are recognisable (ck_… / cs_…); scrub them from any text we log.
 _SECRET_TOKEN_RE = re.compile(r"\b(?:ck|cs)_[0-9a-zA-Z]{8,}", re.IGNORECASE)
+
+
+class _PrettyRouteUnavailable(Exception):
+    """Internal signal: ``/wp-json/…`` is not reaching the REST API on this store.
+
+    Never escapes :meth:`WooClient._perform_request` — it exists purely to hand
+    control to the ``?rest_route=`` fallback. See :func:`_rest_route_for`.
+    """
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
 
 
 class WooAPIError(Exception):
@@ -171,6 +183,75 @@ def _should_bypass_ssl_verification(base_url: str) -> bool:
     return host_name == "https://erpstg.orderjarz.com"
 
 
+# WooCommerce only runs consumer key/secret authentication when the request URI
+# contains "<rest-prefix>/wc/" — see WC_REST_Authentication::is_request_to_rest_api().
+# A bare ?rest_route= URI does not match, so WordPress falls through to core user
+# authentication and every call comes back 401 "invalid_username" no matter how
+# good the credentials are. Carrying a throwaway query arg whose value holds that
+# literal substring restores the match. Routing is unaffected: WordPress dispatches
+# purely on rest_route and ignores unknown args.
+WC_AUTH_URI_MARKER = "_wc_rest_route=/wp-json/wc/"
+
+
+def _rest_route_for(resource: str, api_version: str) -> str:
+    """Map a client resource onto the REST route used by ``?rest_route=``.
+
+    ``orders`` -> ``/wc/v3/orders``; ``wp-json/jarz/v1/delivery-areas`` ->
+    ``/jarz/v1/delivery-areas``.
+    """
+
+    resource = resource.lstrip("/")
+    if resource == "wp-json":
+        return "/"
+    if resource.startswith("wp-json/"):
+        return "/" + resource[len("wp-json/"):]
+    return f"/wc/{api_version}/{resource}"
+
+
+def _is_json_response(response: Any) -> bool:
+    """True when the body actually parses as JSON.
+
+    A live WP REST API answers JSON for *everything*, successes and errors
+    alike. An HTML body therefore means we never reached the REST API — the
+    request was served by the theme, the web server, or a WAF.
+    """
+
+    try:
+        response.json()
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def _log_rest_route_fallback(base_url: str, detail: str) -> None:
+    """Record the permalink degradation once an hour, per store.
+
+    Deliberately an Error Log rather than ``logger().info()``: default log level
+    on staging/production is ERROR, so info/warning would never be seen.
+    """
+
+    try:
+        import frappe
+
+        cache_key = f"woo_rest_route_fallback::{urlparse(base_url).hostname or base_url}"
+        if frappe.cache().get_value(cache_key):
+            return
+        frappe.cache().set_value(cache_key, "1", expires_in_sec=3600)
+        frappe.log_error(
+            title="WooCommerce: falling back to ?rest_route=",
+            message=(
+                f"The /wp-json/ route on {sanitize_url(base_url)} is not reaching the REST API, "
+                f"so this client switched to the ?rest_route= form.\n\n"
+                f"Sync keeps working, but fix the store: this is almost always WordPress "
+                f"Settings -> Permalinks set to 'Plain'. Choose 'Post name' and save.\n\n"
+                f"Trigger: {detail}"
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        # Logging must never take the sync down with it.
+        pass
+
+
 @dataclass
 class WooClient:
     base_url: str
@@ -181,6 +262,9 @@ class WooClient:
     verify_ssl: bool | None = None
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     backoff_base_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS
+    # Talk ?rest_route= instead of /wp-json/. Auto-enabled (and sticky) the first
+    # time the pretty route proves to be unrouted; set it up-front to skip the probe.
+    use_rest_route: bool = False
     _session: requests.Session | None = None
 
     def __post_init__(self):
@@ -192,8 +276,17 @@ class WooClient:
         if self.verify_ssl is False:
             disable_warnings(InsecureRequestWarning)
 
-    def _build_url(self, resource: str) -> str:
+    def _build_url(self, resource: str, *, rest_route: bool = False) -> str:
         resource = resource.lstrip("/")
+        if rest_route:
+            # ?rest_route= is served by index.php directly, so it needs no
+            # rewrite rules and survives "Plain" permalinks. WC_AUTH_URI_MARKER
+            # keeps WooCommerce's authentication engaged — without it the call
+            # routes fine but 401s. Both must be present.
+            path, _, query = resource.partition("?")
+            route = quote(_rest_route_for(path, self.api_version), safe="/")
+            url = f"{self.base_url}/?rest_route={route}&{WC_AUTH_URI_MARKER}"
+            return f"{url}&{query}" if query else url
         if resource.startswith("wp-json"):
             return f"{self.base_url}/{resource}"
         return f"{self.base_url}/wp-json/wc/{self.api_version}/{resource}"
@@ -215,7 +308,19 @@ class WooClient:
         params: dict | None = None,
         data: dict | None = None,
     ) -> tuple[Any, dict]:
-        """Issue a Woo request, retrying transient failures, and return (body, headers).
+        """Issue a Woo request, falling back to ``?rest_route=`` if needed.
+
+        Stores whose WordPress permalinks are set to "Plain" never register the
+        ``wp-json`` rewrite rule, so ``/wp-json/…`` is answered by the theme or
+        the web server instead of the REST API. That took staging's sync down
+        for seven weeks. On the one unambiguous signature of that — a
+        non-retryable 4xx carrying a non-JSON body — retry through
+        ``?rest_route=``, which needs no rewrite rules, and stay on that form
+        for the rest of this client's life.
+
+        Transient shapes (200/5xx/429 with an HTML body) deliberately do *not*
+        trigger the fallback: those mean a WAF challenge or a struggling store,
+        where a second URL shape would only double the load.
 
         Raises:
             WooAPIError: for genuine, non-transient errors (auth, 4xx, ...) — loud
@@ -225,7 +330,35 @@ class WooClient:
                 snippet + Content-Type so the cause is visible in logs/Sentry.
         """
 
-        url = self._build_url(resource)
+        try:
+            return self._perform_request_in_mode(
+                method, resource, params=params, data=data, rest_route=self.use_rest_route
+            )
+        except _PrettyRouteUnavailable as signal:
+            detail = signal.detail
+
+        self.use_rest_route = True
+        _log_rest_route_fallback(self.base_url, detail)
+        return self._perform_request_in_mode(
+            method, resource, params=params, data=data, rest_route=True
+        )
+
+    def _perform_request_in_mode(
+        self,
+        method: str,
+        resource: str,
+        *,
+        params: dict | None = None,
+        data: dict | None = None,
+        rest_route: bool = False,
+    ) -> tuple[Any, dict]:
+        """Issue a Woo request in one URL mode, retrying transient failures.
+
+        Raises :class:`_PrettyRouteUnavailable` (pretty mode only) on a
+        non-retryable 4xx with a non-JSON body — the REST API was never reached.
+        """
+
+        url = self._build_url(resource, rest_route=rest_route)
         safe_url = sanitize_url(url)
         session = self._session or requests
         attempts = max(1, int(self.max_attempts or DEFAULT_MAX_ATTEMPTS))
@@ -250,8 +383,14 @@ class WooClient:
             if status_code >= 400:
                 payload = self._error_payload(response)
                 message = payload.get("message") or "HTTP error"
+                # A live REST API answers JSON even when it is refusing us, so an
+                # HTML error body means the request never got there.
+                unrouted = not rest_route and not _is_json_response(response)
                 if status_code in RETRYABLE_STATUS_CODES:
                     if is_last:
+                        # Deliberately no fallback here: a 5xx/429 HTML body is
+                        # a struggling or throttling store, and a second URL
+                        # shape would just double the load we put on it.
                         raise WooTransientError(
                             status_code,
                             safe_url,
@@ -260,6 +399,12 @@ class WooClient:
                         )
                     self._sleep_before_retry(attempt, response)
                     continue
+                if unrouted:
+                    # Classic missing-rewrite signature: the web server 404s
+                    # /wp-json/ because no such directory exists on disk.
+                    raise _PrettyRouteUnavailable(
+                        f"HTTP {status_code} with a {content_type(response)} body at {safe_url}"
+                    )
                 # Auth failures / 4xx are real bugs on our side — stay loud.
                 raise WooAPIError(status_code, safe_url, message, payload)
 
@@ -271,6 +416,8 @@ class WooClient:
                 snippet = body_snippet(response)
                 ctype = content_type(response)
                 if is_last:
+                    # Also no fallback: HTTP 200 + HTML is a WAF challenge or a
+                    # maintenance page, not a missing rewrite rule.
                     raise WooTransientError(
                         status_code,
                         safe_url,

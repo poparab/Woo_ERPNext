@@ -262,6 +262,114 @@ def test_404_raises_immediately_without_retries():
     assert len(session.calls) == 1
 
 
+# --- (e) "Plain" permalinks: /wp-json/ unrouted -> ?rest_route= fallback ----
+#
+# WordPress only registers the `wp-json` rewrite rule when permalinks are NOT
+# "Plain". Without it the web server 404s /wp-json/ with an HTML body, because
+# no such directory exists on disk. Regression cover for the seven-week staging
+# sync outage of 2026-06-13.
+
+
+def _html_404():
+    return FakeResponse(
+        status_code=404,
+        text="<!DOCTYPE html><html><body>Not Found</body></html>",
+        headers={"Content-Type": "text/html"},
+    )
+
+
+def test_html_404_falls_back_to_rest_route_and_succeeds():
+    client, session = _client([_html_404(), _json_response([{"id": 1}])])
+
+    orders, _total, _pages = client.list_orders_with_meta(params={"per_page": 10})
+
+    assert orders == [{"id": 1}]
+    assert len(session.calls) == 2
+    assert session.calls[0]["url"] == "https://woo.test/wp-json/wc/v3/orders"
+    assert session.calls[1]["url"] == (
+        "https://woo.test/?rest_route=/wc/v3/orders&_wc_rest_route=/wp-json/wc/"
+    )
+    # Query params still ride along as normal query args.
+    assert session.calls[1]["params"] == {"per_page": 10}
+
+
+def test_rest_route_mode_is_sticky_after_first_fallback():
+    """The dead pretty route is probed once, not on every single call."""
+    client, session = _client([_html_404(), _json_response([]), _json_response([])])
+
+    client.list_orders_with_meta(params={"per_page": 1})
+    client.list_orders_with_meta(params={"per_page": 1})
+
+    assert client.use_rest_route is True
+    assert len(session.calls) == 3  # one dead probe, then two direct rest_route calls
+    assert all("rest_route" in call["url"] for call in session.calls[1:])
+
+
+def test_json_404_is_a_real_error_and_does_not_trigger_fallback():
+    """"Order not found" is a legitimate JSON 404 — never a routing problem."""
+    client, session = _client(
+        [FakeResponse(status_code=404, text='{"message": "Invalid ID."}', json_body={"message": "Invalid ID."})]
+    )
+
+    with pytest.raises(WooAPIError):
+        client.list_orders_with_meta(params={"per_page": 10})
+
+    assert client.use_rest_route is False
+    assert len(session.calls) == 1
+
+
+def test_html_200_does_not_trigger_fallback():
+    """A WAF challenge must not double our request load with a second URL shape."""
+    client, session = _client([_html_response(), _html_response(), _html_response()])
+
+    with pytest.raises(WooTransientError):
+        client.list_orders_with_meta(params={"per_page": 10})
+
+    assert client.use_rest_route is False
+    assert len(session.calls) == 3
+
+
+_MARKER = "&_wc_rest_route=/wp-json/wc/"
+
+
+@pytest.mark.parametrize(
+    "resource,expected",
+    [
+        ("orders", "https://woo.test/?rest_route=/wc/v3/orders" + _MARKER),
+        ("webhooks/25", "https://woo.test/?rest_route=/wc/v3/webhooks/25" + _MARKER),
+        # Custom namespaces must NOT be prefixed with /wc/v3.
+        (
+            "wp-json/jarz/v1/delivery-areas",
+            "https://woo.test/?rest_route=/jarz/v1/delivery-areas" + _MARKER,
+        ),
+    ],
+)
+def test_build_url_rest_route_forms(resource, expected):
+    client, _session = _client([])
+    assert client._build_url(resource, rest_route=True) == expected
+
+
+def test_rest_route_url_always_carries_the_wc_auth_marker():
+    """Guard rail: drop this substring and WooCommerce stops authenticating.
+
+    WC_REST_Authentication::is_request_to_rest_api() looks for "wp-json/wc/" in
+    the request URI. Without it the call still routes, but every response is a
+    401 "invalid_username" — a failure mode that looks like bad credentials.
+    """
+    client, _session = _client([])
+    for resource in ("orders", "products/1", "wp-json/jarz/v1/delivery-areas"):
+        assert "wp-json/wc/" in client._build_url(resource, rest_route=True)
+
+
+def test_build_url_pretty_forms_are_unchanged():
+    client, _session = _client([])
+    assert client._build_url("orders") == "https://woo.test/wp-json/wc/v3/orders"
+    assert (
+        client._build_url("wp-json/jarz/v1/delivery-areas")
+        == "https://woo.test/wp-json/jarz/v1/delivery-areas"
+    )
+
+
 def test_get_order_still_swallows_transient_and_returns_none():
     """WooTransientError subclasses WooAPIError, so get_order behaviour is unchanged."""
     client, _session = _client([_html_response(), _html_response(), _html_response()])
