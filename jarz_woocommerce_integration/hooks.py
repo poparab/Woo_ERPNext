@@ -194,6 +194,14 @@ scheduler_events = {
 		"17 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.reconcile_recent_orders_cron"
 		],
+		# Trashed / permanently deleted Woo orders. Neither is visible to the
+		# cancelled poll (status=any excludes trash; a deleted order is simply
+		# gone), so this probes Order Map rows directly — one Woo GET per row,
+		# which is why it runs 4x a day rather than hourly. Deletions are not
+		# time-critical; the point is that they stop being invisible.
+		"42 3,9,15,21 * * *": [
+			"jarz_woocommerce_integration.services.order_sync.reconcile_deleted_orders_cron"
+		],
 		"10 * * * *": [
 			"jarz_woocommerce_integration.services.outbound_sync.reconcile_outbound_state"
 		],

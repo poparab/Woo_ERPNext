@@ -10,7 +10,11 @@ from frappe.utils import get_datetime
 
 import frappe
 
-from jarz_woocommerce_integration.utils.http_client import WooClient, WooTransientError
+from jarz_woocommerce_integration.utils.http_client import (
+    WooAPIError,
+    WooClient,
+    WooTransientError,
+)
 from jarz_woocommerce_integration.utils.custom_fields import ensure_custom_fields
 from jarz_woocommerce_integration.services.customer_sync import (
     ensure_customer_with_addresses,
@@ -54,7 +58,14 @@ NON_PAYABLE_WOO_STATUSES = {"cancelled", "refunded", "failed"}
 #: the invoice is already submitted. "failed" is deliberately excluded: it means
 #: payment failed, not that the customer cancelled, and an order can recover
 #: from it — cancelling on a payment blip would destroy a live order.
-TERMINAL_CANCELLATION_STATUSES = {"cancelled", "refunded"}
+#:
+#: "trash" is included: an admin trashing an order is at least as strong a signal
+#: as a customer cancelling it. Note that including it here only helps when a
+#: trash arrives as a status update — Woo's ``status=any`` list filter excludes
+#: trashed posts, so polling alone never surfaces them. That hole, and permanent
+#: deletes (which cannot appear in any list response at all), are covered by
+#: :func:`reconcile_deleted_orders_cron`.
+TERMINAL_CANCELLATION_STATUSES = {"cancelled", "refunded", "trash"}
 
 ORDER_SYNC_CURSOR_FIELDS = {
     "live": {
@@ -4338,6 +4349,129 @@ def sync_cancelled_orders_cron():  # pragma: no cover - scheduler entry for canc
         )
     except Exception:  # noqa: BLE001
         return
+
+
+#: How far back the deleted-order sweep looks, and how many rows it probes per run.
+#: Each row costs one Woo GET, so this is deliberately bounded.
+DELETED_ORDER_RECONCILE_LOOKBACK_DAYS = 14
+DELETED_ORDER_RECONCILE_MAX_ROWS = 200
+
+
+def reconcile_deleted_orders_cron():  # pragma: no cover - scheduler entry for deleted orders
+    """Catch Woo orders that were trashed or permanently deleted.
+
+    Neither case is reachable through the cancelled-order poll:
+
+    * a **permanent delete** removes the order outright, so it can never appear
+      in a list response again;
+    * a **trash** sets ``status="trash"``, and Woo's ``status=any`` filter
+      explicitly excludes trashed posts.
+
+    So the deletion was never observed at all and the ERPNext invoice stayed
+    submitted and outstanding — phantom AR with nothing to reconcile it against,
+    and unlike the cancel path not even a manual-review flag was raised. This
+    sweep probes recent Order Map rows directly instead of listing.
+
+    Disposition reuses :func:`_handle_terminal_status_on_submitted_invoice`, so
+    the policy is identical to a Woo cancellation: jarz_pos's ``before_cancel``
+    hook permits a pre-dispatch cancel and refuses a dispatched one, which gets
+    flagged for a human rather than silently dropped.
+    """
+    if not frappe.db.get_single_value("WooCommerce Settings", "enable_inbound_orders"):
+        return None
+
+    started_on = frappe.utils.now_datetime()
+    summary: dict[str, Any] = {
+        "probed": 0, "trashed": 0, "deleted": 0,
+        "cancelled": 0, "flagged": 0, "skipped_transient": 0, "errors": 0,
+        "acted": [],
+    }
+
+    try:
+        settings = frappe.get_single("WooCommerce Settings")
+        client = WooClient(
+            base_url=str(getattr(settings, "base_url", "") or "").rstrip("/"),
+            consumer_key=str(getattr(settings, "consumer_key", "") or ""),
+            consumer_secret=settings.get_password("consumer_secret"),
+            api_version=getattr(settings, "api_version", "v3") or "v3",
+        )
+
+        cutoff = frappe.utils.add_days(started_on, -DELETED_ORDER_RECONCILE_LOOKBACK_DAYS)
+        rows = frappe.get_all(
+            "WooCommerce Order Map",
+            filters={
+                "synced_on": [">=", cutoff],
+                "needs_manual_review": 0,
+                "erpnext_sales_invoice": ["is", "set"],
+            },
+            fields=["name", "woo_order_id", "erpnext_sales_invoice", "status"],
+            order_by="synced_on desc",
+            limit_page_length=DELETED_ORDER_RECONCILE_MAX_ROWS,
+        )
+
+        for row in rows:
+            woo_id = int(row.get("woo_order_id") or 0)
+            invoice_name = str(row.get("erpnext_sales_invoice") or "")
+            if not woo_id or not invoice_name:
+                continue
+
+            summary["probed"] += 1
+            try:
+                order = client.get(f"orders/{woo_id}")
+            except WooTransientError:
+                # Store hiccup. NEVER treat an unreachable store as a deletion —
+                # that would cancel live invoices during an outage.
+                summary["skipped_transient"] += 1
+                continue
+            except WooAPIError as err:
+                if getattr(err, "status_code", 0) != 404:
+                    summary["skipped_transient"] += 1
+                    continue
+                disposition = "deleted"
+            else:
+                if str((order or {}).get("status") or "").strip().lower() != "trash":
+                    continue
+                disposition = "trashed"
+
+            summary[disposition] += 1
+
+            if not frappe.db.exists("Sales Invoice", invoice_name):
+                continue
+            inv = frappe.get_doc("Sales Invoice", invoice_name)
+            if inv.docstatus == 2:
+                continue  # already cancelled; nothing owed
+
+            if inv.docstatus == 0:
+                # A draft never hit the GL, so there is no phantom AR to undo.
+                # Flag it rather than deleting data on a human's behalf.
+                _flag_order_map_for_manual_review(
+                    woo_id=woo_id, invoice_name=invoice_name,
+                    reason=f"WooCommerce order #{woo_id} was {disposition}; the draft invoice is still open.",
+                )
+                summary["flagged"] += 1
+            else:
+                before = inv.docstatus
+                _handle_terminal_status_on_submitted_invoice(
+                    inv=inv, woo_id=woo_id, woo_status=disposition,
+                )
+                after = frappe.db.get_value("Sales Invoice", invoice_name, "docstatus")
+                if after == 2 and before == 1:
+                    summary["cancelled"] += 1
+                else:
+                    summary["flagged"] += 1
+
+            summary["acted"].append(
+                {"woo_order_id": woo_id, "invoice": invoice_name, "disposition": disposition}
+            )
+            frappe.db.commit()
+
+    except Exception:  # noqa: BLE001
+        summary["errors"] += 1
+        frappe.log_error(frappe.get_traceback(), "reconcile_deleted_orders_cron failed")
+
+    status = "Error" if summary["errors"] else ("Partial" if summary["skipped_transient"] else "Success")
+    create_sync_log_entry("CronDeleted", status, summary, started_on=started_on)
+    return summary
 
 
 def reconcile_recent_orders_cron():  # pragma: no cover - scheduler entry for missed orders
