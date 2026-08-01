@@ -2171,24 +2171,45 @@ def _handle_terminal_status_on_submitted_invoice(*, inv, woo_id: int, woo_status
     cancellation_type = "WooCommerce Refunded" if woo_status == "refunded" else "WooCommerce Cancelled"
     cancellation_reason = f"Order {woo_status} on WooCommerce (Order #{woo_id})"
 
+    # Set these on the in-memory doc, NOT through frappe.db.set_value: cancel()
+    # rewrites every column from the doc it is called on, so a direct DB write
+    # here is silently clobbered a few lines later and the audit label is lost.
+    # (That is exactly what happened — cancelled Woo orders carried an empty
+    # custom_cancellation_type until this was found.)
+    has_cancellation_fields = False
     try:
         _meta = frappe.get_meta("Sales Invoice")
-        updates = {}
         if _meta.get_field("custom_cancellation_type"):
-            updates["custom_cancellation_type"] = cancellation_type
-            updates["custom_cancellation_reason"] = cancellation_reason
-        if updates:
-            frappe.db.set_value("Sales Invoice", inv.name, updates, update_modified=False)
-    except Exception:
-        pass
+            has_cancellation_fields = True
+            inv.custom_cancellation_type = cancellation_type
+            inv.custom_cancellation_reason = cancellation_reason
+    except Exception:  # noqa: BLE001
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Could not stamp cancellation metadata on {getattr(inv, 'name', '?')}",
+        )
 
     try:
         inv.flags.ignore_permissions = True
         inv.flags.ignore_woo_outbound = True  # Woo already knows; don't echo back.
         inv.cancel()
     except Exception as cancel_err:
-        # The dispatch guard (or any other validation) refused. Surface it for a
-        # human instead of dropping the cancellation on the floor.
+        # The dispatch guard (or any other validation) refused. The doc was never
+        # written, so persist the labels directly — here db.set_value is correct
+        # precisely because no cancel() will follow to overwrite it.
+        if has_cancellation_fields:
+            try:
+                frappe.db.set_value(
+                    "Sales Invoice", inv.name,
+                    {
+                        "custom_cancellation_type": cancellation_type,
+                        "custom_cancellation_reason": cancellation_reason,
+                    },
+                    update_modified=False,
+                )
+            except Exception:  # noqa: BLE001
+                frappe.log_error(frappe.get_traceback(), f"cancellation label write failed {inv.name}")
+        # Surface it for a human instead of dropping the cancellation on the floor.
         _flag_order_map_for_manual_review(
             woo_id=woo_id,
             invoice_name=inv.name,

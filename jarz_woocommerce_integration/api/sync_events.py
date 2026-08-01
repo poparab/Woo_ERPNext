@@ -149,7 +149,15 @@ def _get_breaker_state() -> dict[str, Any]:
 def _settings_summary() -> dict[str, Any]:
 	settings = WooCommerceSettings.get_settings()
 	cfg = sync_events.get_sync_event_config(settings)
-	return asdict(cfg)
+	summary = asdict(cfg)
+	# The two master outbound kill-switches are NOT part of SyncEventConfig, but
+	# they are checked before every outbox gate that is — so with them off the
+	# dashboard showed a fully green config while no outbound event was written
+	# at all. Staging sat like that for seven weeks (2026-06-12 to 2026-08-01)
+	# and the whole config looked healthy the entire time. Surface them.
+	summary["enable_outbound_customers"] = bool(getattr(settings, "enable_outbound_customers", 0))
+	summary["enable_outbound_orders"] = bool(getattr(settings, "enable_outbound_orders", 0))
+	return summary
 
 
 def _recent_events(*, limit: int, statuses: tuple[str, ...] | None = None) -> list[dict[str, Any]]:

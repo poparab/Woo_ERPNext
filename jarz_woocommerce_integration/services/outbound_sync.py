@@ -171,6 +171,40 @@ class OutboundConfig:
     shipping_method_title: str
 
 
+def _note_outbound_disabled(switch: str) -> None:
+	"""Make the master outbound kill-switch visible when it silently drops work.
+
+	``enable_outbound_customers`` / ``enable_outbound_orders`` are checked before
+	every outbox gate, and both call sites used to be a bare ``return``. Staging
+	sat with them off from 2026-06-12 to 2026-08-01: zero outbound events, zero
+	log lines, and a sync dashboard that showed every visible flag green.
+
+	Rate-limited to one Error Log per switch per hour — this fires on every doc
+	event, so it must not become the spam that gets ignored. Deliberately an
+	Error Log rather than logger().warning(), which is below the servers'
+	default log level and would never be seen.
+	"""
+	try:
+		cache_key = f"woo_outbound_disabled::{switch}"
+		if frappe.cache().get_value(cache_key):
+			return
+		frappe.cache().set_value(cache_key, "1", expires_in_sec=3600)
+		frappe.log_error(
+			title=f"WooCommerce: outbound push skipped ({switch} is off)",
+			message=(
+				f"WooCommerce Settings.{switch} is disabled, so outbound work is being "
+				f"dropped before it reaches the outbox. No sync events are being created "
+				f"for it and nothing is retried.\n\n"
+				f"If this is not deliberate, re-enable it in WooCommerce Settings → "
+				f"Outbound Sync. Note that re-enabling enable_outbound_orders lets the "
+				f"hourly reconcile sweep push a backlog of submitted invoices to the "
+				f"store as new orders — enable it deliberately, not by reflex."
+			),
+		)
+	except Exception:  # noqa: BLE001
+		pass
+
+
 def _get_settings() -> tuple[WooCommerceSettings, OutboundConfig]:
     settings = WooCommerceSettings.get_settings()
     cfg = OutboundConfig(
@@ -542,6 +576,7 @@ def enqueue_linked_customer_sync_for_address(
 ) -> None:
     settings, cfg = _get_settings()
     if not cfg.enable_customer_push and not force:
+        _note_outbound_disabled("enable_outbound_customers")
         return
     if not _should_enqueue_customer_address_event(address, method=method, force=force):
         return
@@ -601,6 +636,7 @@ def enqueue_customer_sync(
 ) -> None:
     settings, cfg = _get_settings()
     if not cfg.enable_customer_push and not force:
+        _note_outbound_disabled("enable_outbound_customers")
         return
     if not isinstance(customer, str):
         reason = reason if reason != "event" else (method or "event")
@@ -817,6 +853,7 @@ def sync_customer(
 ) -> dict:
     settings, cfg = _get_settings()
     if not cfg.enable_customer_push and not force:
+        _note_outbound_disabled("enable_outbound_customers")
         return {"skipped": True, "reason": "disabled"}
 
     try:
@@ -954,6 +991,7 @@ def sync_customer(
 def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: str | None = None, *, reason: str = "event", force: bool = False, cancel: bool = False) -> None:
     settings, cfg = _get_settings()
     if not cfg.enable_order_push and not force:
+        _note_outbound_disabled("enable_outbound_orders")
         return
     if not isinstance(invoice, str):
         reason = reason if reason != "event" else (method or "event")
@@ -2082,6 +2120,7 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
 def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: bool = False, force: bool = False) -> dict:
     settings, cfg = _get_settings()
     if not cfg.enable_order_push and not force:
+        _note_outbound_disabled("enable_outbound_orders")
         return {"skipped": True, "reason": "disabled"}
 
     try:
