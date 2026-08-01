@@ -2250,6 +2250,60 @@ def _handle_terminal_status_on_submitted_invoice(*, inv, woo_id: int, woo_status
     }
 
 
+def _woo_noncoupon_discount_total(order: dict) -> float:
+    """Discount WooCommerce applied to this order WITHOUT a coupon line.
+
+    Two shapes reach us in practice, and both are how B2B pricing is expressed
+    on the store — B2B customers are discounted directly, not with a coupon:
+
+    * line-level / dynamic pricing — ``line_item["total"] < line_item["subtotal"]``
+      and Woo reports the difference in ``discount_total`` with no coupon line;
+    * a plugin writing a NEGATIVE ``fee_lines`` entry.
+
+    Only call this when ``coupon_lines`` is empty. With a coupon present,
+    ``discount_total`` already covers the coupon and jarz_pos owns the math.
+    """
+    total = 0.0
+    try:
+        total += float(order.get("discount_total") or 0)
+    except (TypeError, ValueError):
+        pass
+    for fee in order.get("fee_lines") or []:
+        try:
+            amount = float((fee or {}).get("total") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount < 0:
+            total += -amount
+    return round(total, 2)
+
+
+def _apply_noncoupon_woo_discount(inv, order: dict, *, woo_id: int) -> float:
+    """Carry a coupon-less Woo discount onto the invoice.
+
+    Without this the invoice is built from the ERP price list at full rate while
+    the customer was charged less on the store — silent over-billing, with
+    ``custom_promo_discount_mismatch`` reading 0 because nothing was ever passed
+    for it to compare. Measured at 13,228 EGP across 18 production orders.
+
+    Uses the same header-discount mechanism as the coupon path in jarz_pos
+    (``apply_discount_on = "Grand Total"``), deliberately: the POS flow's
+    ``set_missing_values()`` copies the POS Profile default and would silently
+    flip a "Net Total" setting, leaving net_total/grand_total inconsistent.
+    """
+    discount = _woo_noncoupon_discount_total(order)
+    if discount <= 0:
+        return 0.0
+    # No log line here on purpose: info() is below the servers' default log level
+    # so it would never be seen, and an Error Log per discounted order would be
+    # pure noise. The audit trail is on the invoice itself — custom_promo_woo_-
+    # discount_total alongside discount_amount, both queryable.
+    inv.custom_promo_woo_discount_total = discount
+    inv.apply_discount_on = "Grand Total"
+    inv.discount_amount = discount
+    return discount
+
+
 def _flag_order_map_for_manual_review(*, woo_id: int, invoice_name: str, reason: str) -> None:
     """Set needs_manual_review on the WooCommerce Order Map row for this order."""
     try:
@@ -3255,6 +3309,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         inv.custom_promo_codes = json.dumps(codes) if codes else None
                         inv.custom_promo_woo_discount_total = float(discount_total or 0)
                         inv.custom_promo_applied = 0
+                        if not codes:
+                            # Same coupon-less B2B discount path as on create. Reset
+                            # the header discount first so a discount removed on the
+                            # store is actually cleared instead of sticking.
+                            inv.apply_discount_on = "Grand Total"
+                            inv.discount_amount = 0
+                            _apply_noncoupon_woo_discount(inv, order, woo_id=woo_id)
                     except Exception as _promo_err:
                         frappe.log_error(
                             title=f"Woo: promo wiring failed (update) for order {woo_id}",
@@ -3472,6 +3533,11 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     discount_total = order.get("discount_total")
                     inv.custom_promo_codes = json.dumps(codes)
                     inv.custom_promo_woo_discount_total = float(discount_total or 0)
+                else:
+                    # No coupon: jarz_pos's promo hook has nothing to recompute
+                    # from, so a B2B / dynamic-pricing discount has to be carried
+                    # across here or the invoice bills at full list price.
+                    _apply_noncoupon_woo_discount(inv, order, woo_id=woo_id)
             except Exception as _promo_err:
                 frappe.log_error(
                     title=f"Woo: promo wiring failed (create) for order {woo_id}",
