@@ -5,10 +5,20 @@ Woo Sync Operations page and the sync logs were reachable only by typing their
 names into awesomebar — there was no entry for them anywhere in the Desk
 sidebar.
 
-The workspace is created as a child of the JARZ POS workspace when that exists,
-so the whole Jarz surface sits under one sidebar entry. That is a soft
-reference by name only: this app never imports from ``jarz_pos``, and if the
-POS app is absent the workspace is created top-level instead.
+Two surfaces, because Frappe v16 keeps them separate:
+
+- the ``WooCommerce`` **Workspace** — the page itself, and
+- a ``WooCommerce`` **section inside the Jarz POS Workspace Sidebar** — which is
+  what actually makes Woo appear under Jarz in the nav rail.
+
+``Workspace.parent_page`` is set too, but it does not drive sidebar grouping;
+``sidebar.js: find_nested_items`` nests on Section Break + ``child`` rows in the
+``Workspace Sidebar`` record. Setting only ``parent_page`` leaves Woo looking
+like a separate top-level entry, which is exactly how this first shipped.
+
+Both are soft references by name: this app imports nothing from ``jarz_pos``'s
+business logic, and when the POS app is absent the workspace stands alone and
+the sidebar append is skipped.
 
 Same contract as the POS-side builder: the declarations below are the source of
 truth and are rewritten on every ``bench migrate``, every target is
@@ -71,6 +81,114 @@ CARDS = [
 ]
 
 _TARGET_DOCTYPE = {"DocType": "DocType", "Page": "Page", "Report": "Report"}
+
+# The Jarz sidebar this app contributes a section to, referenced by document
+# name only and reached through plain Frappe document APIs. No POS-app module is
+# imported here — the two apps stay fully independent — so the row-building
+# below is deliberately duplicated rather than shared, and every step degrades
+# to a no-op when the record is absent.
+JARZ_SIDEBAR = "Jarz POS"
+
+SIDEBAR_SECTION_LABEL = "WooCommerce"
+SIDEBAR_SECTION_LINKS = [
+    {"label": "WooCommerce", "link_type": "Workspace", "link_to": WORKSPACE_NAME, "icon": WORKSPACE_ICON},
+    {"label": "Woo Sync Operations", "link_type": "Page", "link_to": "woo-sync-operations"},
+    {"label": "WooCommerce Settings", "link_type": "DocType", "link_to": "WooCommerce Settings"},
+    {"label": "WooCommerce Sync Event", "link_type": "DocType", "link_to": "WooCommerce Sync Event"},
+    {"label": "WooCommerce Sync Log", "link_type": "DocType", "link_to": "WooCommerce Sync Log"},
+    {"label": "WooCommerce Order Map", "link_type": "DocType", "link_to": "WooCommerce Order Map"},
+    {"label": "Woo Jarz Bundle", "link_type": "DocType", "link_to": "Woo Jarz Bundle"},
+]
+
+
+def ensure_woo_sidebar_section():  # pragma: no cover
+    """Put a WooCommerce section inside the Jarz sidebar, so it nests under Jarz.
+
+    A no-op when the Jarz sidebar record does not exist (POS app not installed,
+    or an older version of it) — the standalone WooCommerce workspace still
+    stands on its own in that case.
+
+    Idempotent: an existing section with this label is dropped and rewritten, so
+    repeated migrates never stack duplicates.
+    """
+    try:
+        if not frappe.db.exists("Workspace Sidebar", JARZ_SIDEBAR):
+            return
+
+        links = [l for l in SIDEBAR_SECTION_LINKS if _sidebar_target_exists(l)]
+        if not links:
+            return
+
+        sb = frappe.get_doc("Workspace Sidebar", JARZ_SIDEBAR)
+        kept = _rows_without_our_section(sb)
+
+        sb.set("items", [])
+        for row in kept:
+            sb.append("items", row)
+        sb.append("items", {
+            "type": "Section Break",
+            "label": SIDEBAR_SECTION_LABEL,
+            "child": 0,
+            "collapsible": 1,
+            # Collapsed by default so it does not push the POS sections off-screen.
+            "keep_closed": 1,
+        })
+        for link in links:
+            sb.append("items", {
+                "type": "Link",
+                "label": link["label"],
+                "link_type": link["link_type"],
+                "link_to": link.get("link_to"),
+                "icon": link.get("icon"),
+                # child=1 is what nests the row under the Section Break above it.
+                "child": 1,
+                "collapsible": 1,
+                "indent": 0,
+            })
+
+        sb.flags.ignore_mandatory = True
+        sb.flags.ignore_permissions = True
+        sb.flags.ignore_links = True
+        sb.save()
+        frappe.db.commit()
+    except Exception:  # noqa: BLE001
+        frappe.db.rollback()
+        frappe.log_error(frappe.get_traceback(), "ensure_woo_sidebar_section failed")
+
+
+def _rows_without_our_section(sb):
+    """Existing rows minus our Section Break and the child rows beneath it."""
+    kept, dropping = [], False
+    for item in sb.items:
+        if item.type == "Section Break":
+            dropping = item.label == SIDEBAR_SECTION_LABEL
+            if dropping:
+                continue
+        elif dropping and item.child:
+            continue
+        else:
+            dropping = False
+        kept.append({
+            "type": item.type,
+            "label": item.label,
+            "link_type": item.link_type,
+            "link_to": item.link_to,
+            "url": item.url,
+            "icon": item.icon,
+            "child": item.child,
+            "collapsible": item.collapsible,
+            "indent": item.indent,
+            "keep_closed": item.keep_closed,
+        })
+    return kept
+
+
+def _sidebar_target_exists(link):
+    """Sidebar links reach Workspaces too, which the card links cannot."""
+    kind = link["link_type"]
+    if kind == "Workspace":
+        return bool(frappe.db.exists("Workspace", link["link_to"]))
+    return _target_exists(kind, link["link_to"])
 
 
 def ensure_woo_workspace():  # pragma: no cover
