@@ -3,9 +3,23 @@ PROD-WOO-001: Submitted Sales Invoice Freeze
 =============================================
 
 Tests that process_order_phase1 and pull_single_order_phase1 respect the
-"submitted_frozen" contract: once an SI is submitted (docstatus=1) no inbound
-Woo update may mutate it — no save, no db_set, no cancel.  All changes from
-ERPNext submission onwards flow outbound via outbound_sync.py.
+"submitted_frozen" contract: once an SI is submitted (docstatus=1) inbound Woo
+updates may not rewrite its financial content — no re-costing, no item edits,
+no re-save.  Those changes flow outbound via outbound_sync.py instead.
+
+The freeze has two deliberate, narrow carve-outs, both added after incidents
+where blanket silence was worse than acting:
+
+* **Terminal Woo status** — a customer cancelling on the website is not an
+  "update" to swallow.  ``_handle_terminal_status_on_submitted_invoice`` calls
+  the standard ``inv.cancel()`` and lets the jarz_pos ``before_cancel`` hook
+  decide; refusals are escalated for review.  Swallowing these left cancelled
+  orders standing as revenue on our books.
+* **Delivery address** — a corrected street address on an undispatched order is
+  operational, not financial.  It is applied only when the *Woo* address
+  actually changed (so an ERPNext-side correction is never reverted), never
+  once the order is out for delivery, and a territory shift is flagged for a
+  human rather than silently repricing delivery income.
 
 Draft SIs (docstatus=0) keep the current full update behaviour.
 """
@@ -244,8 +258,8 @@ def _setup_common_mocks(
 def test_submitted_si_returns_skipped_submitted_frozen(monkeypatch):
     """
     When process_order_phase1 encounters an existing submitted SI (docstatus=1),
-    it must immediately return {status: skipped, reason: submitted_frozen}.
-    No save, db_set, or cancel may be called.
+    it must return {status: skipped, reason: submitted_frozen} without touching
+    the invoice's financial content.
     """
     sync_log_calls, fake_inv = _setup_common_mocks(monkeypatch, si_docstatus=1)
     order = _make_woo_order(woo_id=14763, status="completed")
@@ -257,10 +271,16 @@ def test_submitted_si_returns_skipped_submitted_frozen(monkeypatch):
     assert result["invoice"] == "ACC-SINV-00001"
     assert result["woo_order_id"] == 14763
 
-    # No accounting mutations
+    # No accounting mutations. db_set is checked per-field rather than
+    # "never called": the address carve-out uses it, and asserting on the
+    # mechanism instead of the fields is what made this test read as though the
+    # invoice were untouchable when two carve-outs already existed.
     fake_inv.save.assert_not_called()
-    fake_inv.db_set.assert_not_called()
     fake_inv.cancel.assert_not_called()
+    financial_fields = {"items", "taxes", "grand_total", "net_total", "discount_amount",
+                        "selling_price_list", "currency", "customer", "posting_date"}
+    written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+    assert not (written & financial_fields), f"financial fields mutated: {written & financial_fields}"
 
 
 def test_submitted_si_freeze_writes_sync_log_entry(monkeypatch):
@@ -284,31 +304,119 @@ def test_submitted_si_freeze_writes_sync_log_entry(monkeypatch):
     assert frozen_entries[0].get("woo_order_id") == 14763
 
 
-def test_woo_cancellation_of_submitted_si_is_blocked(monkeypatch):
+def test_woo_cancellation_of_submitted_si_is_applied_not_swallowed(monkeypatch):
     """
-    Even when the Woo order status is 'cancelled', a submitted SI must not be
-    cancelled by inbound sync (docstatus remains 1; cancel() is never called).
+    Carve-out 1. A customer cancelling on the website must reach ERPNext. The
+    freeze used to swallow it, which left the revenue standing on our books with
+    nothing to reconcile it against. Policy (pre- vs post-dispatch) belongs to
+    the jarz_pos before_cancel hook, so this path just calls the standard
+    cancel() and reports what happened.
     """
     sync_log_calls, fake_inv = _setup_common_mocks(monkeypatch, si_docstatus=1)
     order = _make_woo_order(woo_id=14763, status="cancelled")
 
     result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
 
-    assert result["status"] == "skipped"
-    assert result["reason"] == "submitted_frozen"
-    assert fake_inv.docstatus == 1, "SI docstatus must remain 1 — cancel() must not have been called"
-    fake_inv.cancel.assert_not_called()
+    assert result["status"] == "cancelled"
+    assert result["reason"] == "woo_terminal_status"
+    assert result["cancellation_type"] == "WooCommerce Cancelled"
+    fake_inv.cancel.assert_called_once()
 
 
-def test_woo_refund_of_submitted_si_is_blocked(monkeypatch):
-    """Refunded Woo status must also be blocked from cancelling a submitted SI."""
+def test_woo_refund_of_submitted_si_is_applied_not_swallowed(monkeypatch):
+    """Refunded is terminal too, and is labelled distinctly for the audit trail."""
     _, fake_inv = _setup_common_mocks(monkeypatch, si_docstatus=1)
     order = _make_woo_order(woo_id=14763, status="refunded")
 
     result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
 
-    assert result["reason"] == "submitted_frozen"
-    fake_inv.cancel.assert_not_called()
+    assert result["status"] == "cancelled"
+    assert result["cancellation_type"] == "WooCommerce Refunded"
+    fake_inv.cancel.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Carve-out 2 — delivery address on an undispatched submitted SI
+# ---------------------------------------------------------------------------
+
+def _address_change_mocks(monkeypatch, *, stored_contact_hash, order):
+    """Submitted SI whose Order Map holds ``stored_contact_hash`` for this order."""
+    _, fake_inv = _setup_common_mocks(
+        monkeypatch,
+        si_docstatus=1,
+        map_hash=order_sync._compute_order_hash(order),
+        map_status="processing",
+        map_contact_hash=stored_contact_hash,
+        map_territory_hash=order_sync._extract_order_territory_snapshot(order).get(
+            "woo_territory_hash"
+        ),
+    )
+    fake_inv.customer_address = "ADDR-OLD"
+    fake_inv.shipping_address_name = "ADDR-OLD"
+    fake_inv.territory = None
+    fake_inv.custom_was_out_for_delivery = 0
+    return fake_inv
+
+
+def test_woo_address_change_repoints_an_undispatched_submitted_si(monkeypatch):
+    """A corrected street address must reach the invoice the rider works from."""
+    order = _make_woo_order(woo_id=14763, status="processing")
+    # Stored hash is from the PREVIOUS address, so Woo genuinely moved.
+    stale = _make_woo_order(woo_id=14763, status="processing")
+    stale["shipping"]["address_1"] = "999 Old Road"
+    fake_inv = _address_change_mocks(
+        monkeypatch,
+        stored_contact_hash=order_sync._extract_order_contact_snapshot(stale)["woo_contact_hash"],
+        order=order,
+    )
+
+    order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+    written = {call.args[0]: call.args[1] for call in fake_inv.db_set.call_args_list}
+    assert written.get("shipping_address_name") == "Shipping-001"
+    assert written.get("customer_address") == "Billing-001"
+
+
+def test_unchanged_woo_address_never_overwrites_an_erpnext_side_correction(monkeypatch):
+    """The regression that makes this whole carve-out safe.
+
+    Correcting an address in the POS edits the Address doc in place, which leaves
+    the Woo payload untouched. If inbound repointed on "invoice disagrees with
+    payload" it would resolve the stale Woo text into a fresh Address and undo
+    that correction on the very next poll — fighting the outbound push carrying
+    it to the store. Woo's own hash is unchanged here, so inbound must not act.
+    """
+    order = _make_woo_order(woo_id=14763, status="processing")
+    fake_inv = _address_change_mocks(
+        monkeypatch,
+        stored_contact_hash=order_sync._extract_order_contact_snapshot(order)["woo_contact_hash"],
+        order=order,
+    )
+
+    order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+    written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+    assert "shipping_address_name" not in written
+    assert "customer_address" not in written
+
+
+def test_address_is_not_repointed_once_out_for_delivery(monkeypatch):
+    """The rider has already left with the old address; re-addressing is worse."""
+    order = _make_woo_order(woo_id=14763, status="processing")
+    stale = _make_woo_order(woo_id=14763, status="processing")
+    stale["shipping"]["address_1"] = "999 Old Road"
+    fake_inv = _address_change_mocks(
+        monkeypatch,
+        stored_contact_hash=order_sync._extract_order_contact_snapshot(stale)["woo_contact_hash"],
+        order=order,
+    )
+    fake_inv.custom_was_out_for_delivery = 1
+
+    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+    assert result["reason"] == "out_for_delivery_locked"
+    written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+    assert "shipping_address_name" not in written
 
 
 # ---------------------------------------------------------------------------

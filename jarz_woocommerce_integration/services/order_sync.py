@@ -713,6 +713,19 @@ def _compose_order_contact_name(address: dict) -> str:
     return _normalize_order_contact_text(address.get("company"))
 
 
+def _compose_order_address_fingerprint(address: dict) -> str:
+    """Street-level fingerprint of one Woo address block.
+
+    Deliberately excludes ``state``: that drives Territory resolution and is
+    already covered by :func:`_compute_territory_hash`, which triggers different
+    downstream work. This covers the part nothing else watched.
+    """
+    return "|".join(
+        _normalize_order_contact_text(address.get(key)).lower()
+        for key in ("address_1", "address_2", "city", "postcode", "country")
+    )
+
+
 def _compute_contact_hash(snapshot: dict[str, Any]) -> str:
     import hashlib
 
@@ -723,6 +736,13 @@ def _compute_contact_hash(snapshot: dict[str, Any]) -> str:
         "woo_order_phone_normalized": snapshot.get("woo_order_phone_normalized") or "",
         "woo_order_email": snapshot.get("woo_order_email") or "",
         "woo_customer_id_snapshot": snapshot.get("woo_customer_id_snapshot") or "",
+        # Street address was watched by nothing: not by _compute_order_hash
+        # (id/total/currency/shipping/lines), not by the territory hash (states
+        # only), and not here. A customer correcting their building number on
+        # the website therefore matched all three hashes and the order was
+        # dropped as "unchanged" before any address code ran.
+        "woo_billing_address_fingerprint": snapshot.get("woo_billing_address_fingerprint") or "",
+        "woo_shipping_address_fingerprint": snapshot.get("woo_shipping_address_fingerprint") or "",
     }
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -751,6 +771,11 @@ def _extract_order_contact_snapshot(order: dict) -> dict[str, Any]:
         "woo_order_phone_normalized": _normalize_order_contact_phone(raw_phone),
         "woo_order_email": _normalize_order_contact_email(billing.get("email") or order.get("customer_email")),
         "woo_customer_id_snapshot": str(customer_id) if customer_id not in (None, "", 0, "0") else "",
+        # Hash inputs only — not in ORDER_CONTACT_SNAPSHOT_FIELDS, so they are
+        # not persisted as columns and need no schema change. The resulting
+        # woo_contact_hash is what gets stored and compared.
+        "woo_billing_address_fingerprint": _compose_order_address_fingerprint(billing),
+        "woo_shipping_address_fingerprint": _compose_order_address_fingerprint(shipping),
     }
     snapshot["woo_contact_hash"] = _compute_contact_hash(snapshot)
     return snapshot
@@ -2304,6 +2329,101 @@ def _apply_noncoupon_woo_discount(inv, order: dict, *, woo_id: int) -> float:
     return discount
 
 
+def _apply_address_change_to_submitted_invoice(
+    inv,
+    *,
+    woo_id: int,
+    billing_addr: str | None,
+    shipping_addr: str | None,
+    resolved_territory: str | None,
+    previous_contact_hash: str = "",
+) -> bool:
+    """Re-point a submitted invoice at the Address that matches the current Woo order.
+
+    ``ensure_customer_with_addresses`` has already resolved (and if necessary
+    created) the Address records for the incoming payload, so by the time we get
+    here the correct records exist — the invoice just still points at the old
+    ones.
+
+    Only the address *links* are touched. Territory is deliberately left alone:
+    moving it would change delivery income on a submitted invoice, which is a GL
+    reposting decision, not something an inbound webhook should make silently.
+    When the territory does shift, the order is flagged for a human instead.
+
+    Callers must have already excluded dispatched (OFD-locked) and terminal
+    orders — re-addressing an order that is already on a rider's route is worse
+    than leaving it alone.
+    """
+    desired_billing = billing_addr or shipping_addr
+    desired_shipping = shipping_addr or billing_addr
+    if not (desired_billing or desired_shipping):
+        return False
+
+    updates: dict[str, Any] = {}
+    if desired_billing and str(inv.get("customer_address") or "") != str(desired_billing):
+        updates["customer_address"] = desired_billing
+    if desired_shipping and str(inv.get("shipping_address_name") or "") != str(desired_shipping):
+        updates["shipping_address_name"] = desired_shipping
+    if not updates:
+        return False
+
+    previous = {
+        "customer_address": inv.get("customer_address"),
+        "shipping_address_name": inv.get("shipping_address_name"),
+    }
+    try:
+        for fieldname, value in updates.items():
+            inv.db_set(fieldname, value, commit=False)
+    except Exception:  # noqa: BLE001
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Woo: failed re-pointing address on submitted invoice {inv.name}",
+        )
+        # The caller already stamped the NEW contact hash onto the Order Map
+        # before reaching here, so leaving it would mark this order "in sync"
+        # with the old address still on the invoice and no later poll would look
+        # again. Roll it back to the previous value rather than blanking it:
+        # old != new is what makes the next sweep retry, whereas a blank hash
+        # reads as "we never knew what Woo had" and is deliberately a no-op.
+        try:
+            map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_id}, "name")
+            if map_name:
+                frappe.db.set_value(
+                    "WooCommerce Order Map",
+                    map_name,
+                    "woo_contact_hash",
+                    previous_contact_hash,
+                    update_modified=False,
+                )
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    create_sync_log_entry(
+        "InboundAddressUpdate",
+        "Success",
+        (
+            f"woo_address_changed: {inv.name} re-pointed "
+            f"{previous} -> {updates} from Woo order {woo_id}"
+        ),
+        woo_order_id=woo_id,
+    )
+
+    invoice_territory = str(inv.get("territory") or "").strip()
+    if resolved_territory and invoice_territory and resolved_territory != invoice_territory:
+        _flag_order_map_for_manual_review(
+            woo_id=woo_id,
+            invoice_name=inv.name,
+            reason=(
+                f"Woo address changed and now resolves to territory "
+                f"{resolved_territory!r}, but the submitted invoice is "
+                f"{invoice_territory!r}. Delivery income was NOT recomputed — "
+                f"review whether this order needs an amendment."
+            ),
+        )
+    return True
+
+
 def _flag_order_map_for_manual_review(*, woo_id: int, invoice_name: str, reason: str) -> None:
     """Set needs_manual_review on the WooCommerce Order Map row for this order."""
     try:
@@ -3046,9 +3166,17 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             # ERPNext is the source of truth from submission onwards; all status/delivery
             # changes flow outbound to Woo via outbound_sync.py hooks.
             if inv.docstatus == 1:
+                previous_contact_hash = str((existing_map or {}).get("woo_contact_hash") or "")
+                target_contact_hash = str(contact_snapshot.get("woo_contact_hash") or "")
+                # "Woo changed it" is only a claim we can make when we know what Woo
+                # held before. A blank stored hash means this order predates contact
+                # snapshotting, so we treat it as unknown and leave the invoice alone
+                # rather than overwriting whatever ERPNext currently has.
+                woo_contact_changed = bool(previous_contact_hash) and (
+                    previous_contact_hash != target_contact_hash
+                )
                 if existing_map and existing_map.get("name"):
-                    existing_contact_hash = str((existing_map or {}).get("woo_contact_hash") or "")
-                    target_contact_hash = str(contact_snapshot.get("woo_contact_hash") or "")
+                    existing_contact_hash = previous_contact_hash
                     existing_territory_hash = str((existing_map or {}).get("woo_territory_hash") or "")
                     target_territory_hash = str(territory_snapshot.get("woo_territory_hash") or "")
                     if (
@@ -3132,6 +3260,31 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                         "woo_order_id": woo_id,
                         "invoice": inv.name,
                     }
+
+                # --- Address correction on a live, undispatched order -----------------
+                # Reached only for invoices that are submitted but not terminal and
+                # not yet out for delivery, so the rider has not left with the old
+                # address. Runs before the item-edit gate below because every one of
+                # that gate's branches returns, and an address fix is worth applying
+                # whether or not the items also changed.
+                #
+                # Gated on woo_contact_changed, NOT on "the invoice disagrees with the
+                # payload". Those are very different claims. The POS can correct an
+                # address in place, which leaves the Woo payload untouched — so an
+                # unconditional repoint would resolve the stale Woo text back into a
+                # fresh Address and overwrite the correction on the very next poll,
+                # fighting the outbound push that carries it to the store. Only a
+                # genuine website-side edit moves this hash.
+                if woo_contact_changed:
+                    _apply_address_change_to_submitted_invoice(
+                        inv,
+                        woo_id=woo_id,
+                        billing_addr=billing_addr,
+                        shipping_addr=shipping_addr,
+                        resolved_territory=territory_snapshot.get("resolved_order_territory") or None,
+                        previous_contact_hash=previous_contact_hash,
+                    )
+
                 # --- Item-edit detection / amendment gate ----------------------------
                 # Compute the hash of the incoming Woo payload and compare it with the
                 # stored hash on the Order Map.  A mismatch means the order was edited

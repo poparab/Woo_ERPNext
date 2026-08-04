@@ -80,7 +80,6 @@ _ORDER_SYNC_META_KEYS_TO_COMPARE = frozenset({
     "Delivery Date",
     "_orddd_time_slot",
     "Time Slot",
-    "unmapped_line_items",
 })
 
 _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
@@ -1056,6 +1055,110 @@ def enqueue_linked_invoice_sync_for_payment_entry(payment_entry: frappe.model.do
         enqueue_invoice_sync(invoice_name, reason=reason)
 
 
+#: Cap the fan-out from one Address edit. A delivery address belongs to a
+#: handful of live orders at most; a number far above that means the address is
+#: shared in a way this push was never meant to cover, so we log rather than
+#: quietly truncate.
+_ADDRESS_INVOICE_FANOUT_LIMIT = 20
+
+
+def _invoice_is_woo_pushable_for_address(invoice_name: str) -> bool:
+    """Whether an address correction is still worth pushing for this invoice."""
+    try:
+        state_field = None
+        meta = frappe.get_meta("Sales Invoice")
+        for candidate in ("custom_sales_invoice_state", "sales_invoice_state"):
+            if meta.get_field(candidate):
+                state_field = candidate
+                break
+        if not state_field:
+            return True
+        state = frappe.db.get_value("Sales Invoice", invoice_name, state_field)
+    except Exception:  # noqa: BLE001
+        return True
+    return _normalize_invoice_state(state) not in {"cancelled", "canceled"}
+
+
+def enqueue_linked_invoice_sync_for_address(
+    address: frappe.model.document.Document,
+    method: str | None = None,
+    *,
+    reason: str = "address_event",
+    force: bool = False,
+) -> None:
+    """Push the Woo *orders* that use an Address when its text is edited.
+
+    Editing an address in place — fixing a building number, a landmark, a phone
+    — changes no field on the Sales Invoice, so ``on_update_after_submit`` never
+    fires and the invoice's own outbound gate never sees anything. The Address
+    hook that already existed only re-pushed the *customer profile*, so the
+    store's copy of the order kept the address the rider had failed to find.
+
+    Only re-pointing an invoice to a different Address record used to reach the
+    order. This closes the far more common case: same record, corrected text.
+    """
+    settings, cfg = _get_settings()
+    if not cfg.enable_order_push and not force:
+        _note_outbound_disabled("enable_outbound_orders")
+        return
+    if _is_outbound_suppressed(address):
+        return
+    if not force and method == "on_update" and not _get_changed_fields(
+        address, _CUSTOMER_ADDRESS_OUTBOUND_UPDATE_FIELDS
+    ):
+        return
+
+    address_name = _get_doc_value(address, "name")
+    if not address_name:
+        return
+
+    invoice_names: list[str] = []
+    for fieldname in ("shipping_address_name", "customer_address"):
+        try:
+            rows = frappe.get_all(
+                "Sales Invoice",
+                filters={
+                    fieldname: address_name,
+                    "docstatus": 1,
+                    "woo_order_id": ("not in", ("", None, 0)),
+                },
+                fields=["name"],
+                limit=_ADDRESS_INVOICE_FANOUT_LIMIT + 1,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        for row in rows or []:
+            name = _get_doc_value(row, "name")
+            if name and name not in invoice_names:
+                invoice_names.append(name)
+
+    if not invoice_names:
+        return
+
+    if len(invoice_names) > _ADDRESS_INVOICE_FANOUT_LIMIT:
+        LOGGER.warning({
+            "event": "woo_outbound_address_fanout_capped",
+            "address": address_name,
+            "matched_invoices": len(invoice_names),
+            "limit": _ADDRESS_INVOICE_FANOUT_LIMIT,
+        })
+        invoice_names = invoice_names[:_ADDRESS_INVOICE_FANOUT_LIMIT]
+
+    for invoice_name in invoice_names:
+        if not _invoice_is_woo_pushable_for_address(invoice_name):
+            continue
+        # Pass the NAME, not the doc: `_should_enqueue_invoice_event` only runs
+        # for a document, and it compares Sales Invoice fields — none of which
+        # moved here, because the change is one level down inside the Address
+        # the payload reads. Passing a string skips that gate for us.
+        #
+        # Deliberately not force=True: force means `now=True`, which would run
+        # the Woo HTTP call synchronously inside the address save. The redundant
+        # PUT it would guard against is already suppressed by
+        # `_order_payload_requires_update` once the store holds the new address.
+        enqueue_invoice_sync(invoice_name, reason=reason)
+
+
 def _mark_invoice_status(invoice_name: str, *, status: str, error: str | None = None) -> None:
     updates = {
         "woo_outbound_status": _normalize_outbound_status(status),
@@ -1608,6 +1711,95 @@ def _recover_amended_invoice_woo_order_id(invoice: frappe.model.document.Documen
         return None
 
 
+def _find_replacement_invoice(invoice_name: str) -> Optional[str]:
+    """The live invoice that amends ``invoice_name``, if one exists.
+
+    ERPNext models an amendment as cancel-then-recreate, so at the moment the
+    source is cancelled the replacement may be a draft (docstatus 0) that the
+    operator is still editing, or already submitted (docstatus 1) if the
+    amendment ran as one automated unit. Both mean the same thing for Woo: the
+    order is not dead, it has moved to another invoice.
+    """
+    if not invoice_name:
+        return None
+    try:
+        rows = frappe.get_all(
+            "Sales Invoice",
+            filters={"amended_from": invoice_name, "docstatus": ("in", (0, 1))},
+            fields=["name"],
+            order_by="creation desc",
+            limit=1,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    return rows[0]["name"] if rows else None
+
+
+def _handover_woo_order_to_replacement(
+    *,
+    woo_order_id: Any,
+    source_invoice: str,
+    replacement_invoice: str,
+) -> None:
+    """Move the Woo order's ERPNext ownership from a cancelled invoice to its amendment.
+
+    Without this the Order Map keeps pointing at a cancelled invoice, and the
+    inbound path treats the order as unmapped and builds a second invoice for it.
+    """
+    if not woo_order_id or not replacement_invoice:
+        return
+
+    try:
+        current = frappe.db.get_value("Sales Invoice", replacement_invoice, "woo_order_id")
+        if str(current or "") != str(woo_order_id):
+            frappe.db.set_value(
+                "Sales Invoice",
+                replacement_invoice,
+                "woo_order_id",
+                cint(woo_order_id),
+                update_modified=False,
+            )
+    except Exception:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_amendment_handover_id_failed",
+            "source_invoice": source_invoice,
+            "replacement_invoice": replacement_invoice,
+            "woo_order_id": woo_order_id,
+        })
+
+    link_field = _resolve_order_map_link_field()
+    try:
+        map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_order_id}, "name")
+        if map_name:
+            frappe.db.set_value(
+                "WooCommerce Order Map",
+                map_name,
+                {
+                    # Clear the hash so the next inbound poll re-evaluates the
+                    # order against the replacement rather than skipping it as
+                    # "unchanged" and leaving the two systems silently apart.
+                    link_field: replacement_invoice,
+                    "hash": "",
+                    "synced_on": now_datetime(),
+                },
+                update_modified=False,
+            )
+    except Exception:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_amendment_handover_map_failed",
+            "source_invoice": source_invoice,
+            "replacement_invoice": replacement_invoice,
+            "woo_order_id": woo_order_id,
+        })
+
+    LOGGER.info({
+        "event": "woo_outbound_amendment_handover",
+        "source_invoice": source_invoice,
+        "replacement_invoice": replacement_invoice,
+        "woo_order_id": woo_order_id,
+    })
+
+
 def _relink_order_map_to_invoice(
     woo_order_id: int | str | None,
     invoice_name: str,
@@ -1696,9 +1888,25 @@ def _consume_matching_existing_line(
     return None
 
 
-def _attach_existing_line_ids(line_items: list[dict], existing_line_items: list[dict]) -> tuple[list[dict], list[dict]]:
+def _attach_existing_line_ids(
+    line_items: list[dict],
+    existing_line_items: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Split the desired lines against what the Woo order already holds.
+
+    Returns ``(matched, added, orphaned)``:
+
+    * ``matched``   — desired lines that map onto an existing Woo line; each
+      carries that line's ``id`` so Woo updates it in place.
+    * ``added``     — desired lines with no counterpart on the order. These are
+      new items and MUST be sent without an ``id`` so Woo appends them. They
+      used to be discarded here, which is why an item added in ERPNext never
+      appeared on the store (Woo order 15808).
+    * ``orphaned``  — existing Woo lines nothing desired maps onto, i.e. items
+      removed in ERPNext. The caller decides which are safe to delete.
+    """
     if not existing_line_items:
-        return line_items, []
+        return line_items, [], []
 
     remaining: list[dict] = []
     for existing in existing_line_items:
@@ -1748,7 +1956,67 @@ def _attach_existing_line_ids(line_items: list[dict], existing_line_items: list[
             mapped.append(entry)
         else:
             unmapped.append(entry)
-    return mapped, unmapped
+    orphaned = [row.get("entry") or {} for row in remaining]
+    return mapped, unmapped, orphaned
+
+
+def _protected_existing_line_ids(
+    invoice: frappe.model.document.Document,
+    existing_order: dict,
+) -> set[int]:
+    """Woo line ids an outbound sync must never delete.
+
+    A registered bundle's parent line exists on the Woo order but is
+    deliberately absent from the ERPNext payload (``_is_bundle_parent_item``
+    skips it, since ERPNext carries the expanded children instead). To the
+    orphan check it therefore looks like a line the user removed — deleting it
+    would strip the bundle from the customer's order.
+
+    Two independent signals mark a parent, and we honour either one:
+    the line is referenced by a sibling's ``_woosb_parent_id``, or its
+    ``product_id`` is registered in Woo Jarz Bundle.
+    """
+    existing_lines = existing_order.get("line_items") or []
+    if not existing_lines:
+        return set()
+
+    parent_product_ids: set[str] = set()
+    for entry in existing_lines:
+        raw = _extract_meta_value(entry, "_woosb_parent_id")
+        if raw:
+            parent_product_ids.add(str(raw).strip())
+    parent_product_ids |= _get_registered_bundle_product_ids(invoice)
+
+    if not parent_product_ids:
+        return set()
+
+    protected: set[int] = set()
+    for entry in existing_lines:
+        product_id = cint(entry.get("product_id") or 0)
+        line_id = cint(entry.get("id") or 0)
+        if product_id and line_id and str(product_id) in parent_product_ids:
+            protected.add(line_id)
+    return protected
+
+
+def _build_line_item_removals(
+    orphaned: list[dict],
+    *,
+    protected_ids: set[int],
+) -> list[dict]:
+    """Turn orphaned Woo lines into deletion instructions.
+
+    WooCommerce removes a line item when the PUT sends it with an integer
+    ``quantity`` of 0 (its check is a strict ``0 === $item['quantity']``, so the
+    value must not be a string).
+    """
+    removals: list[dict] = []
+    for entry in orphaned:
+        line_id = cint((entry or {}).get("id") or 0)
+        if not line_id or line_id in protected_ids:
+            continue
+        removals.append({"id": line_id, "quantity": 0})
+    return removals
 
 
 def _meta_entries_to_map(entries: list[dict] | None) -> dict[str, Any]:
@@ -1859,10 +2127,18 @@ def _build_order_payload(
 ) -> dict:
     line_items, missing_products = _collect_line_items(invoice)
     payload_line_items = list(line_items)
-    unmapped_line_items: list[dict] = []
+    added_line_items: list[dict] = []
+    removed_line_items: list[dict] = []
     if existing_order:
-        matched, unmapped_line_items = _attach_existing_line_ids(line_items, existing_order.get("line_items") or [])
-        payload_line_items = matched
+        matched, added_line_items, orphaned = _attach_existing_line_ids(
+            line_items, existing_order.get("line_items") or []
+        )
+        removed_line_items = _build_line_item_removals(
+            orphaned,
+            protected_ids=_protected_existing_line_ids(invoice, existing_order),
+        )
+        # Order matters only for readability; Woo applies each entry by id.
+        payload_line_items = matched + added_line_items + removed_line_items
 
     if not payload_line_items and not existing_order:
         raise ValueError("No line items available for Woo order payload")
@@ -2001,13 +2277,18 @@ def _build_order_payload(
         raise MissingWooProductError(
             "Missing WooCommerce product mapping for items: " + ", ".join(missing_products)
         )
-    if existing_order and unmapped_line_items:
-        codes = [(_extract_item_code(entry) or entry.get("name") or "unknown") for entry in unmapped_line_items]
-        payload.setdefault("meta_data", []).append({"key": "unmapped_line_items", "value": ",".join(codes)})
-        LOGGER.warning({
-            "event": "woo_outbound_unmapped_line_items",
+    if existing_order and (added_line_items or removed_line_items):
+        # Not a warning any more: these lines are now carried in the payload
+        # rather than silently dropped. Logged so an unexpected churn of
+        # add/remove on an order is still traceable after the fact.
+        LOGGER.info({
+            "event": "woo_outbound_line_items_changed",
             "invoice": invoice.name,
-            "unmatched": codes,
+            "added": [
+                (_extract_item_code(entry) or entry.get("name") or "unknown")
+                for entry in added_line_items
+            ],
+            "removed_line_ids": [entry["id"] for entry in removed_line_items],
         })
 
     if not payload.get("line_items"):
@@ -2148,6 +2429,34 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
 
     _woo_id = invoice.get("woo_order_id") or _recover_amended_invoice_woo_order_id(invoice)
     order_map_exists = bool(_woo_id and frappe.db.exists("WooCommerce Order Map", {"woo_order_id": _woo_id}))
+
+    # An amendment is not a cancellation. ERPNext expresses "change a submitted
+    # invoice" as cancel-then-recreate, and the cancel half fires this hook with
+    # cancel=True — which would tell the store the customer's order is dead,
+    # moments before the replacement pushes it back to processing. Whichever of
+    # the two lands last wins, so the store's status was a coin flip.
+    #
+    # The POS amendment sidesteps this by setting flags.ignore_woo_outbound on
+    # the source, but a plain Desk cancel+amend does not, and neither path moved
+    # the Order Map onto the replacement. Resolve it here instead, at the point
+    # where the replacement is actually observable: if one exists, hand the Woo
+    # order over to it and stand down. If the invoice was genuinely just
+    # cancelled, no replacement exists and the cancel proceeds as before.
+    if cancel or invoice.docstatus == 2:
+        replacement_invoice = _find_replacement_invoice(invoice_name)
+        if replacement_invoice:
+            _handover_woo_order_to_replacement(
+                woo_order_id=_woo_id,
+                source_invoice=invoice_name,
+                replacement_invoice=replacement_invoice,
+            )
+            _mark_invoice_status(invoice_name, status="Skipped")
+            return {
+                "skipped": True,
+                "reason": "amended_replacement_owns_order",
+                "woo_order_id": _woo_id,
+                "replacement_invoice": replacement_invoice,
+            }
 
     if invoice.docstatus == 0 and not cancel:
         return {"skipped": True, "reason": "draft"}

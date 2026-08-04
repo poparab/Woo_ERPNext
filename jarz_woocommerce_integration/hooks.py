@@ -154,7 +154,13 @@ doc_events = {
 	},
 	"Address": {
 		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
-		"on_update": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
+		"on_update": [
+			"jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
+			# Editing an address in place touches no Sales Invoice field, so the
+			# invoice's own outbound hook never fires and the Woo *order* keeps
+			# the stale address. Only a new Address record is not enough.
+			"jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_invoice_sync_for_address",
+		],
 	},
 	"Sales Invoice": {
 		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",

@@ -1,5 +1,9 @@
 from types import SimpleNamespace
 import unittest
+# Explicit: this module uses unittest.mock throughout, which is NOT pulled in by
+# `import unittest` alone. It only ever worked because another test module
+# imported it first, making the suite order-dependent.
+import unittest.mock
 
 from jarz_woocommerce_integration.services import order_sync, outbound_sync
 
@@ -1202,7 +1206,7 @@ class TestOutboundStatusSync(unittest.TestCase):
             with self.subTest(status=status):
                 self.assertEqual(order_sync._map_status(status), expected)
 
-    def test_build_order_payload_allows_status_only_update_when_existing_line_items_do_not_match(self):
+    def test_build_order_payload_adds_and_removes_line_items_when_existing_do_not_match(self):
         invoice = DummyInvoice(sales_invoice_state="Delivered")
         cfg = outbound_sync.OutboundConfig(
             enable_customer_push=True,
@@ -1248,8 +1252,27 @@ class TestOutboundStatusSync(unittest.TestCase):
             payload = outbound_sync._build_order_payload(invoice, cfg, existing_order=existing_order)
 
         self.assertEqual(payload["status"], "completed")
-        self.assertNotIn("line_items", payload)
-        self.assertIn({"key": "unmapped_line_items", "value": "ITEM-001"}, payload["meta_data"])
+
+        # ERPNext is authoritative for the line set once the invoice is submitted.
+        # A desired line with no counterpart on the order is a NEW item and must be
+        # sent without an id so Woo appends it; the order's leftover line is one
+        # ERPNext no longer carries and is removed with an integer quantity of 0.
+        # Dropping either (the old behaviour) is what stopped items added in
+        # ERPNext from ever reaching the store.
+        line_items = payload["line_items"]
+        self.assertEqual(len(line_items), 2)
+
+        added = next(entry for entry in line_items if entry.get("product_id") == 101)
+        self.assertNotIn("id", added)
+
+        removal = next(entry for entry in line_items if entry.get("id") == 55)
+        self.assertEqual(removal["quantity"], 0)
+        self.assertIsInstance(removal["quantity"], int)
+
+        self.assertNotIn(
+            "unmapped_line_items",
+            {meta.get("key") for meta in payload["meta_data"]},
+        )
 
     def test_attach_existing_line_ids_reuses_remaining_bundle_child_slot_for_amended_swap(self):
         desired_line_items = [
@@ -1351,9 +1374,12 @@ class TestOutboundStatusSync(unittest.TestCase):
             },
         ]
 
-        matched, unmapped = outbound_sync._attach_existing_line_ids(desired_line_items, existing_line_items)
+        matched, added, orphaned = outbound_sync._attach_existing_line_ids(
+            desired_line_items, existing_line_items
+        )
 
-        self.assertEqual(unmapped, [])
+        self.assertEqual(added, [])
+        self.assertEqual(orphaned, [])
         self.assertEqual(len(matched), 5)
         lotus_entry = next(
             entry
