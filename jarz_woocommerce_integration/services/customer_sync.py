@@ -12,6 +12,13 @@ from frappe.utils import get_datetime  # type: ignore[import]
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
 )
+from jarz_woocommerce_integration.services.geo_passthrough import (
+    GEO_SOURCE_CUSTOMER_PIN,
+    GeoPin,
+    apply_geo_pin as _apply_geo_pin,
+    extract_address_pin as _extract_address_geo_pin,
+    resolve_order_pins as _resolve_order_geo_pins,
+)
 from jarz_woocommerce_integration.utils.customer_woo_id import (
     find_customer_by_woo_id,
     get_legacy_customer_woo_id,
@@ -674,6 +681,42 @@ def _set_address_as_default(address_name: str, customer: str, address_type: str)
         frappe.logger().warning(f"Failed to set address {address_name} as default: {e}")
 
 
+def _apply_customer_pin(address_name: Optional[str], pin: Optional[GeoPin]) -> bool:
+    """Stamp a customer-supplied map pin on an Address (courier lane O1).
+
+    Writes ``custom_*`` geo fields only -- never ``address_line1``,
+    ``address_line2``, ``city``, ``state``, ``pincode``, ``country``, ``phone``,
+    ``email_id``, ``address_type`` or ``is_shipping_address``.  Two reasons, both
+    load-bearing:
+
+    1. The first six of those *are* the address dedup signature
+       (``_address_signature_parts``).  Touching one forks a duplicate Address
+       for the customer on the next sync instead of matching the existing row.
+    2. All ten are ``outbound_sync._CUSTOMER_ADDRESS_OUTBOUND_UPDATE_FIELDS``,
+       the gate on the Woo outbound Address hooks.  A geo-only write therefore
+       fans out nothing; bundling a text edit into the same save would push a
+       customer + invoice sync to WooCommerce per address.
+
+    Never raises -- a pin is a nice-to-have, an order is not.  The failure is
+    logged rather than swallowed silently: a geo write that quietly stops
+    happening looks exactly like "no customer ever sent a pin".
+    """
+    if not address_name or pin is None:
+        return False
+    try:
+        return _apply_geo_pin(
+            address_name,
+            pin.latitude,
+            pin.longitude,
+            GEO_SOURCE_CUSTOMER_PIN,
+        )
+    except Exception as exc:  # noqa: BLE001
+        frappe.logger("woo").warning(
+            f"geo_pin_failed address={address_name} error={exc}"
+        )
+        return False
+
+
 def _resolve_country(raw: str | None) -> Optional[str]:
     if not raw:
         return None
@@ -992,6 +1035,11 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     # Check if billing and shipping are the same physical address
     same_address = _same_source_address(billing, shipping)
 
+    # Courier lane O1 — customer-supplied map pin. Resolved once, up front, so
+    # both address branches below stamp the same values. See
+    # geo_passthrough.resolve_order_pins for the billing/shipping routing rule.
+    billing_pin, shipping_pin = _resolve_order_geo_pins(order)
+
     # Ensure billing address if present
     if _has_usable_source_address(billing):
         existing = _find_existing_address_for_customer(customer, "Billing", billing, address_cache=address_cache)
@@ -999,6 +1047,11 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
         # Set as default billing address for this customer
         if billing_addr_name:
             _set_address_as_default(billing_addr_name, customer, "Billing")
+            # BOTH branches of `existing or _create_address(...)` land here on
+            # purpose: the expression short-circuits, so a create-only pin write
+            # would silently never update a returning customer — which is most
+            # customers.
+            _apply_customer_pin(billing_addr_name, billing_pin)
             # Cache newly created address too
             if address_cache is not None and not existing:
                 address_cache[(customer, _source_address_signature(billing))] = billing_addr_name
@@ -1007,6 +1060,9 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
         # Reuse billing address for shipping — same physical address
         shipping_addr_name = billing_addr_name
         _set_address_as_default(billing_addr_name, customer, "Shipping")
+        # Same record as billing: equal rank is accepted, so the order-level pin
+        # applied here is the one that ends up stored.
+        _apply_customer_pin(shipping_addr_name, shipping_pin)
     elif _has_usable_source_address(shipping):
         # Different address — create/find shipping separately
         existing = _find_existing_address_for_customer(customer, "Shipping", shipping, address_cache=address_cache)
@@ -1014,6 +1070,8 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
         # Set as default shipping address for this customer
         if shipping_addr_name:
             _set_address_as_default(shipping_addr_name, customer, "Shipping")
+            # Created *and* matched-existing both reach this line.
+            _apply_customer_pin(shipping_addr_name, shipping_pin)
             # Cache newly created address too
             if address_cache is not None and not existing:
                 address_cache[(customer, _source_address_signature(shipping))] = shipping_addr_name
@@ -1114,16 +1172,21 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
     def _upsert_address(kind: str, data: dict) -> Optional[str]:
         if not _has_usable_source_address(data):
             return None
+        # Courier lane O1: a Woo customer record carries no order-level pin, but
+        # its address lines can still hold a Maps link the customer typed.
+        pin = _extract_address_geo_pin(data)
         existing = _find_existing_address_for_customer(customer_name, kind, data)
         if existing:
             # Set existing address as default
             _set_address_as_default(existing, customer_name, kind)
+            _apply_customer_pin(existing, pin)
             return existing
         # Create new address
         new_addr = _create_address(customer_name, kind, data, data.get("phone"), email)
         if new_addr:
             # Set newly created address as default
             _set_address_as_default(new_addr, customer_name, kind)
+            _apply_customer_pin(new_addr, pin)
         return new_addr
 
     same_address = _same_source_address(billing, shipping)
