@@ -529,13 +529,22 @@ def apply_geo_pin(
         updates[GEO_ACCURACY_FIELD] = round(accuracy, 2)
     elif not coordinates_match:
         # Contract section 3: any write that moves the coordinates must write the
-        # new accuracy, or explicitly NULL it when the incoming source carries
-        # none. WooCommerce pins never carry one. Leaving the previous value
-        # would leave a radius describing a point that is no longer there, which
+        # new accuracy, or clear it when the incoming source carries none.
+        # WooCommerce pins never carry one. Leaving the previous value would
+        # leave a radius describing a point that is no longer there, which
         # silently corrupts the downstream consensus-hardening job. Accuracy is
         # only meaningful paired with the coordinates it was measured for, so it
         # is preserved when the pin has not actually moved.
-        updates[GEO_ACCURACY_FIELD] = None
+        #
+        # Cleared to 0, NOT None. Frappe creates Float columns as NOT NULL
+        # DEFAULT 0, so None raises (1048) "Column 'custom_geo_accuracy_m' cannot
+        # be null" and takes the entire pin write with it. Since a Woo pin never
+        # has an accuracy, that would have failed EVERY passthrough write —
+        # caught on staging only because a live column rejected it; a mocked
+        # frappe.db.set_value accepts None happily.
+        #
+        # 0 means "no accuracy reported", not "accurate to 0 m".
+        updates[GEO_ACCURACY_FIELD] = 0.0
 
     # Structural belt-and-braces: nothing outside the geo allow-list can reach
     # the DB from here, so no text field can ever join the same write and wake
