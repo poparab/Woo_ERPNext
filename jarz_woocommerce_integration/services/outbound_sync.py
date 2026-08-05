@@ -255,6 +255,114 @@ def _normalize_woo_address_lines(address_line1: str | None, address_line2: str |
     return line1, line2
 
 
+_TERRITORY_ZONE_LOOKUP_FIELDS = ("custom_woo_code", "woo_code", "custom_territory_name_ar")
+
+
+def _territory_has_column(fieldname: str) -> bool:
+    try:
+        return bool(frappe.db.has_column("Territory", fieldname))
+    except Exception:
+        return False
+
+
+def _resolve_leaf_territory(value: Any) -> str | None:
+    """Resolve a city/state label to a Territory, ignoring group territories.
+
+    Delivery zones are always leaves, so requiring ``is_group = 0`` keeps a
+    free-text WooCommerce city like "Cairo" from matching the governorate group
+    and overwriting a perfectly good zone.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    from jarz_woocommerce_integration.services.customer_sync import _resolve_territory_from_state
+
+    try:
+        territory = _resolve_territory_from_state(text)
+    except Exception:
+        return None
+    if not territory:
+        return None
+
+    try:
+        if cint(frappe.db.get_value("Territory", territory, "is_group")):
+            return None
+    except Exception:
+        return None
+    return territory
+
+
+def _territory_woo_zone_label(territory: str | None) -> str:
+    """Return the delivery-zone string WooCommerce keeps in an address ``state``."""
+    territory = str(territory or "").strip()
+    if not territory:
+        return ""
+
+    from jarz_woocommerce_integration.services.territory_sync import CODE_TO_DISPLAY
+
+    fields = ["territory_name"] + [
+        fieldname for fieldname in _TERRITORY_ZONE_LOOKUP_FIELDS if _territory_has_column(fieldname)
+    ]
+    try:
+        row = frappe.db.get_value("Territory", territory, fields, as_dict=True) or {}
+    except Exception:
+        row = {}
+
+    for code in (row.get("custom_woo_code"), row.get("woo_code"), territory):
+        display = CODE_TO_DISPLAY.get(str(code or "").strip())
+        if display:
+            return display
+
+    english = str(row.get("territory_name") or "").strip()
+    arabic = str(row.get("custom_territory_name_ar") or "").strip()
+    if english and arabic and english != arabic:
+        return f"{english} - {arabic}"
+    return english or arabic or ""
+
+
+def _realign_address_state_with_territory(address_name: str | None, city: Any, state: Any) -> str:
+    """Return the ``state`` to push, realigned with the address's territory.
+
+    A territory change made in ERPNext is recorded by writing the Territory into
+    ``Address.city``; ``Address.state`` keeps whatever delivery zone WooCommerce
+    sent first. Pushing both verbatim left the store showing the new zone in
+    ``city`` and the stale one in ``state`` — and the store bills shipping off
+    ``state``.
+
+    The realigned value is written back to the Address too: inbound order
+    matching hashes city + state, so a stored value that disagrees with the
+    store's would fork a duplicate Address on the next pull.
+    """
+    territory = _resolve_leaf_territory(city)
+    if not territory:
+        return str(state or "")
+
+    label = _territory_woo_zone_label(territory)
+    current = str(state or "")
+    if not label or label == current:
+        return current
+
+    if address_name:
+        try:
+            frappe.db.set_value("Address", address_name, "state", label, update_modified=False)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning({
+                "event": "woo_outbound_address_state_writeback_failed",
+                "address": address_name,
+                "territory": territory,
+                "error": str(exc),
+            })
+    LOGGER.info({
+        "event": "woo_outbound_address_state_realigned",
+        "address": address_name,
+        "territory": territory,
+        "previous_state": current,
+        "state": label,
+    })
+    return label
+
+
 def _get_address_payload(address_name: str | None, *, fallback_name: str, phone: str | None, email: str | None) -> dict:
     if not address_name:
         return {}
@@ -273,6 +381,11 @@ def _get_address_payload(address_name: str | None, *, fallback_name: str, phone:
         return {}
     line1, line2 = _normalize_woo_address_lines(address.get("address_line1"), address.get("address_line2"))
     first, last = _split_contact_name(fallback_name)
+    state = _realign_address_state_with_territory(
+        address_name,
+        address.get("city"),
+        address.get("state"),
+    )
     return {
         "first_name": first,
         "last_name": last,
@@ -280,7 +393,7 @@ def _get_address_payload(address_name: str | None, *, fallback_name: str, phone:
         "address_1": line1,
         "address_2": line2,
         "city": address.get("city") or "",
-        "state": address.get("state") or "",
+        "state": state,
         "postcode": address.get("pincode") or "",
         "country": address.get("country") or "",
         "phone": address.get("phone") or phone or "",
@@ -329,7 +442,7 @@ def _get_any_address_for_customer(customer_name: str) -> dict:
             "address_1": line1,
             "address_2": line2,
             "city": addr.city or "",
-            "state": addr.state or "",
+            "state": _realign_address_state_with_territory(addr.name, addr.city, addr.state),
             "postcode": addr.pincode or "",
             "country": addr.country or "",
             "phone": addr.phone or "",
@@ -2065,6 +2178,27 @@ def _normalize_order_shipping_lines(entries: list[dict] | None) -> list[tuple[st
     return sorted(normalized)
 
 
+_ORDER_ADDRESS_COMPARE_KEYS = ("address_1", "address_2", "city", "state", "postcode")
+
+
+def _normalize_order_address(address: dict | None) -> tuple[str, ...]:
+    address = address or {}
+    return tuple(str(address.get(key) or "").strip().casefold() for key in _ORDER_ADDRESS_COMPARE_KEYS)
+
+
+def _order_address_requires_update(existing: dict | None, desired: dict | None) -> bool:
+    """Whether the store's copy of an order address still matches ours.
+
+    ``country`` is deliberately not compared: WooCommerce answers with the ISO
+    code ("EG") while ERPNext stores the country name ("Egypt"), so comparing it
+    would mark every order dirty forever.
+    """
+    desired = desired or {}
+    if not str(desired.get("address_1") or "").strip():
+        return False
+    return _normalize_order_address(desired) != _normalize_order_address(existing)
+
+
 def _order_payload_requires_update(existing_order: dict, payload: dict) -> bool:
     current_status = str(existing_order.get("status") or "").strip().lower()
     desired_status = str(payload.get("status") or "").strip().lower()
@@ -2113,6 +2247,12 @@ def _order_payload_requires_update(existing_order: dict, payload: dict) -> bool:
     if payload_shipping_lines:
         existing_shipping_lines = existing_order.get("shipping_lines") or []
         if _normalize_order_shipping_lines(payload_shipping_lines) != _normalize_order_shipping_lines(existing_shipping_lines):
+            return True
+
+    # An address edit is often the only thing that changed — without this the
+    # order was dropped as "unchanged" and the store kept the old delivery zone.
+    for scope in ("billing", "shipping"):
+        if _order_address_requires_update(existing_order.get(scope), payload.get(scope)):
             return True
 
     return False
