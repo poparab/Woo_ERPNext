@@ -170,6 +170,11 @@ doc_events = {
 	"Payment Entry": {
 		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_invoice_sync_for_payment_entry",
 	},
+	# Owned by jarz_pos. Referenced by name only — no import, and the hook is
+	# inert on any bench where that app is absent.
+	"Jarz Invoice Note": {
+		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_note_sync",
+	},
 }
 
 # Scheduled Tasks

@@ -1,3 +1,4 @@
+from datetime import timedelta
 from types import SimpleNamespace
 import unittest
 # Explicit: this module uses unittest.mock throughout, which is NOT pulled in by
@@ -1402,9 +1403,32 @@ class TestOutboundStatusSync(unittest.TestCase):
         metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
 
         self.assertEqual(metadata["_orddd_timestamp"], "1777680000")
-        self.assertEqual(metadata["Delivery Date"], "Saturday, May 02, 2026")
+        # Matches the shape ORDDD writes on a Woo-native checkout ("4 August, 2026"),
+        # not the "%A, %B %d, %Y" the outbound push used to invent.
+        self.assertEqual(metadata["Delivery Date"], "2 May, 2026")
+        self.assertEqual(metadata["_orddd_delivery_date"], "2 May, 2026")
         self.assertEqual(metadata["_orddd_time_slot"], "19:00 - 20:30")
         self.assertEqual(metadata["Time Slot"], "19:00 - 20:30")
+        self.assertEqual(metadata["_orddd_timeslot_timestamp"], "1777748400")
+        self.assertEqual(metadata["_orddd_delivery_date_label"], "Delivery Date")
+        self.assertEqual(metadata["_orddd_time_slot_label"], "Time Slot")
+
+    def test_build_order_payload_reads_time_field_returned_as_timedelta(self):
+        """Frappe hands a `Time` column back as a timedelta since midnight.
+
+        That type used to fall through the coercer and return None, so every POS
+        order reached WooCommerce with a delivery date but no time slot at all.
+        """
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.custom_delivery_date = "2026-05-02"
+        invoice.custom_delivery_time_from = timedelta(seconds=82800)  # 23:00
+        invoice.custom_delivery_duration = 5400.0
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["_orddd_time_slot"], "23:00 - 00:30")
+        self.assertEqual(metadata["Time Slot"], "23:00 - 00:30")
 
     def test_build_order_payload_formats_delivery_slot_from_two_hour_duration(self):
         invoice = DummyInvoice(sales_invoice_state="Delivered")

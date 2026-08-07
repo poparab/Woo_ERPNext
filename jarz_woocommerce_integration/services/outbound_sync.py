@@ -79,6 +79,7 @@ _ORDER_SYNC_META_KEYS_TO_COMPARE = frozenset({
     "_orddd_delivery_date",
     "Delivery Date",
     "_orddd_time_slot",
+    "_orddd_timeslot_timestamp",
     "Time Slot",
 })
 
@@ -1153,6 +1154,92 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
         reason=reason,
         cancel=cancel,
     )
+
+
+#: The POS keeps its order notes in a DocType owned by jarz_pos. This app never
+#: imports that app — it listens for the doc event by name only, so the hook is
+#: simply inert wherever jarz_pos is not installed.
+_INVOICE_NOTE_DOCTYPE = "Jarz Invoice Note"
+
+
+def _resolve_note_woo_order_id(invoice_name: str) -> str:
+    woo_order_id = str(frappe.db.get_value("Sales Invoice", invoice_name, "woo_order_id") or "").strip()
+    return "" if woo_order_id in ("", "0") else woo_order_id
+
+
+def enqueue_invoice_note_sync(note: frappe.model.document.Document, method: str | None = None) -> None:
+    """Push a POS order note out to the linked WooCommerce order."""
+    settings, cfg = _get_settings()
+    if not cfg.enable_order_push:
+        _note_outbound_disabled("enable_outbound_orders")
+        return
+    if _is_outbound_suppressed(note):
+        return
+
+    note_text = str(getattr(note, "note", "") or "").strip()
+    invoice_name = str(getattr(note, "sales_invoice", "") or "").strip()
+    if not note_text or not invoice_name:
+        return
+    if not _resolve_note_woo_order_id(invoice_name):
+        return
+
+    frappe.enqueue(
+        "jarz_woocommerce_integration.services.outbound_sync.sync_invoice_note",
+        queue="short",
+        timeout=300,
+        enqueue_after_commit=True,
+        note_name=note.name,
+    )
+
+
+def sync_invoice_note(note_name: str) -> dict:
+    """Post one POS order note to its Woo order as a private order note."""
+    settings, cfg = _get_settings()
+    if not cfg.enable_order_push:
+        return {"status": "skipped", "reason": "outbound_disabled"}
+
+    try:
+        note = frappe.get_doc(_INVOICE_NOTE_DOCTYPE, note_name)
+    except frappe.DoesNotExistError:
+        return {"status": "skipped", "reason": "note_missing"}
+
+    note_text = str(getattr(note, "note", "") or "").strip()
+    invoice_name = str(getattr(note, "sales_invoice", "") or "").strip()
+    if not note_text or not invoice_name:
+        return {"status": "skipped", "reason": "empty_note"}
+
+    woo_order_id = _resolve_note_woo_order_id(invoice_name)
+    if not woo_order_id:
+        return {"status": "skipped", "reason": "no_woo_order"}
+
+    author = str(getattr(note, "added_by_full_name", "") or "").strip()
+    body = f"{note_text}\n\n— {author} (Jarz POS)" if author else f"{note_text}\n\n— Jarz POS"
+
+    try:
+        client = _build_client(settings)
+    except ValueError:
+        return {"status": "skipped", "reason": "missing_credentials"}
+
+    try:
+        client.post(f"orders/{woo_order_id}/notes", {"note": body, "customer_note": False})
+    except WooAPIError as exc:
+        LOGGER.error({
+            "event": "woo_outbound_note_error",
+            "note": note_name,
+            "invoice": invoice_name,
+            "woo_order_id": woo_order_id,
+            "status_code": exc.status_code,
+            "message": exc.message,
+        })
+        return {"status": "error", "detail": exc.message}
+
+    LOGGER.info({
+        "event": "woo_outbound_note_synced",
+        "note": note_name,
+        "invoice": invoice_name,
+        "woo_order_id": woo_order_id,
+    })
+    return {"status": "synced", "woo_order_id": woo_order_id, "note": note_name}
 
 
 def enqueue_linked_invoice_sync_for_payment_entry(payment_entry: frappe.model.document.Document, method: str | None = None) -> None:
@@ -2465,6 +2552,12 @@ def _coerce_delivery_time(raw: Any) -> dt_time | None:
         return raw.time().replace(microsecond=0)
     if isinstance(raw, dt_time):
         return raw.replace(microsecond=0)
+    # Frappe hands back a `Time` column as a timedelta since midnight, not a
+    # datetime.time. Without this branch every POS order reached Woo with a
+    # delivery date but no time slot.
+    if isinstance(raw, timedelta):
+        seconds = int(raw.total_seconds()) % 86400
+        return dt_time(seconds // 3600, (seconds % 3600) // 60, seconds % 60)
     if isinstance(raw, str):
         value = raw.strip()
         for fmt in ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M"):
@@ -2507,11 +2600,19 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
     if not delivery_date:
         return []
 
-    formatted_date = delivery_date.strftime("%A, %B %d, %Y")
+    # Mirror the shape the ORDDD plugin itself writes on a Woo-native checkout,
+    # e.g. "4 August, 2026" — not "%A, %B %d, %Y". The plugin reads these keys
+    # back when it renders/edits the slot in the order screen.
+    formatted_date = f"{delivery_date.day} {delivery_date.strftime('%B')}, {delivery_date.year}"
     midnight_timestamp = calendar.timegm(datetime.combine(delivery_date, dt_time(0, 0)).timetuple())
     metadata = [
         {"key": "_orddd_timestamp", "value": str(midnight_timestamp)},
         {"key": "_orddd_delivery_date", "value": formatted_date},
+        {"key": "_orddd_delivery_date_label", "value": "Delivery Date"},
+        {"key": "_orddd_delivery_date_meta_id", "value": "0"},
+        {"key": "_orddd_delivery_schedule_id", "value": "0"},
+        {"key": "_orddd_vendor_id", "value": [0]},
+        {"key": "_total_delivery_charges", "value": "0"},
         {"key": "Delivery Date", "value": formatted_date},
     ]
 
@@ -2527,11 +2628,18 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
             getattr(invoice, "custom_delivery_time", None) or getattr(invoice, "delivery_time", None)
         )
         if legacy_delivery_time:
+            delivery_time_from = legacy_delivery_time
             time_slot_label = legacy_delivery_time.strftime("%H:%M")
 
     if time_slot_label:
+        slot_start_timestamp = midnight_timestamp + (
+            delivery_time_from.hour * 3600 + delivery_time_from.minute * 60 + delivery_time_from.second
+        )
         metadata.extend([
             {"key": "_orddd_time_slot", "value": time_slot_label},
+            {"key": "_orddd_time_slot_label", "value": "Time Slot"},
+            {"key": "_orddd_time_slot_meta_id", "value": "0"},
+            {"key": "_orddd_timeslot_timestamp", "value": str(slot_start_timestamp)},
             {"key": "Time Slot", "value": time_slot_label},
         ])
 
