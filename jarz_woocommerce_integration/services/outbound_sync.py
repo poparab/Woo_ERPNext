@@ -1220,6 +1220,15 @@ def sync_invoice_note(note_name: str) -> dict:
     except ValueError:
         return {"status": "skipped", "reason": "missing_credentials"}
 
+    # A queued job can be retried, and Woo has no natural key for a note, so an
+    # unguarded post shows the same message twice in the order screen.
+    try:
+        for existing in client.get(f"orders/{woo_order_id}/notes") or []:
+            if str(existing.get("note") or "").strip() == body.strip():
+                return {"status": "skipped", "reason": "already_posted", "woo_order_id": woo_order_id}
+    except WooAPIError:
+        pass  # a failed pre-check must not stop the note itself
+
     try:
         client.post(f"orders/{woo_order_id}/notes", {"note": body, "customer_note": False})
     except WooAPIError as exc:
