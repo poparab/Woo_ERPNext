@@ -27,6 +27,7 @@ from jarz_woocommerce_integration.utils.customer_woo_id import (
     has_unmigrated_legacy_customer_woo_id,
     set_customer_woo_id,
 )
+from jarz_woocommerce_integration.services import tracking_link
 from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient
 
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
@@ -81,6 +82,13 @@ _ORDER_SYNC_META_KEYS_TO_COMPARE = frozenset({
     "_orddd_time_slot",
     "_orddd_timeslot_timestamp",
     "Time Slot",
+    # The customer tracking link. Compared so that minting a token on an
+    # already-synced order still produces a PUT -- without this the order would
+    # be dropped as "unchanged" and the customer would never get a Track button.
+    # Safe for the historical backlog: the keys are only compared when the
+    # *payload* carries them, and it only carries them for invoices that
+    # actually have a token, so nothing old is marked dirty.
+    *tracking_link.TRACKING_META_KEYS,
 })
 
 _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
@@ -101,6 +109,11 @@ _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
     "custom_delivery_time",
     "delivery_time",
     "woo_order_id",
+    # Minting the tracking token is often the *only* change on an
+    # already-submitted invoice, and it happens after submit. Without these the
+    # hook would classify it as "nothing outbound changed" and the store would
+    # never receive the link.
+    *tracking_link.INVOICE_TRACKING_FIELDS,
 })
 
 _INVOICE_OUTBOUND_DELIVERY_FIELDS = frozenset({
@@ -121,6 +134,7 @@ _INVOICE_OUTBOUND_PAYLOAD_FIELDS = frozenset({
     "customer_address",
     "shipping_address_name",
     "woo_order_id",
+    *tracking_link.INVOICE_TRACKING_FIELDS,
 })
 
 _APPROVED_INVOICE_OUTBOUND_STATUSES = frozenset({
@@ -1705,6 +1719,59 @@ def _normalize_invoice_state(raw_state: Any) -> str:
     return re.sub(r"[\s_]+", "-", str(raw_state or "").strip().lower())
 
 
+# ---------------------------------------------------------------------------
+# WooCommerce order statuses this app may emit
+# ---------------------------------------------------------------------------
+#: ``out-for-delivery`` is a *custom* status registered by the companion
+#: WordPress plugin (``jarz_woo_plugin``) via ``register_post_status`` + the
+#: ``wc_order_statuses`` filter. PUTting it to a store where that plugin is not
+#: active is rejected/ignored by WooCommerce, and ``sync_sales_invoice`` already
+#: catches that: it compares the status in the response against the one it sent
+#: and marks the invoice Error on a mismatch rather than claiming Synced.
+WOO_STATUS_PROCESSING = "processing"
+WOO_STATUS_OUT_FOR_DELIVERY = "out-for-delivery"
+WOO_STATUS_COMPLETED = "completed"
+WOO_STATUS_CANCELLED = "cancelled"
+
+#: Registered by the plugin so a human can set it in wp-admin, but **never
+#: emitted from here**. See ``_determine_status``.
+WOO_STATUS_DELIVERY_FAILED = "delivery-failed"
+
+#: Statuses the customer reads as "this order is over". Nothing about a failed
+#: delivery attempt may produce one of these.
+_TERMINAL_WOO_STATUSES = frozenset({WOO_STATUS_COMPLETED, WOO_STATUS_CANCELLED})
+
+
+def is_terminal_woo_status(status: Any) -> bool:
+    """Whether a Woo status tells the customer the order has finished."""
+    return str(status or "").strip().lower() in _TERMINAL_WOO_STATUSES
+
+
+#: Sales Invoice fields that describe a *failed delivery attempt* (contract
+#: section 2, fields 7-8). Order matters: (reason, attempt number).
+#:
+#: Deliberately absent from ``_OUTBOUND_RELEVANT_UPDATE_FIELDS``. A failed attempt
+#: changes no field WooCommerce holds -- the status stays ``out-for-delivery`` --
+#: so adding them there would fire a PUT per missed doorbell that rewrote the
+#: order to exactly what it already said. The customer still learns about the
+#: attempt: it is on the ERPNext tracking page their browser is polling.
+_DELIVERY_FAILURE_FIELDS: tuple[str, str] = (
+    "custom_delivery_failure_reason",
+    "custom_delivery_attempt_no",
+)
+
+
+def _has_failed_delivery_attempt(invoice: frappe.model.document.Document) -> bool:
+    """Whether at least one delivery attempt has failed on this invoice."""
+    reason_field, attempt_field = _DELIVERY_FAILURE_FIELDS
+    if str(_get_doc_value(invoice, reason_field, "") or "").strip():
+        return True
+    try:
+        return cint(_get_doc_value(invoice, attempt_field, 0)) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _collect_invoice_states(invoice: frappe.model.document.Document) -> list[str]:
     states: list[str] = []
     seen: set[str] = set()
@@ -1717,19 +1784,49 @@ def _collect_invoice_states(invoice: frappe.model.document.Document) -> list[str
 
 
 def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool = False) -> str:
+    """Map ``custom_sales_invoice_state`` onto a WooCommerce order status.
+
+    ``Out for Delivery`` -> ``out-for-delivery``, ``Delivered`` -> ``completed``,
+    ``Cancelled`` (or docstatus 2) -> ``cancelled``, everything earlier in the
+    pipeline -> ``processing``.
+
+    **A failed delivery attempt is not a status.** COURIER_CONTRACTS.md section 1
+    is explicit: no new invoice state was added for it, a failed stop leaves the
+    invoice at ``Out for Delivery`` and records
+    ``custom_delivery_failure_reason`` + ``custom_delivery_attempt_no`` instead.
+    So the failure fields are read here only to be *ignored on purpose*: the
+    order stays ``out-for-delivery``, never ``delivery-failed`` and never a
+    terminal status. Egypt is a reschedule-heavy market -- the second attempt is
+    usually the successful one, and telling a customer by email that their order
+    failed, when a courier is coming back tomorrow, is a support call we create
+    ourselves.
+
+    ``Delivered`` is checked before the failure fields deliberately: a stale
+    reason left behind by an earlier attempt must not un-complete a delivered
+    order (the contract has it cleared on success, but this does not depend on
+    that).
+    """
     states = _collect_invoice_states(invoice)
 
     if cancel:
-        return "cancelled"
+        return WOO_STATUS_CANCELLED
     if invoice.docstatus == 2:
-        return "cancelled"
+        return WOO_STATUS_CANCELLED
     if any(state in {"cancelled", "canceled"} for state in states):
-        return "cancelled"
+        return WOO_STATUS_CANCELLED
     if any(state in {"delivered", "completed"} for state in states):
-        return "completed"
-    if any(state == "out-for-delivery" for state in states):
-        return "out-for-delivery"
-    return "processing"
+        return WOO_STATUS_COMPLETED
+    if any(state == WOO_STATUS_OUT_FOR_DELIVERY for state in states):
+        # Reached by both a clean first attempt and a failed one. Same status.
+        if _has_failed_delivery_attempt(invoice):
+            LOGGER.info({
+                "event": "woo_outbound_failed_attempt_keeps_out_for_delivery",
+                "invoice": getattr(invoice, "name", None),
+                "attempt_no": _get_doc_value(invoice, "custom_delivery_attempt_no", 0),
+                "failure_reason": _get_doc_value(invoice, "custom_delivery_failure_reason", None),
+            })
+        return WOO_STATUS_OUT_FOR_DELIVERY
+    return WOO_STATUS_PROCESSING
 
 
 def _safe_has_value_changed(invoice: frappe.model.document.Document, fieldname: str) -> bool:
@@ -2490,7 +2587,12 @@ def _build_order_payload(
         payload["line_items"] = payload_line_items
     payload["meta_data"].extend(_build_delivery_metadata(invoice))
     payload["meta_data"].extend(_build_paid_metadata(invoice, payment_method=payment_method, set_paid=bool(set_paid), cfg=cfg))
-    
+    # The customer tracking link rides the ordinary order payload rather than a
+    # push of its own: same outbox, same retries, same idempotency check, no
+    # extra HTTP call and no second queue to forget about. WooCommerce only ever
+    # *stores* these two keys -- all live tracking happens browser -> ERPNext.
+    payload["meta_data"].extend(_build_tracking_metadata(invoice))
+
     woo_customer_id = get_customer_woo_id(customer_doc)
     if woo_customer_id:
         payload["customer_id"] = cint(woo_customer_id)
@@ -2653,6 +2755,30 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
         ])
 
     return metadata
+
+
+def _build_tracking_metadata(invoice: frappe.model.document.Document) -> list[dict[str, str]]:
+    """``_jarz_tracking_url`` / ``_jarz_tracking_token`` for the order payload.
+
+    Thin adapter over ``services/tracking_link`` so the outbound payload has one
+    obvious seam to mock and the URL/token rules live in one module. Reads the
+    Settings singleton again rather than threading it through
+    ``_build_order_payload``; Frappe caches Single docs, and ``_get_settings`` is
+    the seam every test in this app already patches.
+
+    Never raises: ``tracking_link`` swallows its own failures, and a missing
+    tracking link must never stop an order from reaching the store.
+    """
+    try:
+        settings, _cfg = _get_settings()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_tracking_settings_unavailable",
+            "invoice": getattr(invoice, "name", None),
+            "error": str(exc),
+        })
+        return []
+    return tracking_link.build_tracking_metadata(invoice, settings)
 
 
 def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: bool = False, force: bool = False) -> dict:

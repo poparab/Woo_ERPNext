@@ -42,6 +42,9 @@
   "shipping_section",
   "default_shipping_method_id",
   "default_shipping_method_title",
+  "tracking_section",
+  "enable_outbound_tracking_url",
+  "tracking_base_url",
   "event_section",
   "enable_sync_event_ledger",
   "sync_event_shadow_mode",
@@ -290,6 +293,24 @@
    "label": "Woo Shipping Method Title"
   },
   {
+   "fieldname": "tracking_section",
+   "fieldtype": "Section Break",
+   "label": "Customer Tracking Link"
+  },
+  {
+   "default": "0",
+   "fieldname": "enable_outbound_tracking_url",
+   "fieldtype": "Check",
+   "label": "Push Tracking Link to Woo",
+   "description": "When ON, every outbound order push also writes _jarz_tracking_url and _jarz_tracking_token to the WooCommerce order, and the store shows a 'Track your order' button. WooCommerce only stores the URL - all live tracking happens in the customer's browser against ERPNext. Requires Tracking Base URL below and Sales Invoice.custom_tracking_token (owned by jarz_pos)."
+  },
+  {
+   "fieldname": "tracking_base_url",
+   "fieldtype": "Data",
+   "label": "Tracking Base URL",
+   "description": "Public ERPNext tracking page, e.g. https://erp.orderjarz.com/track - the token is appended as a path segment. If the token belongs in the query string, use the {token} placeholder instead: https://erp.orderjarz.com/track?t={token}. Left blank, nothing is pushed and one Error Log is filed (a wrong link reaches customers by email and WhatsApp, so it is never guessed)."
+  },
+  {
    "fieldname": "event_section",
    "fieldtype": "Section Break",
    "label": "Sync Event Ledger"
@@ -416,7 +437,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-05-08 00:00:00.000000",
+ "modified": "2026-08-08 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Jarz WooCommerce Integration",
  "name": "WooCommerce Settings",

@@ -322,7 +322,17 @@ jarz_woocommerce_integration.WooSyncOperationsPage = class WooSyncOperationsPage
 	}
 
 	renderSettings(settings) {
+		// The three master outbound kill-switches come FIRST and deliberately so.
+		// They gate work before any of the ledger flags below are even consulted,
+		// so with one of them off the rest of this row can be entirely green while
+		// nothing at all is being pushed. Staging sat exactly like that for seven
+		// weeks (2026-06-12 to 2026-08-01); the API was taught to report them but
+		// this panel still never drew them, so the blind spot survived the fix.
 		const flags = [
+			["enable_outbound_orders", __("Order Push")],
+			["enable_outbound_customers", __("Customer Push")],
+			["enable_outbound_tracking_url", __("Tracking Link Push")],
+			["tracking_base_url_configured", __("Tracking Base URL")],
 			["enabled", __("Ledger")],
 			["worker_enabled", __("Worker")],
 			["shadow_mode", __("Shadow Mode")],

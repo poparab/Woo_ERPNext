@@ -157,6 +157,13 @@ def _settings_summary() -> dict[str, Any]:
 	# and the whole config looked healthy the entire time. Surface them.
 	summary["enable_outbound_customers"] = bool(getattr(settings, "enable_outbound_customers", 0))
 	summary["enable_outbound_orders"] = bool(getattr(settings, "enable_outbound_orders", 0))
+	# Third master outbound switch, added with the customer tracking link. Same
+	# rule as the two above: it gates work before the outbox, so it belongs on
+	# the dashboard and not only in Settings. ``tracking_base_url`` is reported as
+	# a boolean rather than the URL itself — the flag being On with no base URL
+	# configured is the exact silent-no-op shape this panel exists to expose.
+	summary["enable_outbound_tracking_url"] = bool(getattr(settings, "enable_outbound_tracking_url", 0))
+	summary["tracking_base_url_configured"] = bool(str(getattr(settings, "tracking_base_url", "") or "").strip())
 	return summary
 
 
