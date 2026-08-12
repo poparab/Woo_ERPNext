@@ -162,6 +162,7 @@ class TestConfidenceLadderFrozen(unittest.TestCase):
         "territory_centroid": 10,
         "pos_link": 20,
         "customer_pin": 30,
+        "courier_web": 35,
         "courier_verified": 40,
         "manual_override": 50,
     }
@@ -179,6 +180,7 @@ class TestConfidenceLadderFrozen(unittest.TestCase):
             "territory_centroid",
             "pos_link",
             "customer_pin",
+            "courier_web",
             "courier_verified",
             "manual_override",
         ]

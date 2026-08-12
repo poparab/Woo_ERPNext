@@ -88,6 +88,11 @@ CONFIDENCE_RANK: dict[str, int] = {
     "territory_centroid": 10,
     "pos_link": 20,
     "customer_pin": 30,
+    # A courier capture made through the web build. Unverifiable for mock GPS,
+    # so it sits below courier_verified. Woo can never write it — MAX_WRITABLE_RANK
+    # caps this module at customer_pin — but the table must mirror section 4
+    # exactly or the drift test fails.
+    "courier_web": 35,
     "courier_verified": 40,
     "manual_override": 50,
 }
