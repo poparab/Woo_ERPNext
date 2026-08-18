@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import time as dt_time, timedelta
 from types import SimpleNamespace
 import unittest
 # Explicit: this module uses unittest.mock throughout, which is NOT pulled in by
@@ -1429,6 +1429,62 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         self.assertEqual(metadata["_orddd_time_slot"], "23:00 - 00:30")
         self.assertEqual(metadata["Time Slot"], "23:00 - 00:30")
+
+    def test_build_order_payload_keeps_a_midnight_slot(self):
+        """A midnight start is a real slot, not an absent one.
+
+        A Frappe `Time` column of 00:00 comes back as `timedelta(0)`, which is
+        falsy. The coercer's `if not raw` guard read that as "no time set" and
+        silently dropped the whole time-slot block, so the Woo order showed a
+        delivery date with no slot -- while every other hour of the day worked.
+        """
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.custom_delivery_date = "2026-05-02"
+        invoice.custom_delivery_time_from = timedelta(0)  # 00:00
+        invoice.custom_delivery_duration = 3600.0
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["_orddd_time_slot"], "00:00 - 01:00")
+        self.assertEqual(metadata["Time Slot"], "00:00 - 01:00")
+        # Midnight start == the date's own midnight timestamp, no offset.
+        self.assertEqual(
+            metadata["_orddd_timeslot_timestamp"], metadata["_orddd_timestamp"]
+        )
+
+    def test_build_order_payload_keeps_a_midnight_slot_from_every_representation(self):
+        """The three shapes a 00:00 start can arrive in must agree."""
+        for raw in (timedelta(0), dt_time(0, 0), "00:00:00"):
+            with self.subTest(raw=raw):
+                invoice = DummyInvoice(sales_invoice_state="Delivered")
+                invoice.custom_delivery_date = "2026-05-02"
+                invoice.custom_delivery_time_from = raw
+                invoice.custom_delivery_duration = 3600.0
+
+                payload = _build_payload_for_delivery_test(invoice)
+                metadata = {e["key"]: e["value"] for e in payload["meta_data"]}
+
+                self.assertEqual(metadata["Time Slot"], "00:00 - 01:00")
+
+    def test_build_order_payload_falls_back_to_a_midnight_legacy_time(self):
+        """The legacy `or` chain dropped a midnight `custom_delivery_time` too."""
+        invoice = DummyInvoice(sales_invoice_state="Delivered")
+        invoice.custom_delivery_date = "2026-05-02"
+        invoice.custom_delivery_time_from = None
+        invoice.custom_delivery_duration = None
+        invoice.custom_delivery_time = timedelta(0)  # 00:00
+
+        payload = _build_payload_for_delivery_test(invoice)
+        metadata = {entry["key"]: entry["value"] for entry in payload["meta_data"]}
+
+        self.assertEqual(metadata["Time Slot"], "00:00")
+
+    def test_coerce_delivery_time_still_rejects_genuinely_unset_values(self):
+        """Widening the guard must not make blanks look like midnight."""
+        for raw in (None, "", "   ", "not a time"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(outbound_sync._coerce_delivery_time(raw))
 
     def test_build_order_payload_formats_delivery_slot_from_two_hour_duration(self):
         invoice = DummyInvoice(sales_invoice_state="Delivered")

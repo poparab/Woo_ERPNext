@@ -2639,6 +2639,22 @@ def _build_order_payload(
     return payload
 
 
+def _first_present(*values: Any) -> Any:
+    """First value that is actually set, rather than first *truthy* value.
+
+    ``a or b`` is the wrong test for delivery fields: midnight arrives as
+    ``timedelta(0)``/``time(0, 0)`` and a zero-length duration as ``0``, all of
+    which are falsy but real. Only ``None`` and a blank string mean "unset".
+    """
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
 def _coerce_delivery_date(raw: Any) -> dt_date | None:
     if not raw:
         return None
@@ -2657,7 +2673,14 @@ def _coerce_delivery_date(raw: Any) -> dt_date | None:
 
 
 def _coerce_delivery_time(raw: Any) -> dt_time | None:
-    if not raw:
+    # NOT `if not raw`. Midnight is a legitimate slot start, and both of its
+    # natural representations -- `timedelta(0)` from a Frappe `Time` column and
+    # `time(0, 0)` -- are falsy. Treating them as "unset" made this return None,
+    # which drops the entire time-slot block from the outbound payload: the Woo
+    # order got a delivery date and no slot at all.
+    if raw is None:
+        return None
+    if isinstance(raw, str) and not raw.strip():
         return None
     if isinstance(raw, datetime):
         return raw.time().replace(microsecond=0)
@@ -2706,7 +2729,10 @@ def _coerce_delivery_duration_seconds(raw: Any) -> int | None:
 
 def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[dict[str, str]]:
     delivery_date = _coerce_delivery_date(
-        getattr(invoice, "custom_delivery_date", None) or getattr(invoice, "delivery_date", None)
+        _first_present(
+            getattr(invoice, "custom_delivery_date", None),
+            getattr(invoice, "delivery_date", None),
+        )
     )
     if not delivery_date:
         return []
@@ -2736,7 +2762,10 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
         time_slot_label = f"{delivery_time_from.strftime('%H:%M')} - {end_datetime.strftime('%H:%M')}"
     else:
         legacy_delivery_time = _coerce_delivery_time(
-            getattr(invoice, "custom_delivery_time", None) or getattr(invoice, "delivery_time", None)
+            _first_present(
+                getattr(invoice, "custom_delivery_time", None),
+                getattr(invoice, "delivery_time", None),
+            )
         )
         if legacy_delivery_time:
             delivery_time_from = legacy_delivery_time
