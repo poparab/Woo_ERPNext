@@ -956,7 +956,15 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(line_items[0]["subtotal"], "120.00")
         self.assertEqual(line_items[0]["total"], "60.00")
 
-    def test_collect_line_items_includes_explicit_bundle_parent_at_zero_and_links_children(self):
+    def test_collect_line_items_emits_the_woosb_native_bundle_shape(self):
+        """Priced parent, zero-rated children, ``_woosb_ids`` on the parent.
+
+        Rewritten from ``..._includes_explicit_bundle_parent_at_zero_...``: that
+        version pinned the *inverse* of what a website-created order looks like
+        (verified against production order 16895), which is the whole of F-10.
+        The ERPNext-side rows are unchanged — this is a wire format only, and the
+        sum of the emitted line totals is identical either way.
+        """
         invoice = SimpleNamespace(items=[
             SimpleNamespace(
                 item_code="BUNDLE-001",
@@ -1002,15 +1010,27 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         parent_entry = line_items[0]
         self.assertEqual(parent_entry["name"], "Bundle Parent")
-        self.assertEqual(parent_entry["subtotal"], "0.00")
-        self.assertEqual(parent_entry["total"], "0.00")
+        # The bundle price, taken from the children's ERPNext amounts.
+        self.assertEqual(parent_entry["subtotal"], "120.00")
+        self.assertEqual(parent_entry["total"], "120.00")
         self.assertEqual(parent_entry["product_id"], 202)
-        self.assertEqual(parent_entry["meta_data"], [{"key": "erpnext_item_code", "value": "BUNDLE-001"}])
+        self.assertEqual(
+            parent_entry["meta_data"],
+            [
+                {"key": "erpnext_item_code", "value": "BUNDLE-001"},
+                {
+                    "key": "_woosb_ids",
+                    "value": "303/{token}/1/{{}}".format(
+                        token=outbound_sync._woosb_selection_token("ITEM-CHILD")
+                    ),
+                },
+            ],
+        )
 
         child_entry = line_items[1]
         self.assertEqual(child_entry["name"], "Bundle Child")
-        self.assertEqual(child_entry["subtotal"], "120.00")
-        self.assertEqual(child_entry["total"], "120.00")
+        self.assertEqual(child_entry["subtotal"], "0.00")
+        self.assertEqual(child_entry["total"], "0.00")
         self.assertEqual(child_entry["product_id"], 303)
         self.assertEqual(
             child_entry["meta_data"],
@@ -1018,6 +1038,12 @@ class TestOutboundStatusSync(unittest.TestCase):
                 {"key": "erpnext_item_code", "value": "ITEM-CHILD"},
                 {"key": "_woosb_parent_id", "value": "202"},
             ],
+        )
+
+        # The invariant that protects the order total through the inversion.
+        self.assertEqual(
+            round(sum(outbound_sync.flt(entry["total"]) for entry in line_items), 2),
+            round(sum(outbound_sync.flt(item.amount) for item in invoice.items), 2),
         )
 
     def test_sync_sales_invoice_replaces_stale_woo_order_id_after_missing_remote_order(self):

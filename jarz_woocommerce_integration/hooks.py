@@ -153,8 +153,16 @@ doc_events = {
 		"on_update": "jarz_woocommerce_integration.services.outbound_sync.enqueue_customer_sync",
 	},
 	"Address": {
-		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
+		"after_insert": [
+			"jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
+			"jarz_woocommerce_integration.services.outbound_sync.realign_address_state",
+		],
 		"on_update": [
+			# `state` must agree with the territory implied by `city` whether or
+			# not an order is ever pushed: inbound address matching hashes both,
+			# so a stale `state` forks a duplicate Address on the next pull.
+			# Runs first so the outbound pushes below see the corrected value.
+			"jarz_woocommerce_integration.services.outbound_sync.realign_address_state",
 			"jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_customer_sync_for_address",
 			# Editing an address in place touches no Sales Invoice field, so the
 			# invoice's own outbound hook never fires and the Woo *order* keeps
