@@ -1574,6 +1574,47 @@ def _report_unpayable_transition(client: WooClient, woo_order_id: Any, invoice_n
 _TOTAL_ASSERT_TOLERANCE = 0.01
 
 
+def _payload_total_mismatch(
+    payload: dict | None,
+    invoice: frappe.model.document.Document,
+) -> str | None:
+    """Error string when the payload's own arithmetic misses ``grand_total``.
+
+    The counterpart to :func:`_check_response_total`, run BEFORE the request
+    rather than after it. Same reasoning about why the sum must equal
+    ``grand_total`` (no VAT rows on this site), and the same narrowing: only
+    asserted when the payload actually carries ``line_items``, because a
+    status-only update deliberately sends no money at all.
+
+    Returns ``None`` when there is nothing to complain about — including when
+    the payload is empty or unreadable, since a guard that cannot compute an
+    answer must not block a push.
+    """
+    if not payload or not payload.get("line_items"):
+        return None
+    try:
+        total = 0.0
+        for group in ("line_items", "shipping_lines", "fee_lines"):
+            for row in payload.get(group) or []:
+                # A removal entry carries an id and no total; it moves no money.
+                if row.get("total") in (None, ""):
+                    continue
+                total += flt(row.get("total"))
+        grand_total = flt(getattr(invoice, "grand_total", 0) or 0)
+    except Exception:  # noqa: BLE001
+        return None
+
+    line_count = len(payload.get("line_items") or [])
+    tolerance = _TOTAL_ASSERT_TOLERANCE * (1 + line_count)
+    if abs(total - grand_total) <= tolerance:
+        return None
+    return (
+        f"Payload total {total:.2f} does not reach grand_total {grand_total:.2f} "
+        f"(difference {grand_total - total:+.2f}). A line was most likely dropped "
+        f"for want of a WooCommerce product mapping; the order was NOT pushed."
+    )
+
+
 def _check_response_total(
     response: Any,
     invoice: frappe.model.document.Document,
@@ -4435,6 +4476,30 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         })
         _mark_invoice_status(invoice_name, status="error", error=str(exc))
         return {"status": "error", "detail": str(exc)}
+
+    # --- Refuse to push a total we already know is wrong ---------------------
+    # _check_response_total below catches drift AFTER the store has been written,
+    # which is the right place for anything only the store can tell us. But a
+    # payload whose own arithmetic does not reach grand_total is knowably wrong
+    # BEFORE the request, and pushing it anyway would state a false amount on a
+    # customer-facing order and only then flag it.
+    #
+    # This became reachable when unmapped lines started degrading per line
+    # instead of failing the whole invoice: dropping a line the store has no
+    # product for keeps the order pushable, but silently removes its money. Four
+    # production invoices are in exactly that state (e.g. ACC-SINV-2026-15618,
+    # payload 1500.00 against grand_total 2288.40). Better to stay Error and name
+    # the gap than to publish a short order.
+    prepush_mismatch = _payload_total_mismatch(payload, invoice)
+    if prepush_mismatch:
+        LOGGER.error({
+            "event": "woo_outbound_payload_total_mismatch",
+            "invoice": invoice_name,
+            "detail": prepush_mismatch,
+            "reason": reason,
+        })
+        _mark_invoice_status(invoice_name, status="error", error=prepush_mismatch)
+        return {"status": "error", "detail": f"payload_total_mismatch:{prepush_mismatch}"}
 
     if (
         order_map_exists
