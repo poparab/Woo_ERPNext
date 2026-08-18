@@ -67,6 +67,38 @@ NON_PAYABLE_WOO_STATUSES = {"cancelled", "refunded", "failed"}
 #: :func:`reconcile_deleted_orders_cron`.
 TERMINAL_CANCELLATION_STATUSES = {"cancelled", "refunded", "trash"}
 
+#: WooCommerce prices are deliberately ignored when invoice lines are built
+#: (see :func:`_build_invoice_items`) — the ERPNext price list is the single
+#: source of truth for what we bill. That policy stays. What was missing is the
+#: *check*: when the store's prices and ERPNext's disagree the customer sees one
+#: number and the invoice carries another, and nothing ever noticed. These
+#: tolerances drive a post-build reconciliation that FLAGS the order for a human;
+#: it never blocks an order.
+#:
+#: The absolute floor absorbs per-line rounding (BundleProcessor spreads one
+#: uniform discount percentage across the children, so a few piastres of drift is
+#: normal); the relative component keeps large orders from tripping on that same
+#: rounding. Both can be overridden from WooCommerce Settings when those fields
+#: exist — read defensively so this keeps working on a bench without them.
+WOO_PRICE_RECONCILE_ABS_TOLERANCE = 1.0
+WOO_PRICE_RECONCILE_PCT_TOLERANCE = 0.5  # percent of the compared amount
+
+#: The POS keeps its order notes in a DocType owned by jarz_pos. This app never
+#: imports that app — it addresses the DocType by name only, exactly like
+#: ``outbound_sync._INVOICE_NOTE_DOCTYPE``, so everything here is simply inert on
+#: a bench where jarz_pos is not installed.
+_INVOICE_NOTE_DOCTYPE = "Jarz Invoice Note"
+
+#: Trailer stamped on every note this module materialises from WooCommerce. It is
+#: the idempotency key (the Woo note id is unique per store) and it is also what
+#: keeps the two lanes from looping: a note we wrote inbound is never pushed back
+#: out (outbound is suppressed on insert), and a note we pushed OUT carries
+#: ``outbound_sync.sync_invoice_note``'s own "(Jarz POS)" signature, which we skip
+#: on the way in.
+WOO_ORDER_NOTE_MARKER = "— WooCommerce order note #"
+WOO_CUSTOMER_NOTE_MARKER = "— WooCommerce customer note "
+POS_OUTBOUND_NOTE_SIGNATURE = "(Jarz POS)"
+
 ORDER_SYNC_CURSOR_FIELDS = {
     "live": {
         "modified": "live_order_cursor_modified_gmt",
@@ -107,6 +139,34 @@ def _normalize_woo_status(woo_status: Any) -> str:
     if status.startswith("wc-"):
         status = status[3:]
     return LEGACY_WOO_STATUS_ALIASES.get(status, status)
+
+
+def _log_throttled_error(*, key: str, title: str, message: Any, ttl_seconds: int = 3600) -> None:
+    """``frappe.log_error`` at most once per ``key`` per ``ttl_seconds``.
+
+    Several of the failures worth surfacing here are per-order but store-wide in
+    *cause* — one unrecognised meta format, one delivery zone nobody mapped. One
+    Error Log per affected order would bury the log, and ``logger().warning`` is
+    invisible on staging/production because the default level there is ERROR.
+    Same trick and same reason as ``utils.http_client._log_rest_route_fallback``.
+
+    Never raises: a diagnostic must not be able to take an order sync down.
+    """
+    try:
+        cache = frappe.cache()
+        cache_key = f"woo_throttled_log::{key}"
+        if cache.get_value(cache_key):
+            return
+        cache.set_value(cache_key, "1", expires_in_sec=ttl_seconds)
+    except Exception:  # noqa: BLE001
+        # No cache (unit tests / no site). Fall through and log anyway — dropping
+        # the diagnostic entirely would be worse than logging it twice.
+        pass
+    try:
+        payload = message if isinstance(message, str) else frappe.as_json(message)
+        frappe.log_error(title=str(title)[:140], message=payload)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class MigrationCache:
@@ -339,36 +399,44 @@ def _map_status(woo_status: str | None, is_historical: bool = False) -> dict[str
 
 
 def _map_payment_method(woo_payment_method: str | None, woo_payment_method_title: str | None = None) -> str | None:
-    """Map WooCommerce payment method to ERPNext custom_payment_method.
-    
-    WooCommerce -> ERPNext mapping:
-    - cod -> Cash
-    - instapay -> Instapay
-    - wallet -> Mobile Wallet
-    - card -> Kashier Card
-    - kashier_card -> Kashier Card
-    - kashier -> title-aware fallback (wallet -> Kashier Wallet, else Kashier Card)
-    - kashier_wallet -> Kashier Wallet
+    """Map a WooCommerce payment method onto ERPNext ``custom_payment_method``.
+
+    The table itself lives in :mod:`jarz_woocommerce_integration.services.payment_map`
+    so inbound and outbound cannot drift apart: this used to be a hand-rolled
+    if/elif chain here and a separate one in ``outbound_sync``, which is how a
+    method could map one way in and a different way back out.
+
+    Behaviour is unchanged — ``payment_map.woo_to_erpnext`` accepts the same
+    inputs this chain did, including the legacy aliases (``card``, and ``kashier``
+    with its title-aware wallet/card split) that the store still sends but that we
+    never emit:
+
+    - ``cod`` -> Cash
+    - ``instapay`` -> Instapay
+    - ``wallet`` -> Mobile Wallet
+    - ``card`` / ``kashier_card`` -> Kashier Card
+    - ``kashier`` -> title-aware (title contains "wallet" -> Kashier Wallet, else Kashier Card)
+    - ``kashier_wallet`` -> Kashier Wallet
+    - anything else / blank -> ``None`` (caller logs and skips the Payment Entry)
     """
     if not woo_payment_method:
         return None
-    
-    pm = woo_payment_method.lower().strip()
-    title = (woo_payment_method_title or "").lower().strip()
-    if pm == "cod":
-        return "Cash"
-    elif pm == "instapay":
-        return "Instapay"
-    elif pm == "wallet":
-        return "Mobile Wallet"
-    elif pm in ("card", "kashier_card"):
-        return "Kashier Card"
-    elif pm == "kashier":
-        return "Kashier Wallet" if "wallet" in title else "Kashier Card"
-    elif pm == "kashier_wallet":
-        return "Kashier Wallet"
-    else:
+
+    # Local import for the same reason BundleProcessor is imported locally below:
+    # no hard dependency at module import time, so a missing sibling module can
+    # never take the whole inbound lane (crons, hooks, outbound) down with it.
+    from jarz_woocommerce_integration.services.payment_map import woo_to_erpnext
+
+    # Input normalisation stays on this side. The old chain did `.lower().strip()`
+    # before matching, and 10.7k historical orders were mapped that way; keeping it
+    # here means inbound behaviour is identical no matter how the shared table
+    # chooses to normalise. The title is passed through untouched — the wallet/card
+    # split on the legacy "kashier" alias is the table's contract, not ours.
+    method = str(woo_payment_method).strip().lower()
+    if not method:
         return None
+
+    return woo_to_erpnext(method, woo_payment_method_title)
 
 
 def _should_treat_inbound_order_as_paid(
@@ -458,6 +526,16 @@ def _safe_int(value: Any, default: int) -> int:
         return int(value)
     except Exception:  # noqa: BLE001
         return int(default)
+
+
+def _safe_float(value: Any, default: float) -> float:
+    """Float coercion that treats blank/None as "not configured", not as zero."""
+    if value in (None, ""):
+        return float(default)
+    try:
+        return float(value)
+    except Exception:  # noqa: BLE001
+        return float(default)
 
 
 def _get_setting_int(settings: Any, fieldname: str, default: int) -> int:
@@ -827,6 +905,72 @@ def _extract_order_territory_snapshot(
     return snapshot
 
 
+def _audit_order_territory_resolution(
+    *,
+    woo_id: Any,
+    territory_snapshot: dict[str, Any],
+    effective_territory: str | None,
+    customer: str | None,
+) -> str:
+    """Return a one-line diagnosis of how this order's Territory was resolved.
+
+    Inbound resolves Territory from ``shipping.state`` then ``billing.state`` and,
+    when neither maps, silently falls back to ``Customer.territory``. That fallback
+    is correct — the Woo payload is the only input available at this point and we
+    are deliberately NOT changing what wins — but it was invisible: the Order Map's
+    ``needs_territory_recheck`` flag only ever fires when the *POS Profile* could
+    not be resolved, so an order whose own states resolve to nothing but whose
+    customer happens to carry a territory looked perfectly healthy.
+
+    This makes that case auditable without changing the outcome: the returned
+    string is stored on ``WooCommerce Order Map.last_territory_error`` (a field
+    that already existed in the schema and was written by nothing), and an
+    unresolved order additionally raises a throttled Error Log so the states that
+    map to no Territory can be found and fixed at the source.
+
+    Returns "" when the order resolved its own Territory — the healthy case.
+    """
+    resolved = str(territory_snapshot.get("resolved_order_territory") or "").strip()
+    if resolved:
+        return ""
+
+    shipping_state = str(territory_snapshot.get("woo_shipping_state") or "").strip()
+    billing_state = str(territory_snapshot.get("woo_billing_state") or "").strip()
+    effective = str(effective_territory or "").strip()
+
+    if effective:
+        detail = (
+            f"Order-level territory unresolved (shipping_state={shipping_state!r}, "
+            f"billing_state={billing_state!r}); fell back to Customer.territory "
+            f"{effective!r}."
+        )
+    else:
+        detail = (
+            f"Order-level territory unresolved (shipping_state={shipping_state!r}, "
+            f"billing_state={billing_state!r}) and the customer carries no territory "
+            f"either — this invoice has NO territory, so it gets no delivery income "
+            f"and no branch POS Profile from territory."
+        )
+
+    _log_throttled_error(
+        # Throttle on the state pair, not the order: the cause is a missing
+        # Territory mapping for that state, and it repeats for every order from
+        # that area until somebody maps it.
+        key=f"territory_unresolved::{shipping_state.lower()}::{billing_state.lower()}",
+        title="Woo: order territory unresolved from Woo state",
+        message={
+            "event": "woo_order_territory_unresolved",
+            "woo_order_id": woo_id,
+            "shipping_state": shipping_state,
+            "billing_state": billing_state,
+            "customer": customer,
+            "effective_territory": effective or None,
+            "detail": detail,
+        },
+    )
+    return detail
+
+
 def _apply_contact_snapshot_to_invoice_values(values: dict[str, Any], snapshot: dict[str, Any]) -> None:
     values["customer_name"] = snapshot.get("customer_name") or values.get("customer_name") or ""
     for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
@@ -851,6 +995,7 @@ def _build_order_map_snapshot_values(
     order_hash: str | None = None,
     needs_territory_recheck: int | None = None,
     territory_snapshot: dict[str, Any] | None = None,
+    territory_error: str | None = None,
 ) -> dict[str, Any]:
     values = {
         "woo_order_number": order.get("number"),
@@ -866,6 +1011,12 @@ def _build_order_map_snapshot_values(
         values[link_field] = invoice_name
     if needs_territory_recheck is not None:
         values["needs_territory_recheck"] = needs_territory_recheck
+    # Only written when the caller has actually evaluated territory resolution.
+    # An unconditional "" here would silently clear the last recorded diagnosis
+    # from callers that never look at territory at all (e.g. the contact-snapshot
+    # refresh, which diffs these values against the row).
+    if territory_error is not None:
+        values["last_territory_error"] = territory_error
     for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS:
         values[fieldname] = snapshot.get(fieldname) or ""
     territory_snapshot = territory_snapshot or {}
@@ -1400,8 +1551,242 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
     )
 
 
+def _woo_line_amounts(order: dict) -> tuple[float, float]:
+    """Merchandise totals exactly as WooCommerce charged them.
+
+    Returns ``(gross, net)``:
+
+    * ``gross`` sums ``line_items[].subtotal`` — the price before any
+      coupon/dynamic-pricing discount;
+    * ``net`` sums ``line_items[].total`` — what the customer actually paid for
+      the lines.
+
+    They differ on discounted lines (a real order shows a bundle child at
+    subtotal 960.00 / total 720.00). ``subtotal`` is the one to compare against
+    the ERPNext lines, because ERPNext lines are always built at full price-list
+    rate and any Woo discount is carried separately as a HEADER discount.
+    """
+    gross = 0.0
+    net = 0.0
+    for line in order.get("line_items") or []:
+        if not isinstance(line, dict):
+            continue
+        line_net = _safe_float(line.get("total"), 0.0)
+        raw_subtotal = line.get("subtotal")
+        line_gross = _safe_float(raw_subtotal, line_net) if raw_subtotal not in (None, "") else line_net
+        gross += line_gross
+        net += line_net
+    return round(gross, 2), round(net, 2)
+
+
+def _erpnext_line_amount_total(lines: list[dict]) -> float:
+    """What the built invoice rows will bill, before header discount and shipping.
+
+    Same arithmetic as :func:`_get_invoice_merchandise_subtotal` (which the
+    delivery-promotion engine already trusts): ERPNext derives the final rate
+    from ``price_list_rate`` and ``discount_percentage``, so a bundle nets out to
+    its bundle price — zero-rated parent plus discounted children.
+    """
+    total = 0.0
+    for row in lines or []:
+        qty = _safe_float(_row_value(row, "qty", 0), 0.0)
+        price_list_rate = _row_value(row, "price_list_rate", None)
+        if price_list_rate in (None, ""):
+            price_list_rate = _row_value(row, "rate", 0)
+        rate = _safe_float(price_list_rate, 0.0)
+        discount_pct = min(max(_safe_float(_row_value(row, "discount_percentage", 0), 0.0), 0.0), 100.0)
+        total += rate * qty * (1 - discount_pct / 100.0)
+    return round(total, 2)
+
+
+def _woo_price_tolerance(expected: float, settings: Any = None) -> float:
+    """Absolute floor, or a share of the order — whichever is larger."""
+    abs_tolerance = _safe_float(
+        getattr(settings, "woo_price_tolerance_amount", None),
+        WOO_PRICE_RECONCILE_ABS_TOLERANCE,
+    )
+    pct_tolerance = _safe_float(
+        getattr(settings, "woo_price_tolerance_percent", None),
+        WOO_PRICE_RECONCILE_PCT_TOLERANCE,
+    )
+    return max(abs(abs_tolerance), abs(float(expected or 0)) * abs(pct_tolerance) / 100.0)
+
+
+def _reconcile_woo_line_prices(order: dict, lines: list[dict], *, settings: Any = None) -> dict[str, Any]:
+    """Compare what WooCommerce charged for the lines with what ERPNext will bill.
+
+    ``_build_invoice_items`` ignores every Woo price on purpose and re-prices from
+    the ERPNext price list (and, for bundles, from ``Woo Jarz Bundle``). That
+    policy is unchanged and this function never touches an invoice — it only
+    reports. Until now the divergence was completely silent: a product priced
+    differently on the store than in ERPNext produced an invoice that quietly
+    disagreed with what the customer was shown, and nothing anywhere noticed.
+
+    Compared like-for-like:
+
+    * Woo ``subtotal`` (pre-discount) against the ERPNext line amounts, because
+      ERPNext lines carry full price-list rates and the Woo discount is applied
+      at header level (``_apply_noncoupon_woo_discount``, or the jarz_pos coupon
+      hook). Comparing against ``total`` instead would flag every discounted
+      order as a price mismatch.
+    * Bundles net out on both sides: Woo puts the bundle price on the parent line
+      and zeroes the children; ERPNext zero-rates the parent and discounts the
+      children down to the same total.
+
+    Returns a decision dict; ``matched`` False means "worth a human's attention",
+    never "stop".
+    """
+    woo_gross, woo_net = _woo_line_amounts(order)
+    erpnext_total = _erpnext_line_amount_total(lines)
+    # Fall back to the net when a payload carries no subtotals at all (older Woo
+    # payloads and some plugins) — better a slightly noisier comparison than none.
+    # ``_woo_line_amounts`` already substitutes net for a missing subtotal per
+    # line, so this only decides which label the flag reports.
+    has_subtotals = any(
+        line.get("subtotal") not in (None, "")
+        for line in (order.get("line_items") or [])
+        if isinstance(line, dict)
+    )
+    expected = woo_gross if has_subtotals else woo_net
+    tolerance = _woo_price_tolerance(expected, settings)
+    delta = round(erpnext_total - expected, 2)
+    return {
+        "matched": abs(delta) <= tolerance,
+        "compared_against": "subtotal" if has_subtotals else "total",
+        "woo_line_subtotal": woo_gross,
+        "woo_line_total": woo_net,
+        "woo_discount_total": _safe_float(order.get("discount_total"), 0.0),
+        "erpnext_line_total": erpnext_total,
+        "delta": delta,
+        "tolerance": round(tolerance, 2),
+    }
+
+
+def _flag_woo_price_mismatch(*, woo_id: Any, invoice_name: str, decision: dict[str, Any]) -> None:
+    """Surface a price divergence for a human. Never blocks the order."""
+    reason = (
+        f"WooCommerce line prices disagree with the ERPNext price list. "
+        f"Woo lines: {decision['woo_line_subtotal']:.2f} before discount / "
+        f"{decision['woo_line_total']:.2f} charged (Woo discount_total "
+        f"{decision['woo_discount_total']:.2f}). ERPNext lines: "
+        f"{decision['erpnext_line_total']:.2f}. Difference {decision['delta']:+.2f} "
+        f"(tolerance {decision['tolerance']:.2f}). ERPNext prices always win by "
+        f"policy — review which side is wrong."
+    )
+    _flag_order_map_for_manual_review(woo_id=woo_id, invoice_name=invoice_name, reason=reason)
+    create_sync_log_entry(
+        "PriceMismatch",
+        "NeedsReview",
+        {"invoice": invoice_name, **decision},
+        woo_order_id=woo_id,
+    )
+
+
+#: One half of a Woo time slot, with an OPTIONAL meridiem: "13:00", "1:00 PM",
+#: "1:00pm", "1:00 p.m.". Anchored as a pair below so it can only ever match a
+#: complete "<start>-<end>" slot.
+_SLOT_HALF_PATTERN = r"(?P<{p}h>\d{{1,2}}):(?P<{p}m>\d{{2}})(?::(?P<{p}s>\d{{2}}))?\s*(?P<{p}mer>[ap]\.?\s?m\.?)?"
+_MERIDIEM_SLOT_RE = re.compile(
+    "^" + _SLOT_HALF_PATTERN.format(p="s") + r"\-" + _SLOT_HALF_PATTERN.format(p="e") + "$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_meridiem(raw: Any) -> str | None:
+    """"PM" / "pm" / "p.m." / "P M" -> "pm"; anything else -> None."""
+    token = re.sub(r"[^apm]", "", str(raw or "").lower())
+    return token if token in ("am", "pm") else None
+
+
+def _apply_meridiem(hour: int, meridiem: str | None) -> int:
+    """Convert a clock hour to 24-hour form.
+
+    The two cases naive implementations get wrong are noon and midnight:
+    12 PM is hour 12 (NOT 24) and 12 AM is hour 0 (NOT 12).
+    """
+    if meridiem == "pm":
+        return hour if hour >= 12 else hour + 12
+    if meridiem == "am":
+        return 0 if hour == 12 else hour
+    return hour
+
+
+def _extract_meridiem_slot(normalized: str) -> tuple[str, str] | None:
+    """Rewrite a 12-hour slot into the plain 24-hour strings the caller expects.
+
+    Returns ``None`` for anything without a meridiem, so every slot that parses
+    today keeps going down the exact same code path it always did — the 24-hour
+    forms ("19:00 - 20:30", "12:00-14:00") carry essentially all of the ~10.7k
+    historical orders and must not move.
+
+    Without this, ``_parse_delivery_parts`` stripped the meridiem and read
+    "01:00 PM - 02:00 PM" with ``%H:%M``, booking the order for 01:00 — twelve
+    hours early. That is visible in the staging data as a low cluster of
+    01:00/01:30/02:30 delivery windows among otherwise sane afternoon slots.
+    """
+    match = _MERIDIEM_SLOT_RE.match(normalized)
+    if not match:
+        return None
+
+    start_meridiem = _normalize_meridiem(match.group("smer"))
+    end_meridiem = _normalize_meridiem(match.group("emer"))
+    if not start_meridiem and not end_meridiem:
+        # No meridiem anywhere: identical to the strict 24-hour regex the caller
+        # already tried, so hand it back untouched rather than re-implementing it.
+        return None
+
+    start_hour_raw = int(match.group("sh"))
+    end_hour_raw = int(match.group("eh"))
+    start_minute = int(match.group("sm"))
+    end_minute = int(match.group("em"))
+    start_second = match.group("ss")
+    end_second = match.group("es")
+
+    start_hour = _apply_meridiem(start_hour_raw, start_meridiem)
+    end_hour = _apply_meridiem(end_hour_raw, end_meridiem)
+
+    # Only one side carries a marker ("1:00 - 3:00 PM"). Borrow the other side's,
+    # and if that makes the window run backwards take the opposite reading —
+    # "11:00 - 1:00 PM" is 11:00->13:00, not 23:00->13:00.
+    if start_meridiem is None and end_meridiem is not None:
+        borrowed = _apply_meridiem(start_hour_raw, end_meridiem)
+        flipped = _apply_meridiem(start_hour_raw, "am" if end_meridiem == "pm" else "pm")
+        start_hour = (
+            borrowed
+            if borrowed * 60 + start_minute <= end_hour * 60 + end_minute
+            else flipped
+        )
+    elif end_meridiem is None and start_meridiem is not None:
+        borrowed = _apply_meridiem(end_hour_raw, start_meridiem)
+        flipped = _apply_meridiem(end_hour_raw, "am" if start_meridiem == "pm" else "pm")
+        end_hour = (
+            borrowed
+            if borrowed * 60 + end_minute >= start_hour * 60 + start_minute
+            else flipped
+        )
+
+    if not (0 <= start_hour <= 23 and 0 <= end_hour <= 23):
+        return None
+
+    def _format(hour: int, minute: int, second: str | None) -> str:
+        if second is None:
+            return f"{hour:02d}:{minute:02d}"
+        return f"{hour:02d}:{minute:02d}:{int(second):02d}"
+
+    return (
+        _format(start_hour, start_minute, start_second),
+        _format(end_hour, end_minute, end_second),
+    )
+
+
 def _parse_delivery_parts(o: dict) -> tuple[str | None, str | None, int | None]:
-    """Extract delivery date, start time, and duration (minutes) from Woo meta."""
+    """Extract delivery date, start time, and duration (minutes) from Woo meta.
+
+    All-or-nothing at the call site: the caller drops date, time AND duration
+    together unless all three come back, so anything this function fails to read
+    costs the order its entire delivery window. Every change here is therefore
+    strictly additive — a format that parses today must keep parsing identically.
+    """
     import re
     from datetime import datetime as dt
 
@@ -1416,12 +1801,39 @@ def _parse_delivery_parts(o: dict) -> tuple[str | None, str | None, int | None]:
 
     date_part: str | None = None
     if delivery_date_str:
-        for fmt in ("%d %B %Y", "%d %B, %Y", "%B %d %Y", "%B %d, %Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        for fmt in (
+            # --- formats that already work. Order preserved: the production
+            #     store writes "5 August, 2026" (-> "%d %B %Y" once commas are
+            #     stripped) and that shape carries nearly every historical order.
+            #     The two comma-bearing entries can never match a comma-stripped
+            #     string; they are dead but kept, because removing a format is
+            #     exactly the kind of "harmless" edit that loses 10k orders.
+            "%d %B %Y", "%d %B, %Y", "%B %d %Y", "%B %d, %Y",
+            "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
+            # --- added 2026-08-19: the date picker can be configured to label
+            #     the day, e.g. "Sunday, August 02, 2026". That matched NONE of
+            #     the formats above, so those orders silently lost date, time and
+            #     duration. Seen on the demo store; harmless where absent.
+            "%A %B %d %Y",  # "Sunday, August 02, 2026"
+            "%A %d %B %Y",  # "Sunday, 02 August 2026"
+            "%A %Y-%m-%d",  # "Sunday, 2026-08-02"
+        ):
             try:
                 date_part = dt.strptime(delivery_date_str.replace(",", ""), fmt).date().isoformat()
                 break
             except Exception:
                 continue
+        if not date_part:
+            _log_throttled_error(
+                key=f"delivery_date_unparsed::{delivery_date_str[:60]}",
+                title="Woo: unparsable Delivery Date meta",
+                message={
+                    "event": "woo_delivery_date_unparsed",
+                    "woo_order_id": o.get("id"),
+                    "raw_value": delivery_date_str[:140],
+                    "detail": "Delivery date/time/duration were all dropped for this order.",
+                },
+            )
 
     time_from: str | None = None
     duration_minutes: int | None = None
@@ -1433,11 +1845,18 @@ def _parse_delivery_parts(o: dict) -> tuple[str | None, str | None, int | None]:
         normalized = re.sub(r"\s*\-\s*", "-", normalized.strip())
         m = re.match(r"^(\d{1,2}:\d{2}(?::\d{2})?)\-(\d{1,2}:\d{2}(?::\d{2})?)$", normalized)
         if not m:
-            times = re.findall(r"\d{1,2}:\d{2}(?::\d{2})?", normalized)
-            if len(times) >= 2:
-                start_s, end_s = times[0], times[1]
+            # Try 12-hour form BEFORE the loose fallback below: that fallback
+            # scrapes the first two "H:MM" tokens and reads them as 24-hour,
+            # which is precisely how "01:00 PM" became 01:00.
+            meridiem_slot = _extract_meridiem_slot(normalized)
+            if meridiem_slot:
+                start_s, end_s = meridiem_slot
             else:
-                start_s = end_s = None
+                times = re.findall(r"\d{1,2}:\d{2}(?::\d{2})?", normalized)
+                if len(times) >= 2:
+                    start_s, end_s = times[0], times[1]
+                else:
+                    start_s = end_s = None
         else:
             start_s, end_s = m.group(1), m.group(2)
 
@@ -1455,6 +1874,17 @@ def _parse_delivery_parts(o: dict) -> tuple[str | None, str | None, int | None]:
             except Exception:
                 time_from = None
                 duration_minutes = None
+        if time_from is None:
+            _log_throttled_error(
+                key=f"time_slot_unparsed::{time_slot_str[:60]}",
+                title="Woo: unparsable Time Slot meta",
+                message={
+                    "event": "woo_time_slot_unparsed",
+                    "woo_order_id": o.get("id"),
+                    "raw_value": time_slot_str[:140],
+                    "detail": "Delivery date/time/duration were all dropped for this order.",
+                },
+            )
 
     return date_part, time_from, duration_minutes
 
@@ -2446,6 +2876,283 @@ def _flag_order_map_for_manual_review(*, woo_id: int, invoice_name: str, reason:
         )
 
 
+def _inbound_order_notes_enabled(settings: Any) -> bool:
+    """Whether Woo order notes should be materialised into ERPNext.
+
+    Reads ``enable_inbound_order_notes`` from WooCommerce Settings when that field
+    exists. It does not exist yet — this app cannot add it from here — so a
+    missing field means None, which is treated as ON. A field that is present and
+    explicitly 0 turns it off, which is the whole point of reading it.
+    """
+    value = getattr(settings, "enable_inbound_order_notes", None)
+    if value is None:
+        return True
+    return bool(_safe_int(value, 0))
+
+
+def _woo_note_is_ours(body: str) -> bool:
+    """True when this Woo note is one WE posted, and must not be pulled back in.
+
+    ``outbound_sync.sync_invoice_note`` signs everything it pushes with
+    "(Jarz POS)". Without this check the two lanes would echo: our own POS note
+    would come back as a Woo note, be materialised as a new Jarz Invoice Note,
+    and — but for the outbound suppression on insert — be pushed out again.
+    """
+    text = str(body or "")
+    return POS_OUTBOUND_NOTE_SIGNATURE in text or WOO_ORDER_NOTE_MARKER in text
+
+
+def _invoice_note_doctype_available() -> bool:
+    try:
+        return bool(frappe.db.exists("DocType", _INVOICE_NOTE_DOCTYPE))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _materialize_invoice_note(invoice_name: str, body: str, *, marker: str, author: str | None = None) -> bool:
+    """Create one Jarz Invoice Note, idempotently. Returns True when inserted.
+
+    Idempotency is keyed on ``marker`` — the Woo note id (or a digest of the
+    customer note) embedded in the stored text. There is no field on that DocType
+    to hold a Woo id and this app must not add one to another app's DocType, so
+    the key lives in the note body where it is also human-readable.
+    """
+    try:
+        if frappe.db.exists(
+            _INVOICE_NOTE_DOCTYPE,
+            {"sales_invoice": invoice_name, "note": ["like", f"%{marker}%"]},
+        ):
+            return False
+    except Exception:  # noqa: BLE001
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Woo: invoice-note dedupe check failed for {invoice_name}",
+        )
+        return False  # never risk duplicating on a failed check
+
+    values = {
+        "doctype": _INVOICE_NOTE_DOCTYPE,
+        "sales_invoice": invoice_name,
+        "note": body,
+    }
+    try:
+        meta = frappe.get_meta(_INVOICE_NOTE_DOCTYPE)
+        if meta.get_field("added_by_full_name"):
+            values["added_by_full_name"] = (author or "WooCommerce")[:140]
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        doc = frappe.get_doc(values)
+        # Belt and braces against the echo loop: process_order_phase1 already
+        # sets the global flag, but this doc-level flag is what
+        # outbound_sync._is_outbound_suppressed checks first and it survives any
+        # caller that forgot the global one.
+        doc.flags.ignore_woo_outbound = True
+        doc.insert(ignore_permissions=True)
+        return True
+    except Exception:  # noqa: BLE001
+        # Degrade, but never silently: the DocType belongs to jarz_pos and may
+        # have mandatory fields this app does not know about.
+        _log_throttled_error(
+            key="invoice_note_insert_failed",
+            title="Woo: could not materialise a WooCommerce note",
+            message=frappe.get_traceback(),
+        )
+        return False
+
+
+def sync_woo_order_notes(
+    order: dict,
+    invoice_name: str,
+    *,
+    settings: Any,
+    client: "WooClient | None" = None,
+) -> dict[str, Any]:
+    """Pull an order's WooCommerce notes and mirror them onto the Sales Invoice.
+
+    Normally reached through :func:`sync_woo_order_notes_job`, which the inbound
+    entry points queue after commit; callable directly for a manual repair.
+
+    ``customer_note`` was only ever read on the CREATE path (straight into
+    ``remarks``), so anything the customer or a shop manager added afterwards —
+    "leave it with the doorman", "call before you arrive" — existed only on the
+    website and never reached the people doing the delivery.
+
+    Rules:
+
+    * idempotent, keyed on the Woo note id, so re-polling an order never
+      duplicates a note;
+    * notes this integration pushed OUT are skipped (see :func:`_woo_note_is_ours`);
+    * WooCommerce's own "system" notes (status-change logs) are skipped — ERPNext
+      already knows the status and they would drown the real messages;
+    * a changed ``customer_note`` is materialised too, unless it is still the text
+      already sitting in ``remarks`` from the create path;
+    * degrades quietly-but-logged when jarz_pos (and therefore the DocType) is not
+      installed.
+    """
+    result: dict[str, Any] = {"status": "skipped", "created": 0, "examined": 0}
+    woo_order_id = order.get("id")
+    if not invoice_name or not woo_order_id:
+        result["reason"] = "no_invoice"
+        return result
+    if not _inbound_order_notes_enabled(settings):
+        result["reason"] = "disabled"
+        return result
+    if not _invoice_note_doctype_available():
+        # jarz_pos not installed on this bench. Nothing is broken; say so once.
+        _log_throttled_error(
+            key="invoice_note_doctype_missing",
+            title="Woo: Jarz Invoice Note DocType is absent — order notes not mirrored",
+            message={
+                "event": "woo_invoice_note_doctype_missing",
+                "doctype": _INVOICE_NOTE_DOCTYPE,
+            },
+            ttl_seconds=86400,
+        )
+        result["reason"] = "doctype_missing"
+        return result
+
+    if client is None:
+        try:
+            client = WooClient(
+                base_url=settings.base_url,
+                consumer_key=settings.consumer_key,
+                consumer_secret=settings.get_password("consumer_secret"),
+            )
+        except Exception:  # noqa: BLE001
+            result["reason"] = "no_client"
+            return result
+
+    try:
+        notes = client.get(f"orders/{woo_order_id}/notes") or []
+    except WooTransientError:
+        # Store hiccup — the next poll of this order tries again.
+        result["reason"] = "transient"
+        return result
+    except WooAPIError as exc:
+        _log_throttled_error(
+            key=f"order_notes_fetch::{getattr(exc, 'status_code', 0)}",
+            title="Woo: could not fetch order notes",
+            message={
+                "event": "woo_order_notes_fetch_failed",
+                "woo_order_id": woo_order_id,
+                "status_code": getattr(exc, "status_code", None),
+                "message": str(exc)[:300],
+            },
+        )
+        result["reason"] = "fetch_failed"
+        return result
+
+    created = 0
+    for note in notes if isinstance(notes, list) else []:
+        if not isinstance(note, dict):
+            continue
+        result["examined"] += 1
+        body = str(note.get("note") or "").strip()
+        if not body or _woo_note_is_ours(body):
+            continue
+        if str(note.get("author") or "").strip().lower() == "system":
+            continue
+        note_id = str(note.get("id") or "").strip()
+        if not note_id:
+            continue
+        marker = f"{WOO_ORDER_NOTE_MARKER}{note_id}"
+        # Bounded so a pathological note cannot blow past the field's width.
+        stored = f"{body[:900]}\n\n{marker}"
+        if _materialize_invoice_note(
+            invoice_name, stored, marker=marker, author=str(note.get("author") or "").strip() or None
+        ):
+            created += 1
+
+    created += _materialize_changed_customer_note(order, invoice_name)
+
+    result["status"] = "synced"
+    result["created"] = created
+    return result
+
+
+def sync_woo_order_notes_job(woo_order_id: Any, invoice_name: str, customer_note: str = "") -> dict[str, Any]:
+    """Background entry point for :func:`sync_woo_order_notes`.
+
+    Only the two fields the note sync actually needs are carried across the
+    queue, so the job payload stays small and cannot go stale in an interesting
+    way: the notes themselves are re-fetched from Woo when the job runs.
+    """
+    settings = frappe.get_single("WooCommerce Settings")
+    return sync_woo_order_notes(
+        {"id": woo_order_id, "customer_note": customer_note},
+        invoice_name,
+        settings=settings,
+    )
+
+
+def enqueue_woo_order_note_sync(order: dict, invoice_name: str, *, settings: Any) -> bool:
+    """Queue the Woo note pull instead of doing it inline.
+
+    Enqueued, not inline, for three reasons: it is an extra HTTP round trip that
+    has no business being inside the order-creation transaction; a store hiccup
+    must not be able to fail or roll back an invoice that is otherwise perfectly
+    good; and ``enqueue_after_commit`` guarantees the job only runs once the
+    invoice and the Order Map row are actually committed and visible to it.
+
+    Returns True when a job was queued. Never raises — this is an enrichment.
+    """
+    woo_order_id = (order or {}).get("id")
+    if not invoice_name or not woo_order_id:
+        return False
+    if not _inbound_order_notes_enabled(settings):
+        return False
+
+    try:
+        frappe.enqueue(
+            "jarz_woocommerce_integration.services.order_sync.sync_woo_order_notes_job",
+            queue="short",
+            timeout=120,
+            enqueue_after_commit=True,
+            woo_order_id=woo_order_id,
+            invoice_name=invoice_name,
+            customer_note=str((order or {}).get("customer_note") or ""),
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        try:
+            frappe.log_error(
+                frappe.get_traceback(),
+                f"Woo: could not queue the note sync for {invoice_name}",
+            )
+        except Exception:  # noqa: BLE001
+            pass  # logging the logging failure is not worth taking a sync down
+        return False
+
+
+def _materialize_changed_customer_note(order: dict, invoice_name: str) -> int:
+    """Mirror ``customer_note`` when it no longer matches what is in ``remarks``.
+
+    On CREATE the customer note is copied into ``remarks``; a note added or edited
+    on the website after that never reached ERPNext at all, because the submitted
+    invoice is frozen and nothing re-reads the field. Materialising the change as
+    a note row keeps the invoice untouched (no GL, no re-save) while still putting
+    the text in front of whoever is fulfilling the order.
+    """
+    customer_note = str(order.get("customer_note") or "").strip()
+    if not customer_note:
+        return 0
+    try:
+        remarks = str(frappe.db.get_value("Sales Invoice", invoice_name, "remarks") or "")
+    except Exception:  # noqa: BLE001
+        remarks = ""
+    if customer_note in remarks:
+        return 0  # already on the invoice from the create path — not a change
+
+    import hashlib
+
+    digest = hashlib.sha1(customer_note.encode("utf-8")).hexdigest()[:12]
+    marker = f"{WOO_CUSTOMER_NOTE_MARKER}({digest})"
+    stored = f"{customer_note[:900]}\n\n{marker}"
+    return 1 if _materialize_invoice_note(invoice_name, stored, marker=marker, author="WooCommerce") else 0
+
+
 def _check_and_repair_submitted_invoice_drift(inv, woo_id, territory_name=None, pos_profile=None, default_warehouse=None):
     """Check if a submitted Sales Invoice has item warehouses that don't match the resolved
     POS Profile's warehouse. If drift is detected: log it loudly, and optionally repair
@@ -2529,6 +3236,99 @@ def _check_and_repair_submitted_invoice_drift(inv, woo_id, territory_name=None, 
             pass
 
 
+def _neutralize_is_pos_before_document_write(inv) -> None:
+    """Clear an in-memory ``is_pos`` before this module saves or submits a doc.
+
+    ``is_pos`` is stamped by DIRECT DB WRITE after the document is persisted (see
+    :func:`_ensure_invoice_is_pos_flag`) and must never travel through ERPNext's
+    validation on this lane:
+
+    * ``Sales Invoice.on_submit`` calls ``validate_pos_paid_amount()``, which
+      throws "At least one mode of payment is required for POS invoice." for any
+      ``is_pos`` invoice with no ``payments`` rows and a positive grand total.
+      Woo invoices are submitted UNPAID by design — payment, when it exists, is a
+      separate Payment Entry — so this would break every inbound order.
+    * ``set_pos_fields()`` fires during validate whenever ``is_pos`` is set and
+      rewrites ``selling_price_list`` (and tax category, cost center, ...) from
+      the POS Profile / customer defaults, silently re-pointing pricing that this
+      module resolved deliberately a few lines earlier.
+
+    A document loaded from a row this app has already stamped carries is_pos = 1,
+    which is exactly how that landmine would arrive. Clearing it costs nothing:
+    the caller writes the flag straight back afterwards.
+
+    DRAFTS ONLY. On a submitted document the in-memory value is compared with the
+    stored one by ``validate_update_after_submit``, so clearing it there would
+    turn a harmless flag into "Not allowed to change is_pos after submission" —
+    trading one breakage for another.
+    """
+    try:
+        if int(getattr(inv, "docstatus", 0) or 0) != 0:
+            return
+        if not int(getattr(inv, "is_pos", 0) or 0):
+            return
+        if inv.get("payments") or []:
+            return  # a genuine POS invoice with payment rows — leave it alone
+        inv.is_pos = 0
+    except Exception:  # noqa: BLE001
+        # A guard must never be the reason a save fails.
+        pass
+
+
+def _ensure_invoice_is_pos_flag(invoice_name: str, *, woo_order_id: Any = None) -> bool:
+    """Force ``is_pos = 1`` on a persisted Woo invoice. Direct DB write only.
+
+    Every Sales Invoice is meant to end up as a POS invoice — that is what the
+    POS kanban, the branch reports and the shift reconciliation all assume. The
+    543 invoices sitting at ``is_pos = 0`` are exactly the ones that ended up
+    with no ``pos_profile``: empirically the two are 1:1, so guaranteeing a
+    profile is both necessary and sufficient.
+
+    ``update_modified=False`` and no reload: these documents are submitted and
+    carry GL entries, and ``is_pos`` participates in no ledger. Re-saving or
+    re-submitting them to flip a flag would be reckless.
+
+    Returns True when the row ends up at ``is_pos = 1``.
+    """
+    if not invoice_name:
+        return False
+    try:
+        row = frappe.db.get_value(
+            "Sales Invoice", invoice_name, ["is_pos", "pos_profile"], as_dict=True
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    if not row:
+        return False
+    if int(row.get("is_pos") or 0) == 1:
+        return True
+
+    pos_profile = str(row.get("pos_profile") or "").strip()
+    if not pos_profile:
+        # Deliberately loud: with no profile ERPNext has no branch for this
+        # invoice, and setting is_pos anyway would only hide that.
+        _log_throttled_error(
+            key=f"is_pos_without_profile::{invoice_name}",
+            title="Woo: cannot set is_pos — invoice has no POS Profile",
+            message={
+                "event": "woo_is_pos_skipped_no_profile",
+                "invoice": invoice_name,
+                "woo_order_id": woo_order_id,
+            },
+        )
+        return False
+
+    try:
+        frappe.db.set_value("Sales Invoice", invoice_name, "is_pos", 1, update_modified=False)
+    except Exception:  # noqa: BLE001
+        frappe.log_error(
+            frappe.get_traceback(),
+            f"Woo: failed setting is_pos on {invoice_name}",
+        )
+        return False
+    return True
+
+
 def _apply_invoice_pos_profile(inv, pos_profile: str | None, *, submitted: bool) -> None:
     if not pos_profile:
         return
@@ -2587,6 +3387,10 @@ def _ensure_submitted_invoice_accounting(inv) -> None:
 
 
 def _submit_invoice_with_accounting_guards(inv, pos_profile: str | None = None) -> None:
+    # is_pos must not be set while ERPNext validates the submit — see
+    # _neutralize_is_pos_before_document_write. _apply_invoice_pos_profile writes
+    # it straight back afterwards, by db_set, once the document is persisted.
+    _neutralize_is_pos_before_document_write(inv)
     inv.submit()
     _ensure_submitted_invoice_accounting(inv)
     _apply_invoice_pos_profile(inv, pos_profile, submitted=True)
@@ -2994,6 +3798,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     pos_profile = None
     default_warehouse = None
     _territory_fallback_used = False
+    _territory_error = ""
     try:
         territory_name = territory_snapshot.get("resolved_order_territory") or None
         if not territory_name:
@@ -3012,6 +3817,17 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 default_warehouse = frappe.db.get_value("POS Profile", pos_profile, "warehouse")
     except Exception:
         pass
+
+    # Audit-only (F-07): record HOW the territory was resolved. Nothing about the
+    # precedence above changes — the Woo payload is the only input available here
+    # — but an order whose own states map to no Territory is no longer invisible
+    # just because the customer happened to carry one.
+    _territory_error = _audit_order_territory_resolution(
+        woo_id=woo_id,
+        territory_snapshot=territory_snapshot,
+        effective_territory=territory_name,
+        customer=customer,
+    )
 
     # Fallback: use Default POS Profile from settings when territory resolution produced nothing.
     # This is intentionally loud — fires a frappe.log_error and marks the map for self-heal.
@@ -3035,6 +3851,36 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     })
                 )
         except Exception:
+            pass
+
+    # Nothing answered — not the Territory, not settings.default_pos_profile.
+    # This is where the 533 invoices sitting at is_pos = 0 came from, and it is
+    # deliberately NOT patched over with "any enabled profile for the company":
+    # attaching an invoice to an arbitrary branch is a silent revenue-attribution
+    # decision, and on this site `is_pos = 1` has never once meant "no profile".
+    # So the invoice stays non-POS and this shouts instead: the Order Map already
+    # carries needs_territory_recheck (via _territory_fallback_used), and the fix
+    # is a one-line configuration change, not a guess made in code.
+    if not pos_profile:
+        try:
+            frappe.log_error(
+                title="Woo: no POS Profile could be resolved for this order",
+                message=frappe.as_json({
+                    "woo_order_id": woo_id,
+                    "customer": customer,
+                    "territory_name": territory_name,
+                    "billing_state": (order.get("billing") or {}).get("state"),
+                    "shipping_state": (order.get("shipping") or {}).get("state"),
+                    "settings_default_pos_profile": getattr(settings, "default_pos_profile", None),
+                    "detail": (
+                        "The invoice will be created without a POS Profile, which means "
+                        "is_pos = 0, no branch and no warehouse on its items. Map this "
+                        "Territory to a POS Profile, or set "
+                        "WooCommerce Settings.default_pos_profile."
+                    ),
+                }),
+            )
+        except Exception:  # noqa: BLE001
             pass
 
     # Final guard: if we still have no warehouse (POS Profile missing warehouse field),
@@ -3219,6 +4065,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     return _handle_terminal_status_on_submitted_invoice(
                         inv=inv, woo_id=woo_id, woo_status=woo_status,
                     )
+
+                # Flag-only self-heal, allowed on a frozen invoice for the same
+                # reason the drift repair above is: it touches no business content
+                # and no ledger. is_pos is a pure classification flag.
+                #
+                # Deliberately placed AFTER the terminal branch: that branch calls
+                # inv.cancel(), which rewrites every column from the in-memory doc
+                # and would silently undo a db_set made just before it — the same
+                # trap that once lost the cancellation labels.
+                _ensure_invoice_is_pos_flag(inv.name, woo_order_id=woo_id)
 
                 # --- OFD permanent hard-lock -----------------------------------------
                 # Once an invoice has ever reached "Out for Delivery", it may no longer
@@ -3531,6 +4387,11 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     pass
                 if inv.docstatus == 1 and delivery_result and delivery_result.get("changed"):
                     inv.flags.ignore_validate_update_after_submit = True
+                # A draft loaded from a row this app already stamped carries
+                # is_pos = 1, which would drag ERPNext's POS validation (and
+                # set_pos_fields' price-list rewrite) into this save. The flag is
+                # restored by direct DB write at the end of processing.
+                _neutralize_is_pos_before_document_write(inv)
                 inv.save(ignore_permissions=True, ignore_version=True)
                 if inv.docstatus == 1 and delivery_result and delivery_result.get("changed"):
                     _enqueue_delivery_charge_repost(inv)
@@ -3724,6 +4585,38 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         if woo_status == "failed" and inv:
             _add_payment_failure_comment(inv.name, woo_id)
 
+        # --- is_pos (F-17) ---------------------------------------------------
+        # Stamped here, by direct DB write, once the document has reached its
+        # final docstatus. Deliberately NOT set on the doc before insert/submit:
+        # ERPNext throws "At least one mode of payment is required for POS
+        # invoice." on submit for a payment-less POS invoice, and Woo invoices are
+        # submitted unpaid by design. See _neutralize_is_pos_before_document_write.
+        if inv and inv.docstatus in (1, 2):
+            _ensure_invoice_is_pos_flag(inv.name, woo_order_id=woo_id)
+
+        # --- Woo vs ERPNext price reconciliation (F-20) ----------------------
+        # Report-only. ERPNext prices always win (see _build_invoice_items); this
+        # just stops the divergence from being silent. Skipped for the historical
+        # migration: re-litigating 10k closed orders would produce noise, not work.
+        if not is_historical and not cache:
+            try:
+                price_decision = _reconcile_woo_line_prices(order, lines, settings=settings)
+                if not price_decision.get("matched"):
+                    _flag_woo_price_mismatch(
+                        woo_id=woo_id, invoice_name=inv.name, decision=price_decision
+                    )
+            except Exception:  # noqa: BLE001
+                frappe.log_error(
+                    frappe.get_traceback(),
+                    f"Woo: price reconciliation failed for order {woo_id}",
+                )
+
+        # Woo order notes (F-21) are NOT pulled here. They are queued by the
+        # inbound entry points (pull_recent_orders_phase1 / pull_single_order_phase1)
+        # for every order that reached an invoice, so the frozen path — where a
+        # live order spends its whole fulfilment life — is covered too, and this
+        # function keeps doing exactly one job.
+
         # Best-effort: surface the jarz_pos-computed promo mismatch flag onto the order map.
         # The invoice carries the authoritative flag (set by the jarz_pos before_validate hook);
         # this is a convenience copy for filtering/reporting. We read it back from the in-memory
@@ -3749,6 +4642,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     order_hash=order_hash,
                     needs_territory_recheck=1 if _territory_fallback_used else 0,
                     territory_snapshot=territory_snapshot,
+                    territory_error=_territory_error,
                 )
             )
             if promo_map_values:
@@ -3766,6 +4660,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     order_hash=order_hash,
                     needs_territory_recheck=1 if _territory_fallback_used else 0,
                     territory_snapshot=territory_snapshot,
+                    territory_error=_territory_error,
                 ),
                 **promo_map_values,
             }).insert(ignore_permissions=True)
@@ -3969,6 +4864,14 @@ def pull_recent_orders_phase1(
             process_order_phase1(o, settings, allow_update=allow_update, is_historical=is_historical)
             if not dry_run else {"status": "dry_run", "woo_order_id": o.get("id")}
         )
+        # Mirror the order's Woo notes onto the invoice (F-21). Gated on the
+        # result carrying an invoice, which is true for every outcome that
+        # actually looked at one — created, updated, submitted_frozen,
+        # out_for_delivery_locked, needs_manual_review — and false for the
+        # "unchanged"/"already_mapped" fast path, so a quiet poll costs nothing.
+        # Enqueued after commit, so a store hiccup can never affect the order.
+        if not dry_run and not is_historical and result.get("invoice"):
+            enqueue_woo_order_note_sync(o, result["invoice"], settings=settings)
         if not dry_run and result.get("status") != "error":
             frappe.db.commit()
         metrics["processed"] += 1
@@ -4174,6 +5077,10 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
         }
 
     result = process_order_phase1(order, settings, allow_update=allow_update)
+    # Same note mirroring as the polling path — this is the route webhooks, sync
+    # events, the cancellation reconcile and the manual API all come through.
+    if result.get("invoice"):
+        enqueue_woo_order_note_sync(order, result["invoice"], settings=settings)
     skipped_success_reasons = {
         "already_mapped",
         "unchanged",

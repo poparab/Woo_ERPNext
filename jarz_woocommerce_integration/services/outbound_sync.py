@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import calendar
 from dataclasses import dataclass
-from datetime import date as dt_date, datetime, time as dt_time, timedelta
+from datetime import date as dt_date, datetime, time as dt_time, timedelta, timezone
+import hashlib
 import importlib
+import json
 import re
 from typing import Any, Dict, Optional
 
@@ -27,7 +29,7 @@ from jarz_woocommerce_integration.utils.customer_woo_id import (
     has_unmigrated_legacy_customer_woo_id,
     set_customer_woo_id,
 )
-from jarz_woocommerce_integration.services import tracking_link
+from jarz_woocommerce_integration.services import payment_map, tracking_link
 from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient
 
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
@@ -109,6 +111,10 @@ _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
     "custom_delivery_time",
     "delivery_time",
     "woo_order_id",
+    # The promo engine writes the header discount after submit. Without these
+    # the invoice reached the store at full price (F-01).
+    "discount_amount",
+    "apply_discount_on",
     # Minting the tracking token is often the *only* change on an
     # already-submitted invoice, and it happens after submit. Without these the
     # hook would classify it as "nothing outbound changed" and the store would
@@ -134,6 +140,10 @@ _INVOICE_OUTBOUND_PAYLOAD_FIELDS = frozenset({
     "customer_address",
     "shipping_address_name",
     "woo_order_id",
+    # A header discount is part of the payload (it becomes a negative fee line),
+    # so a change to it must re-push the order — F-01.
+    "discount_amount",
+    "apply_discount_on",
     *tracking_link.INVOICE_TRACKING_FIELDS,
 })
 
@@ -141,6 +151,19 @@ _APPROVED_INVOICE_OUTBOUND_STATUSES = frozenset({
     "out-for-delivery",
     "completed",
     "cancelled",
+    "refunded",
+})
+
+#: Line-item meta keys **we** own. Only these may take part in the
+#: already-in-sync comparison: WooCommerce adds keys of its own to every line
+#: (``_reduced_stock``, the variation attributes), so comparing the whole
+#: ``meta_data`` tuple meant our payload could never equal the store's and every
+#: order looked dirty forever — a PUT per sync, on every order (F-18).
+_ORDER_LINE_META_KEYS_TO_COMPARE = frozenset({
+    "erpnext_item_code",
+    "discount_percentage",
+    "_woosb_parent_id",
+    "_woosb_ids",
 })
 
 
@@ -227,8 +250,11 @@ def _get_settings() -> tuple[WooCommerceSettings, OutboundConfig]:
         payment_cod=(getattr(settings, "payment_method_cod", None) or "cod").strip(),
         payment_instapay=(getattr(settings, "payment_method_instapay", None) or "instapay").strip(),
         payment_wallet=(getattr(settings, "payment_method_wallet", None) or "wallet").strip(),
-        shipping_method_id=(getattr(settings, "default_shipping_method_id", None) or "flat_rate").strip(),
-        shipping_method_title=(getattr(settings, "default_shipping_method_title", None) or "Shipping").strip(),
+        # Deliberately NOT defaulted here. An unset value must stay empty so
+        # `_build_shipping_line` can tell "the operator configured flat_rate"
+        # from "nobody ever set this" and pick the native title accordingly.
+        shipping_method_id=(getattr(settings, "default_shipping_method_id", None) or "").strip(),
+        shipping_method_title=(getattr(settings, "default_shipping_method_title", None) or "").strip(),
     )
     return settings, cfg
 
@@ -336,6 +362,19 @@ def _territory_woo_zone_label(territory: str | None) -> str:
     return english or arabic or ""
 
 
+def _is_payload_dry_run() -> bool:
+    """Whether payload building must not touch the database.
+
+    Set ``frappe.flags.woo_payload_dry_run = True`` to build an order payload
+    for inspection (diffing our wire format against a native order, say) without
+    the address realignment writing back. Off in every real code path.
+    """
+    try:
+        return bool(getattr(frappe.flags, "woo_payload_dry_run", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _realign_address_state_with_territory(address_name: str | None, city: Any, state: Any) -> str:
     """Return the ``state`` to push, realigned with the address's territory.
 
@@ -348,6 +387,10 @@ def _realign_address_state_with_territory(address_name: str | None, city: Any, s
     The realigned value is written back to the Address too: inbound order
     matching hashes city + state, so a stored value that disagrees with the
     store's would fork a duplicate Address on the next pull.
+
+    ``realign_address_state`` runs the same logic from the Address doc event, so
+    an address whose order is never pushed no longer keeps a ``state`` that
+    disagrees with its ``city`` (F-22).
     """
     territory = _resolve_leaf_territory(city)
     if not territory:
@@ -358,7 +401,7 @@ def _realign_address_state_with_territory(address_name: str | None, city: Any, s
     if not label or label == current:
         return current
 
-    if address_name:
+    if address_name and not _is_payload_dry_run():
         try:
             frappe.db.set_value("Address", address_name, "state", label, update_modified=False)
         except Exception as exc:  # noqa: BLE001
@@ -376,6 +419,73 @@ def _realign_address_state_with_territory(address_name: str | None, city: Any, s
         "state": label,
     })
     return label
+
+
+#: Address fields that can put ``state`` out of step with ``city``.
+_ADDRESS_TERRITORY_FIELDS = frozenset({"city", "state"})
+
+
+def realign_address_state(address: frappe.model.document.Document, method: str | None = None) -> None:
+    """Doc-event entry point: keep ``Address.state`` in step with its territory.
+
+    Realignment used to happen *only* as a side effect of building an outbound
+    order payload, so an address belonging to an order that was never pushed
+    kept a ``state`` that contradicted its ``city`` indefinitely — and inbound
+    order matching hashes both, so the next pull forked a duplicate Address
+    (F-22).
+
+    A doc event rather than a scheduled sweep, deliberately: the two fields that
+    can drift are written here and nowhere else, so the event fires exactly when
+    drift becomes possible and never otherwise. A sweep would re-resolve every
+    Address in the system on a timer to find the handful that moved.
+
+    Three guards, all necessary:
+
+    * ``ignore_woo_outbound`` — during an inbound sync the store's values are
+      authoritative and rewriting them here would fight the puller;
+    * a re-entrancy flag — the write-back is a ``db.set_value``, which does not
+      re-fire doc events today, but this must not become a recursion if that
+      ever changes;
+    * a changed-fields check on ``on_update`` — every Address save would
+      otherwise pay for a territory resolution it cannot need.
+
+    Never raises: an address save must not fail because a delivery zone could
+    not be resolved.
+    """
+    try:
+        if _is_outbound_suppressed(address):
+            return
+        if getattr(frappe.flags, "woo_realigning_address_state", False):
+            return
+        if method == "on_update" and not _get_changed_fields(address, _ADDRESS_TERRITORY_FIELDS):
+            return
+
+        address_name = _get_doc_value(address, "name")
+        city = _get_doc_value(address, "city")
+        state = _get_doc_value(address, "state")
+        if not address_name or not str(city or "").strip():
+            return
+
+        frappe.flags.woo_realigning_address_state = True
+        try:
+            realigned = _realign_address_state_with_territory(address_name, city, state)
+        finally:
+            frappe.flags.woo_realigning_address_state = False
+
+        # Keep the in-memory document consistent with what was just written, so
+        # anything reading the doc later in this request sees the same value.
+        if realigned and realigned != str(state or ""):
+            try:
+                address.state = realigned
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_address_state_realign_hook_failed",
+            "address": _get_doc_value(address, "name"),
+            "method": method,
+            "error": str(exc),
+        })
 
 
 def _get_address_payload(address_name: str | None, *, fallback_name: str, phone: str | None, email: str | None) -> dict:
@@ -1123,6 +1233,12 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
     if not isinstance(invoice, str):
         reason = reason if reason != "event" else (method or "event")
         cancel = cancel or method == "on_cancel"
+        # A credit note is never pushed as an order, but it is not nothing
+        # either: it changes what the customer's ORDER means. Routed to its own
+        # handler (F-16) instead of being dropped on the floor.
+        if _is_credit_note(invoice):
+            _enqueue_invoice_return_sync(invoice, method=method, force=force)
+            return
         if not _should_enqueue_invoice_event(invoice, method=method, cancel=cancel, force=force):
             return
         invoice_name = invoice.name
@@ -1170,6 +1286,204 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
     )
 
 
+def _is_credit_note(invoice: Any) -> bool:
+    try:
+        return bool(cint(_get_doc_value(invoice, "is_return", 0)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _enqueue_invoice_return_sync(
+    credit_note: frappe.model.document.Document,
+    *,
+    method: str | None = None,
+    force: bool = False,
+) -> None:
+    """Queue the Woo-side reflection of a submitted (or cancelled) credit note.
+
+    Credit notes are still never pushed *as orders* — see the guard in
+    ``sync_sales_invoice``. What changed is that they no longer vanish: a return
+    is the one event that can make the store's copy of an order wrong in the
+    customer's favour, and it used to leave the order reading ``completed``
+    forever (F-16).
+    """
+    if _is_outbound_suppressed(credit_note):
+        return
+    if method not in (None, "on_submit", "on_cancel") and not force:
+        return
+
+    credit_note_name = str(_get_doc_value(credit_note, "name", "") or "").strip()
+    return_against = str(_get_doc_value(credit_note, "return_against", "") or "").strip()
+    if not credit_note_name or not return_against:
+        return
+
+    frappe.enqueue(
+        "jarz_woocommerce_integration.services.outbound_sync.sync_invoice_return",
+        queue="short",
+        timeout=600,
+        enqueue_after_commit=not force,
+        now=force,
+        credit_note_name=credit_note_name,
+    )
+
+
+def _get_original_invoice_return_row(invoice_name: str) -> dict[str, Any]:
+    """``grand_total`` / ``currency`` / ``custom_return_status`` for an invoice.
+
+    ``custom_return_status`` belongs to jarz_pos, so the query is guarded: on a
+    bench without that app the column does not exist and asking for it raises
+    rather than returning a partial row. Falling back to the two stock fields
+    keeps this app inert there instead of broken.
+    """
+    fields = ["grand_total", "currency", "custom_return_status"]
+    try:
+        row = frappe.db.get_value("Sales Invoice", invoice_name, fields, as_dict=True)
+    except Exception:  # noqa: BLE001
+        row = frappe.db.get_value(
+            "Sales Invoice", invoice_name, ["grand_total", "currency"], as_dict=True
+        )
+    return dict(row or {})
+
+
+def _return_is_full(
+    return_status: Any,
+    *,
+    returned_total: float,
+    original_total: float,
+) -> bool:
+    """Whether a return covers the whole order.
+
+    The canonical ``custom_return_status`` decides when it says so. It is set
+    across two saves, though, so a blank — or a value still reading
+    ``Partially Returned`` while a second credit note lands — must not be taken
+    as proof of the opposite. The credit-note sum stays underneath it as the
+    accounting answer that cannot lag.
+    """
+    if str(return_status or "").strip().casefold() == _RETURN_STATUS_FULL:
+        return True
+    return original_total > 0 and returned_total >= original_total - _RETURN_TOLERANCE
+
+
+def sync_invoice_return(credit_note_name: str) -> dict:
+    """Reflect an ERPNext credit note onto the ORIGINAL WooCommerce order.
+
+    Never pushes the credit note itself — it is a local accounting document, not
+    an order. Instead:
+
+    * a **full** return — ``custom_return_status`` on the original reads
+      ``Fully Returned``, or the submitted credit notes add up to its grand
+      total — drives the original order to ``refunded``; ``_determine_status``
+      derives that on its own, so this simply re-syncs the original invoice;
+    * a **partial** return leaves the status alone — the order really was
+      delivered — and records what came back as a Woo order note, so the
+      customer-facing history is honest without lying about the state.
+
+    Cancelling a credit note runs the same path: ``_returned_amount`` drops back
+    and the original leaves ``refunded`` by itself.
+    """
+    settings, cfg = _get_settings()
+    if not cfg.enable_order_push:
+        _note_outbound_disabled("enable_outbound_orders")
+        return {"skipped": True, "reason": "disabled"}
+
+    try:
+        credit_note = frappe.get_doc("Sales Invoice", credit_note_name)
+    except frappe.DoesNotExistError:
+        return {"skipped": True, "reason": "missing"}
+
+    if not _is_credit_note(credit_note):
+        return {"skipped": True, "reason": "not_a_credit_note"}
+
+    original_invoice = str(_get_doc_value(credit_note, "return_against", "") or "").strip()
+    if not original_invoice:
+        return {"skipped": True, "reason": "no_return_against"}
+
+    woo_order_id = _resolve_note_woo_order_id(original_invoice)
+    if not woo_order_id:
+        # The original never reached the store, so there is no order to correct.
+        return {"skipped": True, "reason": "no_woo_order", "invoice": original_invoice}
+
+    original_row = _get_original_invoice_return_row(original_invoice)
+    original_total = flt(original_row.get("grand_total") or 0)
+    returned_total = _returned_amount(original_invoice)
+    is_full = _return_is_full(
+        original_row.get("custom_return_status"),
+        returned_total=returned_total,
+        original_total=original_total,
+    )
+
+    currency = str(original_row.get("currency") or "").strip()
+    currency_suffix = f" {currency}" if currency else ""
+    if returned_total <= _RETURN_TOLERANCE:
+        # Every credit note against this order has been cancelled.
+        body = (
+            f"Jarz POS: the return against this order was reversed — nothing is "
+            f"credited any more. Credit note: {credit_note_name}."
+        )
+    else:
+        body = (
+            f"Jarz POS: {'Full' if is_full else 'Partial'} return recorded against this "
+            f"order ({returned_total:.2f}{currency_suffix} of "
+            f"{original_total:.2f}{currency_suffix} returned). "
+            f"Credit note: {credit_note_name}."
+        )
+
+    try:
+        client = _build_client(settings)
+    except ValueError:
+        return {"skipped": True, "reason": "missing_credentials"}
+
+    note_outcome = _post_woo_order_note(client, woo_order_id, body)
+    return_status = str(original_row.get("custom_return_status") or "").strip()
+    LOGGER.info({
+        "event": "woo_outbound_return_noted",
+        "credit_note": credit_note_name,
+        "invoice": original_invoice,
+        "woo_order_id": woo_order_id,
+        "returned_total": returned_total,
+        "original_total": original_total,
+        "return_status": return_status or None,
+        "full_return": is_full,
+        "note": note_outcome,
+    })
+
+    # The canonical flag is written across two saves, so it can legitimately lag
+    # the credit notes for a moment. A disagreement that persists means the two
+    # have genuinely diverged, and the accounting is what we acted on.
+    if return_status.casefold() == _RETURN_STATUS_PARTIAL and is_full:
+        LOGGER.warning({
+            "event": "woo_outbound_return_status_disagrees_with_credit_notes",
+            "invoice": original_invoice,
+            "return_status": return_status,
+            "returned_total": returned_total,
+            "original_total": original_total,
+            "detail": (
+                "custom_return_status still reads Partially Returned while the submitted "
+                "credit notes cover the whole invoice; the order was pushed as refunded."
+            ),
+        })
+
+    result = {
+        "status": "ok",
+        "woo_order_id": woo_order_id,
+        "invoice": original_invoice,
+        "full_return": is_full,
+        "note": note_outcome,
+    }
+
+    # Always re-sync the original, not just on a full return. Crossing the
+    # full/partial line in *either* direction changes the Woo status: a full
+    # return makes it `refunded`, and cancelling that credit note has to take it
+    # back off `refunded` again. `_order_payload_requires_update` drops the PUT
+    # when nothing actually moved, so a partial return costs one GET.
+    # Run inline: we are already in a background job and re-queueing adds a hop.
+    result["order_sync"] = sync_sales_invoice(
+        original_invoice,
+        reason="credit_note_full" if is_full else "credit_note_partial",
+    )
+    return result
+
+
 #: The POS keeps its order notes in a DocType owned by jarz_pos. This app never
 #: imports that app — it listens for the doc event by name only, so the hook is
 #: simply inert wherever jarz_pos is not installed.
@@ -1206,6 +1520,120 @@ def enqueue_invoice_note_sync(note: frappe.model.document.Document, method: str 
     )
 
 
+def _post_woo_order_note(client: WooClient, woo_order_id: Any, body: str) -> str:
+    """Post a private order note, once. Returns ``posted``/``already_posted``/an error.
+
+    A queued job can be retried and WooCommerce has no natural key for a note,
+    so an unguarded post shows the same message twice in the order screen.
+    """
+    body = str(body or "").strip()
+    if not woo_order_id or not body:
+        return "empty_note"
+
+    try:
+        for existing in client.get(f"orders/{woo_order_id}/notes") or []:
+            if str(existing.get("note") or "").strip() == body:
+                return "already_posted"
+    except WooAPIError:
+        pass  # a failed pre-check must not stop the note itself
+
+    try:
+        client.post(f"orders/{woo_order_id}/notes", {"note": body, "customer_note": False})
+    except WooAPIError as exc:
+        return exc.message or f"note_post_failed:{exc.status_code}"
+    return "posted"
+
+
+def _report_unpayable_transition(client: WooClient, woo_order_id: Any, invoice_name: str) -> None:
+    """Record the one-way ``set_paid`` limitation on the order itself.
+
+    See ``_detect_unpayable_transition``. Nothing here can un-pay the order, so
+    the only honest thing to do is make the divergence visible to a human. The
+    note text is fixed so the idempotency check in ``_post_woo_order_note``
+    keeps it to one note per order rather than one per sync.
+    """
+    if not woo_order_id:
+        return
+    body = (
+        "Jarz POS: this order is no longer settled in ERPNext (the invoice has an "
+        "outstanding balance again), but WooCommerce cannot be moved back to "
+        "unpaid over the API — set_paid only ever marks an order paid. The store "
+        "will keep showing this order as paid until someone clears the payment in "
+        f"wp-admin. ERPNext invoice: {invoice_name}."
+    )
+    outcome = _post_woo_order_note(client, woo_order_id, body)
+    LOGGER.warning({
+        "event": "woo_outbound_unpayable_transition",
+        "invoice": invoice_name,
+        "woo_order_id": woo_order_id,
+        "note": outcome,
+    })
+
+
+#: Tolerance for the outbound total assertion: one piastre.
+_TOTAL_ASSERT_TOLERANCE = 0.01
+
+
+def _check_response_total(
+    response: Any,
+    invoice: frappe.model.document.Document,
+    *,
+    invoice_name: str,
+    payload: dict | None = None,
+    reason: str | None = None,
+) -> str | None:
+    """Error string when the store's order total disagrees with ``grand_total``.
+
+    This site has no VAT rows — the only tax row in use is the shipping-income
+    ``Actual`` charge — so an order total is exactly
+    ``sum(line totals) + shipping - header discount``, which is ``grand_total``.
+    Any drift means a component did not survive the push (a dropped line, a
+    discount that never became a fee line, a shipping row read wrong), and until
+    now that was completely silent: the invoice was marked Synced regardless.
+
+    **Only asserted when the payload actually carried the money.** A status-only
+    update sends no ``line_items``, so the store's total is whatever it already
+    held — and for the 10,651 Woo-origin orders that can legitimately differ from
+    ``grand_total``, because inbound deliberately ignores Woo prices and rebuilds
+    every line from the ERPNext price list. Asserting there would convert a
+    working pipeline into a wall of false errors.
+
+    The tolerance grows by one piastre per line: each line total is rounded to
+    two decimals independently, so a long order can drift by a few cents without
+    anything being wrong. A real failure is orders of magnitude larger — the
+    live F-01 case is 640 EGP on a 30 EGP invoice.
+    """
+    if not isinstance(response, dict):
+        return None
+    line_items = (payload or {}).get("line_items") or []
+    if not line_items:
+        return None
+    raw_total = response.get("total")
+    if raw_total in (None, ""):
+        return None
+
+    store_total = flt(raw_total)
+    invoice_total = flt(_get_doc_value(invoice, "grand_total", 0))
+    difference = abs(store_total - invoice_total)
+    tolerance = _TOTAL_ASSERT_TOLERANCE * (1 + len(line_items))
+    if difference <= tolerance:
+        return None
+
+    LOGGER.error({
+        "event": "woo_outbound_total_mismatch",
+        "invoice": invoice_name,
+        "woo_order_id": response.get("id"),
+        "store_total": store_total,
+        "invoice_grand_total": invoice_total,
+        "difference": difference,
+        "reason": reason,
+    })
+    return (
+        f"WooCommerce order total {store_total:.2f} does not match invoice "
+        f"grand_total {invoice_total:.2f} (difference {difference:.2f})"
+    )
+
+
 def sync_invoice_note(note_name: str) -> dict:
     """Post one POS order note to its Woo order as a private order note."""
     settings, cfg = _get_settings()
@@ -1234,27 +1662,18 @@ def sync_invoice_note(note_name: str) -> dict:
     except ValueError:
         return {"status": "skipped", "reason": "missing_credentials"}
 
-    # A queued job can be retried, and Woo has no natural key for a note, so an
-    # unguarded post shows the same message twice in the order screen.
-    try:
-        for existing in client.get(f"orders/{woo_order_id}/notes") or []:
-            if str(existing.get("note") or "").strip() == body.strip():
-                return {"status": "skipped", "reason": "already_posted", "woo_order_id": woo_order_id}
-    except WooAPIError:
-        pass  # a failed pre-check must not stop the note itself
-
-    try:
-        client.post(f"orders/{woo_order_id}/notes", {"note": body, "customer_note": False})
-    except WooAPIError as exc:
+    outcome = _post_woo_order_note(client, woo_order_id, body)
+    if outcome == "already_posted":
+        return {"status": "skipped", "reason": "already_posted", "woo_order_id": woo_order_id}
+    if outcome != "posted":
         LOGGER.error({
             "event": "woo_outbound_note_error",
             "note": note_name,
             "invoice": invoice_name,
             "woo_order_id": woo_order_id,
-            "status_code": exc.status_code,
-            "message": exc.message,
+            "detail": outcome,
         })
-        return {"status": "error", "detail": exc.message}
+        return {"status": "error", "detail": outcome}
 
     LOGGER.info({
         "event": "woo_outbound_note_synced",
@@ -1472,9 +1891,40 @@ def _get_item_product_row(item_code: str, *, cache: dict[str, dict[str, Any]]) -
     if not key:
         return {}
     if key not in cache:
-        row = frappe.db.get_value("Item", key, ["woo_product_id", "item_name"], as_dict=True)
+        try:
+            row = frappe.db.get_value(
+                "Item", key, ["woo_product_id", "woo_variation_id", "item_name"], as_dict=True
+            )
+        except Exception:  # noqa: BLE001
+            # `woo_variation_id` is a Custom Field. On a bench where the fixture
+            # has not been applied the query raises instead of returning a
+            # partial row, so fall back to the columns that certainly exist —
+            # one degraded lookup rather than a failed push.
+            row = frappe.db.get_value("Item", key, ["woo_product_id", "item_name"], as_dict=True)
         cache[key] = dict(row or {})
     return cache[key]
+
+
+def _resolve_item_product_identity(product_row: dict[str, Any] | None) -> tuple[Optional[int], Optional[int]]:
+    """``(product_id, variation_id)`` for an Item, honouring *both* mapping fields.
+
+    ``Item.woo_product_id`` holds either a bare product id or the composite
+    ``"<product>:<variation>"``. Separately, ``Item.woo_variation_id`` carries
+    the variation on its own — and outbound used to read only the first field,
+    so an Item mapped that way resolved to nothing, raised
+    ``MissingWooProductError`` and failed the **entire** invoice over one line
+    (F-12). It also meant a variation Item reached the store as its parent
+    product with no variation attached.
+
+    Hardening rather than a live bug fix: zero variation-only Items exist today.
+    """
+    row = product_row or {}
+    product_id, variation_id = _parse_product_identifier(row.get("woo_product_id"))
+    if variation_id is None:
+        candidate, _ = _parse_product_identifier(row.get("woo_variation_id"))
+        if candidate:
+            variation_id = candidate
+    return product_id, variation_id
 
 
 def _get_bundle_link_key(item: frappe.model.document.Document) -> str:
@@ -1506,23 +1956,56 @@ def _collect_explicit_bundle_parent_product_ids(
         item_code = str(getattr(item, "item_code", "") or "").strip()
         if not bundle_key or not item_code:
             continue
-        product_identifier = _get_item_product_row(item_code, cache=item_product_rows).get("woo_product_id")
-        product_id, variation_id = _parse_product_identifier(product_identifier)
+        product_row = _get_item_product_row(item_code, cache=item_product_rows)
+        product_id, variation_id = _resolve_item_product_identity(product_row)
         if variation_id is None and product_id is not None:
             parent_product_ids[bundle_key] = product_id
     return parent_product_ids
 
 
+def _invoice_uses_explicit_bundle_flags(invoice: frappe.model.document.Document) -> bool:
+    """Whether this invoice carries the modern ``is_bundle_*`` markers at all."""
+    for item in getattr(invoice, "items", []) or []:
+        if _is_explicit_bundle_parent_item(item) or _is_explicit_bundle_child_item(item):
+            return True
+    return False
+
+
+def _allow_bundle_parent_inference(invoice: frappe.model.document.Document) -> bool:
+    """Whether the legacy "this row *looks* like a bundle parent" guess may run.
+
+    The guess (registered bundle product id + price_list_rate > 0 + rate/amount
+    <= 0 + discount >= 100) exists for invoices written before either builder
+    stamped ``is_bundle_parent``. It is a *heuristic*, and it silently deletes
+    the line it matches — so a genuine 100%-off giveaway of a bundle-registered
+    product disappears from the customer's order (F-11).
+
+    Both builders set the explicit flags today (``BundleProcessor`` stamps
+    ``is_bundle_parent``/``parent_bundle``, and the POS cart does the same), so
+    the guess is switched off entirely for any invoice that uses them: the flags
+    are then authoritative and an unflagged 100%-off row is exactly what it
+    looks like. It also cannot run on a single-line invoice, because a bundle
+    parent without children on the same document is not a bundle.
+    """
+    if _invoice_uses_explicit_bundle_flags(invoice):
+        return False
+    return len(list(getattr(invoice, "items", []) or [])) > 1
+
+
 def _is_bundle_parent_item(
     item: frappe.model.document.Document,
     *,
-    product_identifier: str | None,
+    product_id: Optional[int],
+    variation_id: Optional[int],
     registered_bundle_product_ids: set[str],
+    allow_inference: bool = True,
 ) -> bool:
     if _is_truthy_flag(getattr(item, "is_bundle_parent", 0)):
         return True
 
-    product_id, variation_id = _parse_product_identifier(product_identifier)
+    if not allow_inference:
+        return False
+
     if variation_id is not None or product_id is None:
         return False
 
@@ -1542,7 +2025,80 @@ def _is_bundle_parent_item(
     )
 
 
+def _woosb_selection_token(item_code: str) -> str:
+    """The short WooSB-internal token that occupies ``_woosb_ids`` part 1.
+
+    Native entries look like ``13777/anox/1/{"attribute_pa_size":"medium"}``.
+    Nothing on either side reads part 1 — our parser takes parts 0 and 2 — but
+    a native order always has one, so we emit one to stay indistinguishable.
+
+    Derived from the item code rather than generated, deliberately: a fresh
+    token on every push would make the meta value differ every time and
+    re-create exactly the permanently-dirty comparator F-18 removes.
+    """
+    digest = hashlib.sha1(str(item_code or "").encode("utf-8")).hexdigest()
+    return digest[:4]
+
+
+def _woosb_selection_identifier(product_id: Optional[int], variation_id: Optional[int]) -> str:
+    """Part 0 of a ``_woosb_ids`` entry: the variation id, else the product id.
+
+    Matches native WooSB, which writes the variation id there for a variable
+    product, and matches ``order_sync._resolve_bundle_selection_item_code``,
+    which tries ``Item.woo_variation_id`` before ``Item.woo_product_id``. Using
+    the variation id is therefore both the native shape *and* the only value
+    that resolves back to one specific Item when several variations share a
+    parent product id.
+    """
+    return str(variation_id or product_id or "")
+
+
+def _build_woosb_ids_value(children: list[dict[str, Any]]) -> str:
+    """Render the parent-side ``_woosb_ids`` selection string.
+
+    Grammar, verbatim from a website-created order::
+
+        13777/anox/1/{"attribute_pa_size":"medium"},13780/88zq/1/{...}
+
+        part 0  child variation id (product id when the Item has no variation)
+        part 1  short WooSB token
+        part 2  quantity, TOTAL across the parent line (per-bundle x parent qty)
+        part 3  attributes JSON
+
+    Returns ``""`` when any child cannot be described honestly — a partial
+    selection string is worse than none, because inbound treats ``_woosb_ids``
+    as authoritative and would rebuild the bundle from an incomplete list.
+    """
+    entries: list[str] = []
+    for child in children:
+        identifier = _woosb_selection_identifier(child.get("product_id"), child.get("variation_id"))
+        quantity = int(flt(child.get("qty") or 0))
+        if not identifier or quantity <= 0:
+            return ""
+        attributes = child.get("attributes") or "{}"
+        entries.append(f"{identifier}/{child.get('token') or ''}/{quantity}/{attributes}")
+    return ",".join(entries)
+
+
 def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[dict], list[str]]:
+    """Render the invoice's items in the shape a website-created order has.
+
+    Bundle wire format (F-10), taken from a genuinely native order:
+
+    * the **parent** line carries the whole bundle price and the ``_woosb_ids``
+      selection string;
+    * every **child** line is zero-rated and carries ``_woosb_parent_id``.
+
+    ERPNext models a bundle the other way round — zero-rated parent, discounted
+    children — and that internal representation is deliberately left alone. Only
+    the wire format changes here, and the *sum* of the emitted line totals is
+    identical either way, so the order total is unaffected.
+
+    Child rows that share a (product, variation, parent) identity are merged
+    into one line: ERPNext can legitimately produce the same item twice when a
+    bundle asks for it from two different item groups, but a native order shows
+    it once with the combined quantity.
+    """
     line_items: list[dict] = []
     missing_products: list[str] = []
     registered_bundle_product_ids = _get_registered_bundle_product_ids(invoice)
@@ -1551,8 +2107,16 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
         invoice,
         item_product_rows=item_product_rows,
     )
+    allow_bundle_parent_inference = _allow_bundle_parent_inference(invoice)
 
-    for item in invoice.items:
+    #: bundle link key -> the emitted parent entry, priced once every child is known
+    parent_entries: dict[str, dict] = {}
+    #: bundle link key -> child records in emission order (drives ``_woosb_ids``)
+    parent_children: dict[str, list[dict[str, Any]]] = {}
+    #: (bundle key, product, variation) -> the child record that owns that line
+    child_slots: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+    for item in getattr(invoice, "items", []) or []:
         qty = flt(item.qty)
         if qty <= 0:
             continue
@@ -1560,16 +2124,51 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
         rate = flt(_get_doc_value(item, "rate", 0))
         amount = flt(_get_doc_value(item, "amount", 0))
         product_row = _get_item_product_row(item.item_code, cache=item_product_rows)
-        product_identifier = (product_row or {}).get("woo_product_id")
-        product_id, variation_id = _parse_product_identifier(product_identifier)
+        product_id, variation_id = _resolve_item_product_identity(product_row)
 
-        if not product_identifier or (product_id is None and variation_id is None):
+        if product_id is None and variation_id is None:
+            # No Woo product to point at. Only 14 of 26 Jarz Bundles carry a
+            # `woo_product_id`, so an unmapped *bundle parent* is routine — and
+            # it is worth nothing (100% discounted, amount 0), while its
+            # children below carry the whole price and fall through to the
+            # ordinary priced-line branch. Dropping it therefore FLATTENS the
+            # bundle: the store loses the gift-box grouping but keeps every item
+            # and every piastre. Raising instead is what stranded 11 production
+            # invoices at `woo_outbound_status = error`, their status updates no
+            # longer reaching the store at all.
+            if _is_explicit_bundle_parent_item(item) and abs(amount) <= _TOTAL_ASSERT_TOLERANCE:
+                LOGGER.warning({
+                    "event": "woo_outbound_bundle_flattened_unmapped_parent",
+                    "invoice": getattr(invoice, "name", None),
+                    "item_code": item.item_code,
+                    "bundle": _get_bundle_link_key(item),
+                    "detail": (
+                        "Bundle parent has no Item.woo_product_id, so the order is pushed "
+                        "with its children as ordinary priced lines. Map the bundle to a "
+                        "Woo product (and add a Woo Jarz Bundle record) to restore the "
+                        "native bundle grouping in the store."
+                    ),
+                })
+                continue
+            # A priced line we cannot express. Dropped rather than failing the
+            # whole order — but recorded, because the total assertion after the
+            # push will now notice the money that went missing.
             missing_products.append(item.item_code)
             continue
+        if product_id is None:
+            # A variation with no parent product id still identifies a purchasable
+            # thing; emit it and say so rather than failing the whole invoice.
+            LOGGER.warning({
+                "event": "woo_outbound_line_variation_only_mapping",
+                "invoice": getattr(invoice, "name", None),
+                "item_code": item.item_code,
+                "variation_id": variation_id,
+            })
 
         if _is_explicit_bundle_parent_item(item):
             entry = {
                 "quantity": int(qty),
+                # Priced after the loop, from the children's ERPNext amounts.
                 "subtotal": _format_money(0),
                 "total": _format_money(0),
                 "name": item.item_name or item.item_code,
@@ -1582,14 +2181,106 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
             if variation_id:
                 entry["variation_id"] = variation_id
             line_items.append(entry)
+            bundle_key = _get_bundle_link_key(item)
+            if bundle_key:
+                parent_entries[bundle_key] = entry
+                parent_children.setdefault(bundle_key, [])
+            else:
+                LOGGER.warning({
+                    "event": "woo_outbound_bundle_parent_without_link_key",
+                    "invoice": getattr(invoice, "name", None),
+                    "item_code": item.item_code,
+                })
             continue
 
         if _is_bundle_parent_item(
             item,
-            product_identifier=product_identifier,
+            product_id=product_id,
+            variation_id=variation_id,
             registered_bundle_product_ids=registered_bundle_product_ids,
+            allow_inference=allow_bundle_parent_inference,
         ):
+            # Legacy guess, and it *deletes* the line — never silently.
+            LOGGER.warning({
+                "event": "woo_outbound_inferred_bundle_parent_dropped",
+                "invoice": getattr(invoice, "name", None),
+                "item_code": item.item_code,
+                "product_id": product_id,
+                "qty": qty,
+                "price_list_rate": price_list_rate,
+                "rate": rate,
+                "amount": amount,
+                "discount_percentage": flt(_get_doc_value(item, "discount_percentage", 0)),
+                "detail": (
+                    "Row inferred to be a WooSB bundle parent (registered bundle product, "
+                    "100% discounted) and omitted from the Woo payload because the store "
+                    "already carries the parent. If this was a genuine giveaway line, mark "
+                    "the real bundle rows with is_bundle_parent/parent_bundle."
+                ),
+            })
             continue
+
+        bundle_key = _get_bundle_link_key(item) if _is_explicit_bundle_child_item(item) else ""
+        parent_product_id = explicit_bundle_parent_product_ids.get(bundle_key) if bundle_key else None
+
+        if bundle_key and parent_product_id:
+            slot_key = (bundle_key, str(product_id or ""), str(variation_id or ""))
+            record = child_slots.get(slot_key)
+            if record is not None:
+                # Same product, same bundle: one native line, combined quantity.
+                record["qty"] += qty
+                record["amount"] += amount
+                record["entry"]["quantity"] = int(record["qty"])
+                LOGGER.info({
+                    "event": "woo_outbound_bundle_child_merged",
+                    "invoice": getattr(invoice, "name", None),
+                    "item_code": item.item_code,
+                    "bundle": bundle_key,
+                    "merged_qty": record["qty"],
+                })
+                continue
+
+            entry = {
+                "quantity": int(qty),
+                # Native children are free; the money is on the parent line.
+                "subtotal": _format_money(0),
+                "total": _format_money(0),
+                "name": item.item_name or item.item_code,
+                "meta_data": [
+                    {"key": "erpnext_item_code", "value": item.item_code},
+                    {"key": "_woosb_parent_id", "value": str(parent_product_id)},
+                ],
+            }
+            if product_id:
+                entry["product_id"] = product_id
+            if variation_id:
+                entry["variation_id"] = variation_id
+            line_items.append(entry)
+            record = {
+                "entry": entry,
+                "qty": qty,
+                "amount": amount,
+                "product_id": product_id,
+                "variation_id": variation_id,
+                "token": _woosb_selection_token(item.item_code),
+                # We do not carry Woo variation attributes in ERPNext, and an
+                # invented value would be a lie the store renders.
+                "attributes": "{}",
+            }
+            child_slots[slot_key] = record
+            parent_children.setdefault(bundle_key, []).append(record)
+            continue
+
+        if bundle_key and not parent_product_id:
+            # Flagged as a child but its parent is not on this invoice (or the
+            # parent Item has no Woo mapping). Keep the row priced: making it
+            # free with no parent to carry the money would under-bill the order.
+            LOGGER.warning({
+                "event": "woo_outbound_bundle_child_without_parent",
+                "invoice": getattr(invoice, "name", None),
+                "item_code": item.item_code,
+                "bundle": bundle_key,
+            })
 
         subtotal_base = price_list_rate or rate
         subtotal = subtotal_base * qty if subtotal_base else amount
@@ -1608,51 +2299,134 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
             entry["variation_id"] = variation_id
         discount_percentage = flt(_get_doc_value(item, "discount_percentage", 0))
         if discount_percentage:
-            entry["meta_data"].append({"key": "discount_percentage", "value": discount_percentage})
-
-        if _is_explicit_bundle_child_item(item):
-            parent_product_id = explicit_bundle_parent_product_ids.get(_get_bundle_link_key(item))
-            if parent_product_id:
-                entry["meta_data"].append({"key": "_woosb_parent_id", "value": str(parent_product_id)})
+            # Emitted as a normalised string so the value we send and the value
+            # WooCommerce echoes back compare equal (see F-18).
+            entry["meta_data"].append({
+                "key": "discount_percentage",
+                "value": _normalize_meta_compare_value(discount_percentage),
+            })
 
         line_items.append(entry)
+
+    for bundle_key, entry in parent_entries.items():
+        children = parent_children.get(bundle_key) or []
+        bundle_total = sum(flt(child.get("amount") or 0) for child in children)
+        entry["subtotal"] = _format_money(bundle_total)
+        entry["total"] = _format_money(bundle_total)
+
+        woosb_ids = _build_woosb_ids_value(children)
+        if woosb_ids:
+            entry["meta_data"].append({"key": "_woosb_ids", "value": woosb_ids})
+        else:
+            LOGGER.warning({
+                "event": "woo_outbound_bundle_selection_string_unavailable",
+                "invoice": getattr(invoice, "name", None),
+                "bundle": bundle_key,
+                "children": len(children),
+                "detail": (
+                    "Parent line pushed without _woosb_ids; the store falls back to the "
+                    "child lines' _woosb_parent_id, which our inbound parser also accepts."
+                ),
+            })
+
     return line_items, missing_products
 
 
+def _resolve_shipping_income_account(company: str | None) -> str | None:
+    """The account a shipping-income tax row is booked to, for this company.
+
+    Mirrors ``order_sync._get_shipping_income_account``, which is what the
+    inbound lane uses when it *writes* the row — so matching on it here is an
+    exact identity test rather than a guess. Imported lazily: ``order_sync`` is
+    a heavy module and outbound already reaches into it that way, which also
+    keeps the import graph acyclic.
+    """
+    company = str(company or "").strip()
+    if not company:
+        return None
+    try:
+        from jarz_woocommerce_integration.services.order_sync import _get_shipping_income_account
+
+        return _get_shipping_income_account(company)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_shipping_account_lookup_failed",
+            "company": company,
+            "error": str(exc),
+        })
+        return None
+
+
 def _compute_shipping_total(invoice: frappe.model.document.Document) -> float:
+    """Sum the invoice's shipping-income charge rows.
+
+    Identity first, text second. The old test was ``"ship" in description or
+    "delivery" in account``, which is why an item called "Delivery Box" was
+    counted as freight, and why any tax row whose description happened to
+    mention shipping inflated the number pushed to the store.
+
+    The account head is the reliable signal: the shipping row is always the
+    ``Actual`` charge booked to the company's shipping-income account (there is
+    no VAT row on this site, so it is the only tax row in practice). The
+    description match is kept purely as a fallback for rows booked elsewhere,
+    and it says so in the log when it fires. The old "scan item *names* for the
+    word shipping" fallback is gone — it could only ever double-count a real
+    product.
+    """
+    shipping_account = _resolve_shipping_income_account(getattr(invoice, "company", None))
+    normalized_account = str(shipping_account or "").strip().casefold()
+
     shipping_total = 0.0
+    fallback_total = 0.0
+    fallback_rows: list[str] = []
+
     for tax in getattr(invoice, "taxes", []) or []:
-        description = (getattr(tax, "description", "") or "").lower()
-        account = (getattr(tax, "account_head", "") or "").lower()
-        if getattr(tax, "charge_type", "") == "Actual" and (
-            "ship" in description
-            or "delivery" in description
-            or "ship" in account
-            or "delivery" in account
-        ):
-            shipping_total += flt(getattr(tax, "tax_amount", 0))
-    if shipping_total > 0:
+        if str(getattr(tax, "charge_type", "") or "") != "Actual":
+            continue
+        account = str(getattr(tax, "account_head", "") or "").strip()
+        amount = flt(getattr(tax, "tax_amount", 0))
+
+        if normalized_account and account.casefold() == normalized_account:
+            shipping_total += amount
+            continue
+
+        description = str(getattr(tax, "description", "") or "").casefold()
+        if "ship" in description or "delivery" in description:
+            fallback_total += amount
+            fallback_rows.append(f"{account}|{description[:60]}")
+
+    if shipping_total:
         return shipping_total
-    # fallback: detect explicit items that look like shipping rows
-    for item in invoice.items:
-        name = (item.item_name or item.description or "").lower()
-        if "shipping" in name or "delivery" in name:
-            shipping_total += flt(item.amount)
-    return shipping_total
+
+    if fallback_total:
+        LOGGER.warning({
+            "event": "woo_outbound_shipping_matched_by_description",
+            "invoice": getattr(invoice, "name", None),
+            "expected_account": shipping_account,
+            "rows": fallback_rows,
+            "amount": fallback_total,
+            "detail": (
+                "No Actual charge row on the shipping-income account; fell back to a "
+                "description match. Check the tax row's account_head."
+            ),
+        })
+    return fallback_total
 
 
 def _map_payment_method(invoice: frappe.model.document.Document, cfg: OutboundConfig) -> tuple[str, str]:
+    """``(woo payment_method, payment_method_title)`` for this invoice.
+
+    Delegates to ``services.payment_map``, the one table both lanes share.
+    Previously three substring tests decided this, and ``Kashier Card`` matched
+    none of them and shipped as ``cod`` while ``Kashier Wallet`` matched the
+    wallet test and shipped as the mobile-wallet id (F-02).
+    """
     raw_method = (
         getattr(invoice, "custom_payment_method", None)
         or getattr(invoice, "mode_of_payment", None)
-        or "Cash on Delivery"
+        or ""
     )
-    raw_lower = str(raw_method).strip().lower()
-    if "insta" in raw_lower:
-        return cfg.payment_instapay or "instapay", str(raw_method or "Instapay")
-    if "wallet" in raw_lower:
-        return cfg.payment_wallet or "wallet", str(raw_method or "Wallet")
-    return cfg.payment_cod or "cod", str(raw_method or "Cash on Delivery")
+    return payment_map.erpnext_to_woo(raw_method, cfg)
 
 
 def _coerce_datetime_value(raw: Any) -> datetime | None:
@@ -1715,6 +2489,171 @@ def _build_paid_metadata(
     ]
 
 
+#: Label for the order-level discount we push. WooCommerce has no order-level
+#: discount primitive over REST other than a negative fee line, so that is what
+#: an ERPNext header discount becomes. Inbound already reads it back the same
+#: way (``order_sync._woo_noncoupon_discount_total`` sums negative fee lines).
+_DISCOUNT_FEE_NAME = "Discount"
+
+
+def _invoice_promo_codes(invoice: frappe.model.document.Document) -> list[str]:
+    """Promo codes on the invoice, if the promo engine recorded any.
+
+    ``custom_promo_codes`` is a JSON list written by the coupon passthrough. It
+    is read defensively: a malformed value must never stop an order pushing.
+    """
+    raw = _get_doc_value(invoice, "custom_promo_codes", None)
+    if not raw:
+        return []
+    if isinstance(raw, (list, tuple)):
+        candidates = list(raw)
+    else:
+        try:
+            parsed = json.loads(str(raw))
+        except Exception:  # noqa: BLE001
+            return []
+        candidates = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+    return [str(code).strip() for code in candidates if str(code or "").strip()]
+
+
+def _build_discount_fee_lines(
+    invoice: frappe.model.document.Document,
+    *,
+    existing_order: Optional[dict] = None,
+) -> list[dict]:
+    """Render the invoice's header discount as WooCommerce fee lines.
+
+    ``apply_discount_on`` / ``discount_amount`` are what the promo engine writes
+    for a coupon or a dynamic-pricing discount. Nothing carried them outbound,
+    so a discounted order reached the store at full price and the customer saw a
+    total they had not agreed to (F-01).
+
+    A negative ``fee_lines`` entry is WooCommerce's only order-level discount
+    over REST — ``coupon_lines`` require a coupon that actually exists in the
+    store, which an ERPNext-side promo does not. There is no VAT on this site,
+    so ``total = sum(line totals) + shipping - discount`` exactly, which is what
+    the post-push total assertion checks.
+
+    An existing fee line is updated in place by id rather than appended, and a
+    discount that has gone away is deleted (Woo removes a fee line when the PUT
+    sends ``name: null``). Only fee lines we recognise as ours — negative total,
+    or our own label — are ever touched: a fee somebody added in wp-admin is
+    left alone.
+    """
+    discount = flt(_get_doc_value(invoice, "discount_amount", 0))
+    existing_fee_lines = list((existing_order or {}).get("fee_lines") or [])
+    ours = [
+        line for line in existing_fee_lines
+        if line and (
+            flt(line.get("total") or 0) < 0
+            or str(line.get("name") or "").strip().startswith(_DISCOUNT_FEE_NAME)
+        )
+    ]
+
+    if discount <= 0:
+        # Discount removed in ERPNext: retract it from the store too, otherwise
+        # the customer keeps a reduction the invoice no longer grants.
+        return [
+            {"id": cint(line.get("id") or 0), "name": None}
+            for line in ours
+            if cint(line.get("id") or 0)
+        ]
+
+    codes = _invoice_promo_codes(invoice)
+    name = f"{_DISCOUNT_FEE_NAME} ({', '.join(codes)})" if codes else _DISCOUNT_FEE_NAME
+
+    entry: dict[str, Any] = {
+        "name": name,
+        "total": _format_money(-discount),
+        # No VAT rows exist on this site; saying so explicitly stops WooCommerce
+        # from trying to apportion tax across a negative fee.
+        "tax_status": "none",
+    }
+    reused = next((line for line in ours if cint(line.get("id") or 0)), None)
+    if reused is not None:
+        entry["id"] = cint(reused.get("id"))
+
+    removals = [
+        {"id": cint(line.get("id") or 0), "name": None}
+        for line in ours
+        if cint(line.get("id") or 0) and (reused is None or line is not reused)
+    ]
+    return [entry, *removals]
+
+
+#: What the production store calls its shipping lines, by census over 300
+#: orders: ``flat_rate``/"Delivery" x195 when delivery is charged and
+#: ``flat_rate``/"Free Delivery" x67 when it is waived (a ``free_shipping``
+#: method id also appears x34, but it is the minority form and changing the
+#: method id risks the store recalculating the line, so only the title moves).
+#: The literal we used to send, "Shipping", appears on exactly two orders in the
+#: whole store — both pushed from here, which is precisely the giveaway this
+#: parity work exists to remove.
+_SHIPPING_METHOD_PAID = ("flat_rate", "Delivery")
+_SHIPPING_METHOD_FREE = ("flat_rate", "Free Delivery")
+
+
+def _build_shipping_line(
+    shipping_total: float,
+    cfg: OutboundConfig,
+    *,
+    existing_order: Optional[dict] = None,
+) -> dict:
+    """One shipping line, titled the way the store titles its own.
+
+    A configured ``default_shipping_method_id`` / ``default_shipping_method_title``
+    still wins — this only replaces the fallback literals, and both settings are
+    unset in production.
+    """
+    method_id, method_title = (
+        _SHIPPING_METHOD_PAID if flt(shipping_total) > 0 else _SHIPPING_METHOD_FREE
+    )
+    entry: dict[str, Any] = {
+        "method_id": cfg.shipping_method_id or method_id,
+        "method_title": cfg.shipping_method_title or method_title,
+        "total": _format_money(shipping_total if shipping_total else 0),
+    }
+    # Attach the existing shipping-line ID so WooCommerce updates the line in
+    # place instead of appending a brand-new one on every PUT.
+    if existing_order:
+        existing_shipping = existing_order.get("shipping_lines") or []
+        if existing_shipping:
+            entry["id"] = existing_shipping[0].get("id")
+    return entry
+
+
+def _store_shows_order_paid(existing_order: Optional[dict]) -> bool:
+    return bool(
+        (existing_order or {}).get("date_paid")
+        or (existing_order or {}).get("date_paid_gmt")
+    )
+
+
+def _detect_unpayable_transition(
+    invoice: frappe.model.document.Document,
+    existing_order: Optional[dict],
+) -> bool:
+    """Whether we are being asked to un-pay an order WooCommerce will not un-pay.
+
+    **Known one-way limitation.** ``set_paid`` is a *transition*, not a state:
+    sending ``true`` moves an unpaid order to paid, but sending ``false`` on an
+    order that already has ``date_paid`` does nothing at all. WooCommerce has no
+    REST verb for "this is no longer paid".
+
+    So when an invoice's ``outstanding_amount`` goes back above zero — a payment
+    reversed, a settlement corrected, a payment entry cancelled — the store keeps
+    showing the order as paid and nothing in the response says otherwise. That
+    used to be completely silent (F-23). It still cannot be fixed from here, but
+    it is now logged and written to the order as a note so a human can reconcile
+    it in wp-admin.
+    """
+    if not existing_order:
+        return False
+    if flt(_get_doc_value(invoice, "outstanding_amount", 0)) <= 0.01:
+        return False
+    return _store_shows_order_paid(existing_order)
+
+
 def _normalize_invoice_state(raw_state: Any) -> str:
     return re.sub(r"[\s_]+", "-", str(raw_state or "").strip().lower())
 
@@ -1732,6 +2671,9 @@ WOO_STATUS_PROCESSING = "processing"
 WOO_STATUS_OUT_FOR_DELIVERY = "out-for-delivery"
 WOO_STATUS_COMPLETED = "completed"
 WOO_STATUS_CANCELLED = "cancelled"
+#: Core WooCommerce status. Emitted when the order has been fully returned in
+#: ERPNext — see ``_determine_status`` and ``sync_invoice_return``.
+WOO_STATUS_REFUNDED = "refunded"
 
 #: Registered by the plugin so a human can set it in wp-admin, but **never
 #: emitted from here**. See ``_determine_status``.
@@ -1739,7 +2681,15 @@ WOO_STATUS_DELIVERY_FAILED = "delivery-failed"
 
 #: Statuses the customer reads as "this order is over". Nothing about a failed
 #: delivery attempt may produce one of these.
-_TERMINAL_WOO_STATUSES = frozenset({WOO_STATUS_COMPLETED, WOO_STATUS_CANCELLED})
+_TERMINAL_WOO_STATUSES = frozenset({
+    WOO_STATUS_COMPLETED,
+    WOO_STATUS_CANCELLED,
+    WOO_STATUS_REFUNDED,
+})
+
+#: Invoice states that mean the goods came back. ``Returned`` is an option on
+#: ``custom_sales_invoice_state`` (the terminal kanban column).
+_RETURNED_INVOICE_STATES = frozenset({"returned", "refunded"})
 
 
 def is_terminal_woo_status(status: Any) -> bool:
@@ -1770,6 +2720,84 @@ def _has_failed_delivery_attempt(invoice: frappe.model.document.Document) -> boo
         return cint(_get_doc_value(invoice, attempt_field, 0)) > 0
     except Exception:  # noqa: BLE001
         return False
+
+
+#: A return within this much of the original grand total counts as a full one.
+#: One piastre, matching the tolerance the outbound total assertion uses.
+_RETURN_TOLERANCE = 0.01
+
+#: The canonical return flag, written to the ORIGINAL Sales Invoice by the POS
+#: return workflow (``custom_return_status``). Referenced by value only — the
+#: field belongs to jarz_pos and this app never imports it, so on a bench where
+#: that app is absent the value is simply blank and the fallbacks below decide.
+_RETURN_STATUS_FULL = "fully returned"
+_RETURN_STATUS_PARTIAL = "partially returned"
+
+
+def _invoice_return_status(invoice: Any) -> str:
+    """``custom_return_status`` on an invoice, normalised, or ``""``."""
+    return str(_get_doc_value(invoice, "custom_return_status", "") or "").strip().casefold()
+
+
+def _returned_amount(invoice_name: str) -> float:
+    """Absolute value of every *submitted* credit note against an invoice.
+
+    Standard ERPNext: a credit note is a Sales Invoice with ``is_return = 1``
+    and ``return_against`` pointing at the original, carrying a negative
+    ``grand_total``. No app-specific field is involved, so this reads the same
+    whichever app created the return.
+    """
+    if not invoice_name:
+        return 0.0
+    try:
+        rows = frappe.get_all(
+            "Sales Invoice",
+            filters={"return_against": invoice_name, "is_return": 1, "docstatus": 1},
+            fields=["grand_total"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_return_lookup_failed",
+            "invoice": invoice_name,
+            "error": str(exc),
+        })
+        return 0.0
+    return sum(abs(flt(_get_doc_value(row, "grand_total", 0))) for row in rows or [])
+
+
+def _is_fully_returned(invoice: frappe.model.document.Document) -> bool:
+    """Whether the customer's whole order has been returned.
+
+    Three signals, in descending order of authority; any one is enough:
+
+    1. ``custom_return_status == "Fully Returned"`` — the canonical,
+       purpose-built flag the return workflow writes to the original invoice;
+    2. ``custom_sales_invoice_state == "Returned"`` — the terminal kanban column
+       a fully-returned order lands in;
+    3. submitted credit notes against this invoice add up to its grand total.
+
+    (1) is preferred because it says exactly this and nothing else. (3) is kept
+    underneath it rather than replaced by it: the workflow sets the flag across
+    two saves, so a blank value means "not known yet", not "not returned", and
+    accounting is the thing that cannot lag. Consequently a row still reading
+    ``Partially Returned`` is *not* short-circuited to False — if the credit
+    notes have since reached the full amount, the order really is refunded.
+    """
+    if _invoice_return_status(invoice) == _RETURN_STATUS_FULL:
+        return True
+
+    if any(state in _RETURNED_INVOICE_STATES for state in _collect_invoice_states(invoice)):
+        return True
+
+    grand_total = flt(_get_doc_value(invoice, "grand_total", 0))
+    if grand_total <= 0:
+        return False
+
+    invoice_name = str(_get_doc_value(invoice, "name", "") or "").strip()
+    if not invoice_name:
+        return False
+
+    return _returned_amount(invoice_name) >= grand_total - _RETURN_TOLERANCE
 
 
 def _collect_invoice_states(invoice: frappe.model.document.Document) -> list[str]:
@@ -1805,6 +2833,12 @@ def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool =
     reason left behind by an earlier attempt must not un-complete a delivered
     order (the contract has it cleared on success, but this does not depend on
     that).
+
+    A **fully returned** order maps to ``refunded`` (F-15), checked ahead of
+    ``Delivered`` because a return happens *after* delivery: leaving the order
+    at ``completed`` told the customer their returned order was still fulfilled.
+    A partial return deliberately does not change the status — the order really
+    was delivered — and is reported as a Woo order note instead (F-16).
     """
     states = _collect_invoice_states(invoice)
 
@@ -1814,6 +2848,8 @@ def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool =
         return WOO_STATUS_CANCELLED
     if any(state in {"cancelled", "canceled"} for state in states):
         return WOO_STATUS_CANCELLED
+    if _is_fully_returned(invoice):
+        return WOO_STATUS_REFUNDED
     if any(state in {"delivered", "completed"} for state in states):
         return WOO_STATUS_COMPLETED
     if any(state == WOO_STATUS_OUT_FOR_DELIVERY for state in states):
@@ -2106,6 +3142,196 @@ def _handover_woo_order_to_replacement(
     })
 
 
+def _response_has_contact_data(order: dict) -> bool:
+    """Whether a Woo order response actually carries addressee information.
+
+    Guard against overwriting good snapshot values with a stub: a response with
+    empty ``billing``/``shipping`` would make the extractor invent
+    ``"Woo Guest <id>"`` and we would write that over the real customer name.
+    """
+    for scope in ("billing", "shipping"):
+        block = order.get(scope) or {}
+        if any(
+            str(block.get(key) or "").strip()
+            for key in ("first_name", "last_name", "phone", "email", "address_1")
+        ):
+            return True
+    return bool(str(order.get("customer_email") or "").strip())
+
+
+def _extract_response_snapshots(
+    response: Any,
+    *,
+    invoice_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(contact_snapshot, territory_snapshot)`` from a Woo order response.
+
+    The response to a create/update **is** a Woo order dict, so the inbound
+    extractors take it unchanged. POS-origin orders never travel the inbound
+    path, so nothing had ever written these fields for them: every POS order
+    read as "no contact snapshot", which made the contact-hash comparison
+    useless and left the Order Map holding a seven-field subset (F-05/F-06).
+
+    Never raises — a snapshot is a nice-to-have and must not fail a push that
+    the store has already accepted.
+    """
+    if not isinstance(response, dict) or not _response_has_contact_data(response):
+        return {}, {}
+    try:
+        from jarz_woocommerce_integration.services.order_sync import (
+            _extract_order_contact_snapshot,
+            _extract_order_territory_snapshot,
+        )
+
+        return (
+            _extract_order_contact_snapshot(response) or {},
+            _extract_order_territory_snapshot(response) or {},
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_snapshot_extract_failed",
+            "invoice": invoice_name,
+            "error": str(exc),
+        })
+        return {}, {}
+
+
+def _contact_snapshot_invoice_values(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """The snapshot fields that exist as Sales Invoice columns.
+
+    Deliberately excludes ``customer_name``: that belongs to the ERPNext
+    Customer and must not be rewritten from a store response.
+    """
+    if not snapshot:
+        return {}
+    try:
+        from jarz_woocommerce_integration.services.order_sync import ORDER_CONTACT_SNAPSHOT_FIELDS
+    except Exception:  # noqa: BLE001
+        return {}
+    return {fieldname: (snapshot.get(fieldname) or "") for fieldname in ORDER_CONTACT_SNAPSHOT_FIELDS}
+
+
+#: Never a realtime recipient: not a real session, and addressing it would put
+#: order data in a room the public website shares.
+_REALTIME_EXCLUDED_USERS = frozenset({"Guest"})
+
+
+def _pos_profile_recipients(pos_profile: Any) -> list[str]:
+    """The users assigned to a POS Profile.
+
+    Replicated here rather than imported — this app never imports ``jarz_pos``
+    — but there is nothing app-specific to share: the lookup reads only stock
+    ERPNext DocTypes, ``POS Profile`` and its ``POS Profile User`` child table.
+
+    ``disabled = 0`` is part of the filter deliberately. A closed branch's users
+    can no longer load the orders the event refers to, so delivering it to them
+    would only produce a board update they cannot act on.
+
+    Returns ``[]`` rather than raising; the caller decides what an empty
+    recipient list means.
+    """
+    profile = str(pos_profile or "").strip()
+    if not profile:
+        return []
+
+    try:
+        enabled_profiles = frappe.get_all(
+            "POS Profile",
+            filters={"name": ["in", [profile]], "disabled": 0},
+            pluck="name",
+        ) or []
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_realtime_pos_profile_lookup_failed",
+            "pos_profile": profile,
+            "error": str(exc),
+        })
+        return []
+
+    if not enabled_profiles:
+        return []
+
+    try:
+        rows = frappe.get_all(
+            "POS Profile User",
+            filters={"parent": ["in", enabled_profiles], "parenttype": "POS Profile"},
+            fields=["user"],
+        ) or []
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_realtime_pos_profile_user_lookup_failed",
+            "pos_profile": profile,
+            "error": str(exc),
+        })
+        return []
+
+    recipients: list[str] = []
+    for row in rows:
+        user = str(_get_doc_value(row, "user", "") or "").strip()
+        if not user or user in _REALTIME_EXCLUDED_USERS or user in recipients:
+            continue
+        recipients.append(user)
+    return recipients
+
+
+def _publish_woo_order_assigned(
+    invoice_name: str,
+    woo_order_id: Any,
+    *,
+    invoice: Any = None,
+) -> None:
+    """Tell the branch that owns this invoice that it just acquired a Woo order id.
+
+    Addressed **per user, to the invoice's POS Profile**. There are two ways to
+    get this wrong and this call site has now been on both:
+
+    * ``user="*"`` resolves to ``get_user_room("*")`` — a room literally named
+      ``user:*`` that no socket ever joins, so the event reached nobody (F-25);
+    * omitting ``user`` falls through to the site-wide ``all`` room, which
+      delivers to every System User on the site regardless of branch. That is a
+      leak, not a fix: one branch's orders would appear on every other branch's
+      board, which is exactly what the branch-scoping work exists to prevent.
+
+    An empty recipient list is **dropped and logged**, never widened into a
+    broadcast — the broadcast is the leak. Each publish is wrapped on its own so
+    one bad recipient cannot silence the rest.
+    """
+    payload: dict[str, Any] = {
+        "invoice": invoice_name,
+        "invoice_id": invoice_name,
+        "woo_order_id": woo_order_id,
+        "event": "woo_order_assigned",
+    }
+    pos_profile = str(_get_doc_value(invoice, "pos_profile", "") or "").strip()
+    if pos_profile:
+        payload["pos_profile"] = pos_profile
+
+    recipients = _pos_profile_recipients(pos_profile)
+    if not recipients:
+        LOGGER.warning({
+            "event": "woo_order_assigned_realtime_no_recipients",
+            "invoice": invoice_name,
+            "woo_order_id": woo_order_id,
+            "pos_profile": pos_profile or None,
+            "detail": (
+                "No enabled POS Profile user to address, so the board update was "
+                "dropped. Deliberately not broadcast site-wide: that would show this "
+                "branch's order to every other branch."
+            ),
+        })
+        return
+
+    for user in recipients:
+        try:
+            frappe.publish_realtime("kanban_update", payload, user=user)
+        except Exception:  # noqa: BLE001
+            LOGGER.warning({
+                "event": "woo_order_assigned_realtime_failed",
+                "invoice": invoice_name,
+                "user": user,
+            })
+
+
 def _relink_order_map_to_invoice(
     woo_order_id: int | str | None,
     invoice_name: str,
@@ -2115,6 +3341,9 @@ def _relink_order_map_to_invoice(
     status: str | None = None,
     payment_method: str | None = None,
     hash_value: str | None = None,
+    order_response: Optional[dict] = None,
+    contact_snapshot: Optional[dict] = None,
+    territory_snapshot: Optional[dict] = None,
 ) -> None:
     if not woo_order_id or not invoice_name:
         return
@@ -2130,6 +3359,47 @@ def _relink_order_map_to_invoice(
     }
     if hash_value:
         map_updates["hash"] = hash_value
+
+    # Write the FULL map row when the store handed us a real order back, not the
+    # seven-field subset outbound used to leave behind. In particular
+    # `woo_order_number` — the id every screen shows the customer — was blank on
+    # every POS-origin map row (F-06).
+    #
+    # Gated on a non-empty snapshot: an empty one means the response carried no
+    # addressee data, and writing it through would blank every snapshot column.
+    if isinstance(order_response, dict) and contact_snapshot:
+        try:
+            from jarz_woocommerce_integration.services.order_sync import (
+                _build_order_map_snapshot_values,
+            )
+
+            full_values = _build_order_map_snapshot_values(
+                order_response,
+                contact_snapshot or {},
+                link_field=link_field,
+                invoice_name=invoice_name,
+                order_hash=hash_value,
+                territory_snapshot=territory_snapshot or {},
+            )
+            # The response is authoritative for what the store holds, but fall
+            # back to the caller's values wherever it is silent.
+            for fieldname, fallback in (
+                ("currency", currency or ""),
+                ("status", status or ""),
+                ("payment_method", payment_method or ""),
+            ):
+                if not full_values.get(fieldname):
+                    full_values[fieldname] = fallback
+            if full_values.get("total") in (None, ""):
+                full_values["total"] = flt(total or 0)
+            map_updates = full_values
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning({
+                "event": "woo_outbound_order_map_snapshot_failed",
+                "invoice": invoice_name,
+                "woo_order_id": woo_order_id,
+                "error": str(exc),
+            })
 
     try:
         map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_order_id}, "name")
@@ -2266,17 +3536,63 @@ def _attach_existing_line_ids(
     return mapped, unmapped, orphaned
 
 
+def _preserve_native_bundle_selection(
+    payload_line_items: list[dict],
+    existing_order: dict | None,
+) -> None:
+    """Never overwrite a ``_woosb_ids`` the store wrote itself.
+
+    Ours is *reconstructed* from ERPNext rows: the WooSB token becomes a hash of
+    the item code and the attributes object is empty, because ERPNext does not
+    carry Woo variation attributes. That is right for an order we created and
+    wrong for one the website created — the store renders the bundle contents
+    from this string, so replacing the plugin's own value with our approximation
+    would degrade 10,000+ Woo-origin orders on their next status update.
+
+    Mutates ``payload_line_items`` in place, dropping only our own key.
+    """
+    existing_by_id: dict[int, dict] = {}
+    for entry in (existing_order or {}).get("line_items") or []:
+        line_id = cint((entry or {}).get("id") or 0)
+        if line_id:
+            existing_by_id[line_id] = entry
+    if not existing_by_id:
+        return
+
+    for entry in payload_line_items:
+        line_id = cint(entry.get("id") or 0)
+        existing = existing_by_id.get(line_id) if line_id else None
+        if not existing or not _extract_meta_value(existing, "_woosb_ids"):
+            continue
+        meta = entry.get("meta_data") or []
+        kept = [meta_entry for meta_entry in meta if str(meta_entry.get("key") or "") != "_woosb_ids"]
+        if len(kept) != len(meta):
+            entry["meta_data"] = kept
+            LOGGER.info({
+                "event": "woo_outbound_native_bundle_selection_preserved",
+                "line_id": line_id,
+                "item_code": _extract_item_code(entry),
+            })
+
+
 def _protected_existing_line_ids(
     invoice: frappe.model.document.Document,
     existing_order: dict,
+    *,
+    protected_item_codes: set[str] | None = None,
 ) -> set[int]:
     """Woo line ids an outbound sync must never delete.
 
-    A registered bundle's parent line exists on the Woo order but is
-    deliberately absent from the ERPNext payload (``_is_bundle_parent_item``
-    skips it, since ERPNext carries the expanded children instead). To the
-    orphan check it therefore looks like a line the user removed — deleting it
+    Two families are protected.
+
+    A registered bundle's parent line can be absent from the ERPNext payload —
+    the legacy ``_is_bundle_parent_item`` inference still skips such a row on
+    flag-free invoices, and a bundle with no ``woo_product_id`` is flattened. To
+    the orphan check it looks like a line the user removed, and deleting it
     would strip the bundle from the customer's order.
+
+    An item whose Woo mapping is missing is likewise absent from the payload
+    (see ``protected_item_codes``) without having been removed from the invoice.
 
     Two independent signals mark a parent, and we honour either one:
     the line is referenced by a sibling's ``_woosb_parent_id``, or its
@@ -2286,6 +3602,19 @@ def _protected_existing_line_ids(
     if not existing_lines:
         return set()
 
+    protected: set[int] = set()
+
+    # A line whose ERPNext Item lost (or never had) a Woo mapping is absent from
+    # the payload, so the orphan check sees it as "removed in ERPNext". It was
+    # not: we simply cannot describe it. Deleting it would strip a real product
+    # — and its money — off the customer's order.
+    protected_item_codes = {code for code in (protected_item_codes or set()) if code}
+    if protected_item_codes:
+        for entry in existing_lines:
+            line_id = cint(entry.get("id") or 0)
+            if line_id and str(_extract_item_code(entry) or "") in protected_item_codes:
+                protected.add(line_id)
+
     parent_product_ids: set[str] = set()
     for entry in existing_lines:
         raw = _extract_meta_value(entry, "_woosb_parent_id")
@@ -2294,9 +3623,8 @@ def _protected_existing_line_ids(
     parent_product_ids |= _get_registered_bundle_product_ids(invoice)
 
     if not parent_product_ids:
-        return set()
+        return protected
 
-    protected: set[int] = set()
     for entry in existing_lines:
         product_id = cint(entry.get("product_id") or 0)
         line_id = cint(entry.get("id") or 0)
@@ -2334,7 +3662,49 @@ def _meta_entries_to_map(entries: list[dict] | None) -> dict[str, Any]:
     return result
 
 
-def _normalize_order_line_items(entries: list[dict] | None) -> list[tuple[Any, ...]]:
+def _normalize_meta_compare_value(value: Any) -> str:
+    """Compare meta values by *meaning*, not by repr.
+
+    We send ``discount_percentage`` as a number and WooCommerce echoes it back
+    as the string ``"50"``; ``str(50.0)`` is ``"50.0"``, so a naive comparison
+    never matched and the order stayed permanently dirty.
+    """
+    text = str("" if value is None else value).strip()
+    if not text:
+        return ""
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        return text
+    if numeric == int(numeric):
+        return str(int(numeric))
+    return f"{numeric:g}"
+
+
+def _payload_line_meta_keys(entries: list[dict] | None) -> frozenset[str]:
+    """The owned meta keys our payload actually carries.
+
+    Comparison is one-directional, exactly like the order-level meta check: the
+    question is "does the store already say everything we are about to say?",
+    not "are the two identical". A key we deliberately do not send — a native
+    ``_woosb_ids`` we are preserving, say — must not make the order look dirty
+    forever.
+    """
+    keys: set[str] = set()
+    for entry in entries or []:
+        for meta in entry.get("meta_data", []) or []:
+            key = str(meta.get("key") or "")
+            if key in _ORDER_LINE_META_KEYS_TO_COMPARE:
+                keys.add(key)
+    return frozenset(keys)
+
+
+def _normalize_order_line_items(
+    entries: list[dict] | None,
+    *,
+    meta_keys: frozenset[str] | None = None,
+) -> list[tuple[Any, ...]]:
+    compare_keys = _ORDER_LINE_META_KEYS_TO_COMPARE if meta_keys is None else meta_keys
     normalized: list[tuple[Any, ...]] = []
     for entry in entries or []:
         variation_id = entry.get("variation_id")
@@ -2343,10 +3713,10 @@ def _normalize_order_line_items(entries: list[dict] | None) -> list[tuple[Any, .
         metadata = tuple(sorted(
             (
                 str(meta.get("key") or ""),
-                str(meta.get("value") or ""),
+                _normalize_meta_compare_value(meta.get("value")),
             )
             for meta in entry.get("meta_data", []) or []
-            if meta.get("key")
+            if str(meta.get("key") or "") in compare_keys
         ))
         normalized.append((
             cint(entry.get("id") or 0),
@@ -2367,6 +3737,23 @@ def _normalize_order_shipping_lines(entries: list[dict] | None) -> list[tuple[st
             str(entry.get("method_id") or ""),
             str(entry.get("method_title") or ""),
             str(entry.get("total") or ""),
+        ))
+    return sorted(normalized)
+
+
+def _normalize_order_fee_lines(entries: list[dict] | None) -> list[tuple[str, str]]:
+    """``(name, total)`` per fee line, money compared numerically.
+
+    Woo answers with ``"-25.00"`` for a fee we sent as ``"-25.0"``; comparing
+    the raw strings would mark the order dirty on every sync.
+    """
+    normalized = []
+    for entry in entries or []:
+        if not entry:
+            continue
+        normalized.append((
+            str(entry.get("name") or "").strip(),
+            _format_money(flt(entry.get("total") or 0)),
         ))
     return sorted(normalized)
 
@@ -2433,13 +3820,28 @@ def _order_payload_requires_update(existing_order: dict, payload: dict) -> bool:
     payload_line_items = payload.get("line_items") or []
     if payload_line_items:
         existing_line_items = existing_order.get("line_items") or []
-        if _normalize_order_line_items(payload_line_items) != _normalize_order_line_items(existing_line_items):
+        meta_keys = _payload_line_meta_keys(payload_line_items)
+        if _normalize_order_line_items(payload_line_items, meta_keys=meta_keys) != _normalize_order_line_items(
+            existing_line_items, meta_keys=meta_keys
+        ):
             return True
 
     payload_shipping_lines = payload.get("shipping_lines") or []
     if payload_shipping_lines:
         existing_shipping_lines = existing_order.get("shipping_lines") or []
         if _normalize_order_shipping_lines(payload_shipping_lines) != _normalize_order_shipping_lines(existing_shipping_lines):
+            return True
+
+    # The header discount rides as a negative fee line. Without comparing it, an
+    # order whose discount changed (or was applied for the first time) was
+    # dropped as "already in sync" and the customer kept the old total — F-01.
+    if "fee_lines" in payload:
+        payload_fee_lines = [
+            line for line in (payload.get("fee_lines") or [])
+            if line and line.get("name") is not None
+        ]
+        existing_fee_lines = existing_order.get("fee_lines") or []
+        if _normalize_order_fee_lines(payload_fee_lines) != _normalize_order_fee_lines(existing_fee_lines):
             return True
 
     # An address edit is often the only thing that changed — without this the
@@ -2457,7 +3859,10 @@ def _build_order_payload(
     *,
     cancel: bool = False,
     existing_order: Optional[dict] = None,
+    is_create: Optional[bool] = None,
 ) -> dict:
+    if is_create is None:
+        is_create = existing_order is None
     line_items, missing_products = _collect_line_items(invoice)
     payload_line_items = list(line_items)
     added_line_items: list[dict] = []
@@ -2468,10 +3873,15 @@ def _build_order_payload(
         )
         removed_line_items = _build_line_item_removals(
             orphaned,
-            protected_ids=_protected_existing_line_ids(invoice, existing_order),
+            protected_ids=_protected_existing_line_ids(
+                invoice,
+                existing_order,
+                protected_item_codes=set(missing_products),
+            ),
         )
         # Order matters only for readability; Woo applies each entry by id.
         payload_line_items = matched + added_line_items + removed_line_items
+        _preserve_native_bundle_selection(payload_line_items, existing_order)
 
     if not payload_line_items and not existing_order:
         raise ValueError("No line items available for Woo order payload")
@@ -2585,6 +3995,19 @@ def _build_order_payload(
 
     if payload_line_items:
         payload["line_items"] = payload_line_items
+
+    fee_lines = _build_discount_fee_lines(invoice, existing_order=existing_order)
+    if fee_lines:
+        payload["fee_lines"] = fee_lines
+
+    # The store stamps its own clock on a create, so a backfilled or
+    # end-of-shift invoice showed up in the store dated whenever the job ran
+    # rather than when the sale happened (F-19). Only sent on the create:
+    # WooCommerce takes `date_created` on POST and ignores it on PUT, and
+    # re-sending it would be noise in the already-in-sync comparison.
+    if is_create:
+        payload.update(_build_order_creation_dates(invoice))
+
     payload["meta_data"].extend(_build_delivery_metadata(invoice))
     payload["meta_data"].extend(_build_paid_metadata(invoice, payment_method=payment_method, set_paid=bool(set_paid), cfg=cfg))
     # The customer tracking link rides the ordinary order payload rather than a
@@ -2597,24 +4020,37 @@ def _build_order_payload(
     if woo_customer_id:
         payload["customer_id"] = cint(woo_customer_id)
 
-    if shipping_total or cfg.shipping_method_id:
-        shipping_entry: dict = {
-            "method_id": cfg.shipping_method_id or "flat_rate",
-            "method_title": cfg.shipping_method_title or "Shipping",
-            "total": _format_money(shipping_total if shipping_total else 0),
-        }
-        # Attach existing shipping-line ID so WooCommerce updates the line
-        # in-place instead of appending a brand-new one on every PUT.
-        if existing_order:
-            existing_shipping = existing_order.get("shipping_lines") or []
-            if existing_shipping:
-                shipping_entry["id"] = existing_shipping[0].get("id")
-        payload["shipping_lines"] = [shipping_entry]
+    payload["shipping_lines"] = [_build_shipping_line(shipping_total, cfg, existing_order=existing_order)]
 
     if missing_products:
-        raise MissingWooProductError(
-            "Missing WooCommerce product mapping for items: " + ", ".join(missing_products)
-        )
+        detail = "Missing WooCommerce product mapping for items: " + ", ".join(missing_products)
+        if not payload_line_items:
+            # Nothing at all resolved: an empty payload is the one case where
+            # pushing is genuinely meaningless, so this stays a hard failure.
+            raise MissingWooProductError(detail)
+        # Otherwise degrade. An order that reaches the store missing one line is
+        # recoverable and visible (the total assertion flags it); an order that
+        # never reaches the store, or whose status silently stops updating, is
+        # not. log_error rather than LOGGER.warning: warnings are below the
+        # servers' log level and this must be seen.
+        LOGGER.error({
+            "event": "woo_outbound_line_dropped_unmapped",
+            "invoice": invoice.name,
+            "item_codes": missing_products,
+        })
+        try:
+            if _is_payload_dry_run():
+                raise RuntimeError("dry_run")  # keeps the builder write-free
+            frappe.log_error(
+                title=f"WooCommerce: unmapped items on {invoice.name}",
+                message=(
+                    f"{detail}\n\nThe order was pushed without those lines so its status "
+                    f"keeps syncing, but the store's total will be short by their value. "
+                    f"Set Item.woo_product_id (or woo_variation_id) for each of them."
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
     if existing_order and (added_line_items or removed_line_items):
         # Not a warning any more: these lines are now carried in the payload
         # rather than silently dropped. Logged so an unexpected churn of
@@ -2725,6 +4161,60 @@ def _coerce_delivery_duration_seconds(raw: Any) -> int | None:
         return max(0, int(float(raw)))
     except (TypeError, ValueError):
         return None
+
+
+def _invoice_posting_datetime(invoice: frappe.model.document.Document) -> datetime | None:
+    """The moment of sale: ``posting_date`` + ``posting_time``, site-local."""
+    posting_date = _coerce_delivery_date(_get_doc_value(invoice, "posting_date", None))
+    if not posting_date:
+        return None
+    posting_time = _coerce_delivery_time(_get_doc_value(invoice, "posting_time", None)) or dt_time.min
+    return datetime.combine(posting_date, posting_time)
+
+
+def _to_utc_naive(local_dt: datetime) -> datetime | None:
+    """Convert a site-local naive datetime to a naive UTC one, or ``None``."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        from frappe.utils import get_system_timezone
+
+        tz_name = get_system_timezone()
+        if not tz_name:
+            return None
+        return (
+            local_dt.replace(tzinfo=ZoneInfo(tz_name))
+            .astimezone(timezone.utc)
+            .replace(tzinfo=None)
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_utc_conversion_failed",
+            "error": str(exc),
+        })
+        return None
+
+
+def _build_order_creation_dates(invoice: frappe.model.document.Document) -> dict[str, str]:
+    """``date_created`` / ``date_created_gmt`` from the invoice's posting moment.
+
+    ``date_created`` is site-local and ``date_created_gmt`` is UTC — WooCommerce
+    treats them as two views of the same instant, so sending the same string for
+    both would shift the order by the site's UTC offset in half the store's
+    screens. When the timezone cannot be resolved we send only the local value
+    and let WooCommerce derive the GMT one, rather than send a wrong number.
+    """
+    local_dt = _invoice_posting_datetime(invoice)
+    if not local_dt:
+        return {}
+
+    local_dt = local_dt.replace(microsecond=0)
+    dates = {"date_created": local_dt.isoformat(timespec="seconds")}
+
+    utc_dt = _to_utc_naive(local_dt)
+    if utc_dt:
+        dates["date_created_gmt"] = utc_dt.replace(microsecond=0).isoformat(timespec="seconds")
+    return dates
 
 
 def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[dict[str, str]]:
@@ -2926,8 +4416,16 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
                 _mark_invoice_status(invoice_name, status="error", error=exc.message)
                 return {"status": "error", "detail": exc.message}
 
+    unpayable_transition = _detect_unpayable_transition(invoice, existing_order)
+
     try:
-        payload = _build_order_payload(invoice, cfg, cancel=cancel, existing_order=existing_order)
+        payload = _build_order_payload(
+            invoice,
+            cfg,
+            cancel=cancel,
+            existing_order=existing_order,
+            is_create=not woo_order_id,
+        )
     except MissingWooProductError as exc:
         LOGGER.warning({
             "event": "woo_outbound_missing_product_mapping",
@@ -2977,31 +4475,13 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
 
     woo_id = response.get("id") if isinstance(response, dict) else None
     woo_number = response.get("number") if isinstance(response, dict) else None
-
-    # --- Verify WooCommerce accepted the desired status ------------------
-    # Some WordPress plugins (e.g. delivery management) silently override the
-    # status in the same PUT response.  If the response status doesn't match
-    # what we sent, do not mark as Synced — flag as error so the reconcile
-    # will retry.
-    actual_woo_status = (response.get("status") or "") if isinstance(response, dict) else ""
     desired_woo_status = payload.get("status") or ""
-    if actual_woo_status and desired_woo_status and actual_woo_status != desired_woo_status:
-        LOGGER.warning({
-            "event": "woo_outbound_status_mismatch",
-            "invoice": invoice_name,
-            "desired_status": desired_woo_status,
-            "actual_status": actual_woo_status,
-            "woo_order_id": woo_order_id,
-            "reason": reason,
-        })
-        _mark_invoice_status(
-            invoice_name,
-            status="error",
-            error=f"WooCommerce returned status={actual_woo_status!r}; expected {desired_woo_status!r}",
-        )
-        return {"status": "error", "detail": f"status_mismatch:{actual_woo_status}"}
-    # ---------------------------------------------------------------------
 
+    # The store has accepted the order, so record what we know about it BEFORE
+    # deciding whether we are happy with the answer. The verification guards
+    # below mark the invoice Error, and if they ran first a freshly POSTed order
+    # would have no `woo_order_id` recorded anywhere — the retry would create a
+    # second order in the customer's account.
     updates = {
         "woo_outbound_status": "Synced",
         "woo_outbound_error": "",
@@ -3011,21 +4491,16 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         updates["woo_order_id"] = woo_id
     if woo_number:
         updates["woo_order_number"] = woo_number
+
+    contact_snapshot, territory_snapshot = _extract_response_snapshots(
+        response, invoice_name=invoice_name
+    )
+    updates.update(_contact_snapshot_invoice_values(contact_snapshot))
+
     frappe.db.set_value("Sales Invoice", invoice_name, updates, update_modified=False)
     if "woo_order_id" in updates:
-        try:
-            frappe.publish_realtime(
-                "kanban_update",
-                {
-                    "invoice": invoice_name,
-                    "invoice_id": invoice_name,
-                    "woo_order_id": woo_id,
-                    "event": "woo_order_assigned",
-                },
-                user="*",
-            )
-        except Exception:
-            LOGGER.warning({"event": "woo_order_assigned_realtime_failed", "invoice": invoice_name})
+        _publish_woo_order_assigned(invoice_name, woo_id, invoice=invoice)
+
     response_status = response.get("status") if isinstance(response, dict) else None
     response_payment_method = response.get("payment_method") if isinstance(response, dict) else None
     response_hash = None
@@ -3045,7 +4520,53 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         status=response_status or desired_woo_status,
         payment_method=response_payment_method or payload.get("payment_method"),
         hash_value=response_hash,
+        order_response=response if isinstance(response, dict) else None,
+        contact_snapshot=contact_snapshot,
+        territory_snapshot=territory_snapshot,
     )
+
+    # `set_paid` only ever moves an order *to* paid. Say so out loud when the
+    # invoice has gone back to outstanding — see `_detect_unpayable_transition`.
+    if unpayable_transition:
+        _report_unpayable_transition(client, woo_id or woo_order_id, invoice_name)
+
+    # --- Verify WooCommerce accepted the desired status ------------------
+    # Some WordPress plugins (e.g. delivery management) silently override the
+    # status in the same PUT response.  If the response status doesn't match
+    # what we sent, do not leave the invoice reading Synced — flag it as Error
+    # so the reconcile sweep retries.
+    actual_woo_status = (response.get("status") or "") if isinstance(response, dict) else ""
+    if actual_woo_status and desired_woo_status and actual_woo_status != desired_woo_status:
+        LOGGER.warning({
+            "event": "woo_outbound_status_mismatch",
+            "invoice": invoice_name,
+            "desired_status": desired_woo_status,
+            "actual_status": actual_woo_status,
+            "woo_order_id": woo_order_id,
+            "reason": reason,
+        })
+        _mark_invoice_status(
+            invoice_name,
+            status="error",
+            error=f"WooCommerce returned status={actual_woo_status!r}; expected {desired_woo_status!r}",
+        )
+        return {"status": "error", "detail": f"status_mismatch:{actual_woo_status}"}
+    # ---------------------------------------------------------------------
+
+    # --- Verify the store charged what the invoice says ------------------
+    # There are no VAT rows on this site: the only components of an order total
+    # are the line totals, the shipping-income row and the header discount. So
+    # the store's total must equal `grand_total` exactly, and any drift means
+    # one of those three did not survive the push — silently, until now (F-03).
+    #
+    # Deliberately not raised: the order exists in the store, and an exception
+    # here would have the outbox retry the POST and duplicate it.
+    total_mismatch = _check_response_total(
+        response, invoice, invoice_name=invoice_name, payload=payload, reason=reason
+    )
+    if total_mismatch:
+        _mark_invoice_status(invoice_name, status="error", error=total_mismatch)
+        return {"status": "error", "detail": f"total_mismatch:{total_mismatch}"}
 
     LOGGER.info({
         "event": "woo_outbound_invoice_synced",
