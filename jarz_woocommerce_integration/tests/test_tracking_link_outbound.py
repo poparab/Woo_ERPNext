@@ -209,10 +209,25 @@ class TestFailedAttemptIsNotTerminal(unittest.TestCase):
             outbound_sync._APPROVED_INVOICE_OUTBOUND_STATUSES,
         )
 
-    def test_terminal_status_set_is_exactly_completed_and_cancelled(self):
+    def test_terminal_status_set_is_exactly_completed_cancelled_and_refunded(self):
+        # ``refunded`` joined the set when outbound learned to emit it (F-15).
+        # It belongs here for the same reason the other two do: it tells the
+        # customer the order is over. What this test actually guards is the
+        # invariant below it — that a failed delivery attempt can never produce
+        # any of them — so the set is pinned rather than left to drift.
         self.assertEqual(
             set(outbound_sync._TERMINAL_WOO_STATUSES),
-            {"completed", "cancelled"},
+            {"completed", "cancelled", "refunded"},
+        )
+
+    def test_a_failed_attempt_produces_no_terminal_status(self):
+        self.assertNotIn(
+            outbound_sync.WOO_STATUS_DELIVERY_FAILED,
+            outbound_sync._TERMINAL_WOO_STATUSES,
+        )
+        self.assertNotIn(
+            outbound_sync.WOO_STATUS_OUT_FOR_DELIVERY,
+            outbound_sync._TERMINAL_WOO_STATUSES,
         )
 
     def test_the_failure_fields_are_the_two_named_in_the_contract(self):
