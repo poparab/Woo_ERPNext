@@ -99,6 +99,18 @@ WOO_ORDER_NOTE_MARKER = "— WooCommerce order note #"
 WOO_CUSTOMER_NOTE_MARKER = "— WooCommerce customer note "
 POS_OUTBOUND_NOTE_SIGNATURE = "(Jarz POS)"
 
+#: ``outbound_sync.sync_invoice_note`` signs a note TWO ways, because the author
+#: is optional on ``Jarz Invoice Note``:
+#:
+#:     authored   -> "<text>\n\n— <name> (Jarz POS)"
+#:     unauthored -> "<text>\n\n— Jarz POS"
+#:
+#: Only the authored form carries the parenthesised signature above, so checking
+#: for that alone lets every unauthored note we pushed come straight back in on
+#: the next poll and be materialised as a duplicate Jarz Invoice Note of the very
+#: note that produced it. Both shapes have to be recognised.
+POS_OUTBOUND_NOTE_SIGNATURE_NO_AUTHOR = "— Jarz POS"
+
 ORDER_SYNC_CURSOR_FIELDS = {
     "live": {
         "modified": "live_order_cursor_modified_gmt",
@@ -2893,13 +2905,19 @@ def _inbound_order_notes_enabled(settings: Any) -> bool:
 def _woo_note_is_ours(body: str) -> bool:
     """True when this Woo note is one WE posted, and must not be pulled back in.
 
-    ``outbound_sync.sync_invoice_note`` signs everything it pushes with
-    "(Jarz POS)". Without this check the two lanes would echo: our own POS note
-    would come back as a Woo note, be materialised as a new Jarz Invoice Note,
-    and — but for the outbound suppression on insert — be pushed out again.
+    ``outbound_sync.sync_invoice_note`` signs everything it pushes, but in two
+    shapes depending on whether the note had an author — see
+    :data:`POS_OUTBOUND_NOTE_SIGNATURE_NO_AUTHOR`. Both are checked. Without
+    this the two lanes would echo: our own POS note would come back as a Woo
+    note, be materialised as a new Jarz Invoice Note, and — but for the outbound
+    suppression on insert — be pushed out again.
     """
     text = str(body or "")
-    return POS_OUTBOUND_NOTE_SIGNATURE in text or WOO_ORDER_NOTE_MARKER in text
+    return (
+        POS_OUTBOUND_NOTE_SIGNATURE in text
+        or POS_OUTBOUND_NOTE_SIGNATURE_NO_AUTHOR in text
+        or WOO_ORDER_NOTE_MARKER in text
+    )
 
 
 def _invoice_note_doctype_available() -> bool:
