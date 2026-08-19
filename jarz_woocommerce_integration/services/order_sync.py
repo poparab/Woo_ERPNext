@@ -3602,6 +3602,45 @@ def _maybe_create_payment_entry_for_invoice(
             pass
 
 
+def _release_order_locks(lock, db_lock_key: str, db_lock_acquired: bool) -> None:
+    """Drop both per-order locks. Safe to call twice — a double release is a no-op."""
+    if lock:
+        try:
+            lock.release()
+        except Exception:  # noqa: BLE001 - already expired, or held by nobody
+            pass
+    if db_lock_acquired:
+        try:
+            frappe.db.sql("SELECT RELEASE_LOCK(%s)", (db_lock_key,))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _unlock_order(result: dict, lock, db_lock_key: str, db_lock_acquired: bool) -> dict:
+    """Release the per-order locks, then hand back *result*.
+
+    ``process_order_phase1`` takes a Redis lock and a MySQL named lock near the
+    top, but its ``finally`` sits on a ``try`` that opens several hundred lines
+    later — so every early ``return`` before that point walked out still holding
+    both. Thirteen of them did: ``unchanged``, ``already_mapped`` (x3),
+    ``cleanup_failed``, ``no_address``, the three customer-error results,
+    ``unmapped_items``, ``no_lines``, ``pending_payment`` and ``processing``.
+
+    The Redis lock self-heals after its 120s TTL. The MySQL lock does NOT: it is
+    held for the life of that worker's DB session, so an order first seen by
+    worker A could be refused ``db_locked`` in worker B until A's connection
+    closed. Neither ``locked`` nor ``db_locked`` is in
+    ``pull_single_order_phase1``'s ``skipped_success_reasons``, so those calls
+    also reported ``success=False`` and were counted as failures by
+    ``cancellation_reconcile``.
+
+    Wrapping the returns rather than re-indenting the whole body keeps the diff
+    reviewable. Any early return added inside that window must be wrapped too.
+    """
+    _release_order_locks(lock, db_lock_key, db_lock_acquired)
+    return result
+
+
 def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None, skip_payment_entry: bool = False, amended_from: "str | None" = None) -> dict:
     """Process a single Woo order into a Sales Invoice.
     
@@ -3641,7 +3680,13 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             res = frappe.db.sql("SELECT GET_LOCK(%s, 2)", (db_lock_key,))
             db_lock_acquired = bool(res and res[0] and res[0][0] == 1)
             if not db_lock_acquired:
-                return {"status": "skipped", "reason": "db_locked", "woo_order_id": woo_id}
+                # The Redis lock IS held at this point — releasing it here is the
+                # whole reason this return is wrapped. Bailing out without it left
+                # the order locked for the full 120s TTL on top of losing the race.
+                return _unlock_order(
+                    {"status": "skipped", "reason": "db_locked", "woo_order_id": woo_id},
+                    lock, db_lock_key, db_lock_acquired,
+                )
         except Exception:
             db_lock_acquired = False
 
@@ -3713,7 +3758,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 and contact_hash_matches
                 and territory_hash_matches
             ):
-                return {"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}
+                return _unlock_order({"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
             # target is cancellation but SI is active — fall through to cancel it
 
     # Hard idempotency: if a live Sales Invoice already exists with this woo_order_id, use it.
@@ -3798,7 +3843,7 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     if existing_map and not allow_update:
         # If map has a linked invoice, genuinely skip (already processed)
         if existing_map.get(LINK_FIELD):
-            return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+            return _unlock_order({"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
         # Orphan map entry (processing/error without invoice) — clean up and retry
         map_status = _normalize_woo_status(existing_map.get("status"))
         if map_status in ("processing", "error", ""):
@@ -3807,9 +3852,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                 frappe.db.commit()
                 existing_map = None
             except Exception:
-                return {"status": "skipped", "reason": "cleanup_failed", "woo_order_id": woo_id}
+                return _unlock_order({"status": "skipped", "reason": "cleanup_failed", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
         else:
-            return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+            return _unlock_order({"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
 
     # Suppress outbound sync hooks while processing inbound WooCommerce data.
     # Must be set BEFORE customer operations to prevent Customer.on_update from
@@ -3827,12 +3872,12 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     except ValueError as ve:
         reason = str(ve)
         if reason == "no_address":
-            return {"status": "skipped", "reason": "no_address", "woo_order_id": woo_id}
-        return _build_customer_error_result(woo_id, reason, detail=ve)
+            return _unlock_order({"status": "skipped", "reason": "no_address", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
+        return _unlock_order(_build_customer_error_result(woo_id, reason, detail=ve), lock, db_lock_key, db_lock_acquired)
     except Exception as ce:  # noqa
         if _is_duplicate_key_error(ce):
-            return _build_customer_error_result(woo_id, "duplicate_key_race", detail=ce)
-        return _build_customer_error_result(woo_id, "internal_error", detail=ce)
+            return _unlock_order(_build_customer_error_result(woo_id, "duplicate_key_race", detail=ce), lock, db_lock_key, db_lock_acquired)
+        return _unlock_order(_build_customer_error_result(woo_id, "internal_error", detail=ce), lock, db_lock_key, db_lock_acquired)
 
     # Resolve Territory -> POS Profile -> warehouse.
     # Warehouse is ALWAYS derived from POS Profile.warehouse — never from settings.default_warehouse.
@@ -3961,16 +4006,16 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
         is_historical=is_historical,
     )
     if missing:
-        return {"status": "skipped", "reason": "unmapped_items", "details": missing, "woo_order_id": woo_id}
+        return _unlock_order({"status": "skipped", "reason": "unmapped_items", "details": missing, "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
     if not lines:
-        return {"status": "skipped", "reason": "no_lines", "woo_order_id": woo_id}
+        return _unlock_order({"status": "skipped", "reason": "no_lines", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
 
     # Check payment status for live orders
     woo_status = _normalize_woo_status(order.get("status"))
     if not is_historical:
         # For live orders, skip if pending payment
         if woo_status in {"pending", "on-hold"}:
-            return {"status": "skipped", "reason": "pending_payment", "woo_order_id": woo_id, "woo_status": woo_status}
+            return _unlock_order({"status": "skipped", "reason": "pending_payment", "woo_order_id": woo_id, "woo_status": woo_status}, lock, db_lock_key, db_lock_acquired)
     
     # Map payment method
     woo_payment_method = order.get("payment_method")
@@ -4011,9 +4056,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             except Exception:
                 existing_map = None
             if existing_map and existing_map.get(LINK_FIELD):
-                return {"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}
+                return _unlock_order({"status": "skipped", "reason": "already_mapped", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
             if existing_map and _is_processing_equivalent_woo_status(existing_map.get("status")):
-                return {"status": "skipped", "reason": "processing", "woo_order_id": woo_id}
+                return _unlock_order({"status": "skipped", "reason": "processing", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
             raise map_err
 
     try:
@@ -4744,16 +4789,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
     finally:
         # Always clear the outbound-suppression flag
         frappe.flags.ignore_woo_outbound = False
-        if lock:
-            try:
-                lock.release()
-            except Exception:
-                pass
-        if db_lock_acquired:
-            try:
-                frappe.db.sql("SELECT RELEASE_LOCK(%s)", (db_lock_key,))
-            except Exception:
-                pass
+        # Same release the early returns use, via _unlock_order. Idempotent, so a
+        # path that already released does no harm reaching here.
+        _release_order_locks(lock, db_lock_key, db_lock_acquired)
 
 
 def pull_recent_orders_phase1(
@@ -5129,6 +5167,12 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
         "pending_payment",
         "processing",
         "submitted_frozen",  # PROD-WOO-001: submitted SI is intentionally frozen
+        # Another worker holds this order right now. That is the lock doing its
+        # job, not a failure — the other worker will finish it. Counting these as
+        # errors made `cancellation_reconcile` report failures for orders that
+        # were being processed correctly one connection over.
+        "locked",
+        "db_locked",
     }
     result["success"] = result.get("status") in ("created", "updated") or (
         result.get("status") == "skipped" and result.get("reason") in skipped_success_reasons
