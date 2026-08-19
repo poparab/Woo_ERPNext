@@ -159,14 +159,19 @@ def _phone_variants(p: str | None) -> list[str]:
 def _pick_established_customer(candidates: list[str]) -> str | None:
     """Of several Customers sharing one identity, which should orders attach to?
 
-    The one the business is already using: the record carrying the most recent
-    submitted Sales Invoice.  This is not hypothetical tidiness — production has
-    504 phone numbers held by more than one Customer, and for the largest family
-    the *newer*, odd-looking ``<name>-<order_id>`` record is the real one while
-    the clean-named record is an empty shell.  So neither "oldest" nor "newest"
-    is the right tie-break; "wherever the orders already are" is, and it makes
-    every future order converge on that same record instead of splitting the
-    history further.
+    The one the business is already using: the record where most of the order
+    history lives, most recent invoice breaking a tie.  This is not hypothetical
+    tidiness — production has 504 phone numbers held by more than one Customer,
+    and for the largest family the *newer*, odd-looking ``<name>-<order_id>``
+    record is the real one while the clean-named record is an empty shell.  So
+    neither "oldest" nor "newest" is the right tie-break; "wherever the orders
+    already are" is, and it makes every future order converge on that record
+    instead of splitting the history further.
+
+    Count outranks recency deliberately.  Ranking by recency alone picks the
+    accident over the account: production's ``Ahmed`` carries 142 invoices while
+    the stray ``Ahmed - 19`` carries one that happens to be newer, and recency
+    would have handed every future order to the stray.
 
     Falls back to the oldest candidate when none has ever been invoiced, so the
     answer is always deterministic — an unordered ``get_value`` picking whichever
@@ -186,7 +191,7 @@ def _pick_established_customer(candidates: list[str]) -> str | None:
             FROM `tabSales Invoice`
             WHERE `docstatus` = 1 AND `customer` IN ({placeholders})
             GROUP BY `customer`
-            ORDER BY MAX(`posting_date`) DESC, MAX(`creation`) DESC
+            ORDER BY COUNT(*) DESC, MAX(`posting_date`) DESC, `customer` ASC
             LIMIT 1
             """,
             tuple(candidates),

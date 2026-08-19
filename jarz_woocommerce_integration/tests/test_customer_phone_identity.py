@@ -156,8 +156,8 @@ class TestPickEstablishedCustomer(unittest.TestCase):
             self.assertEqual(customer_sync._pick_established_customer(["CUST-1"]), "CUST-1")
         sql.assert_not_called()
 
-    def test_prefers_the_record_holding_the_most_recent_invoice(self):
-        """The production shape: the suffixed record is the one with the history."""
+    def test_prefers_the_record_holding_the_history(self):
+        """The production shape: the suffixed record is the one with the orders."""
         def _sql(_query, values=None):
             self.assertIn("مصطفى مسعد-15570", values)
             return [("مصطفى مسعد-15570",)]
@@ -167,6 +167,29 @@ class TestPickEstablishedCustomer(unittest.TestCase):
                 ["مصطفى مسعد", "مصطفى مسعد-15570"]
             )
         self.assertEqual(winner, "مصطفى مسعد-15570")
+
+    def test_ranks_by_invoice_count_before_recency(self):
+        """Recency alone hands the account to the accident.
+
+        Production's 'Ahmed' carries 142 invoices; the stray 'Ahmed - 19' carries
+        one that happens to be newer. The query must sort on COUNT(*) first.
+        """
+        captured = {}
+
+        def _sql(query, values=None):
+            captured["query"] = " ".join(query.split())
+            return [("Ahmed",)]
+
+        with patch.object(customer_sync.frappe.db, "sql", side_effect=_sql):
+            winner = customer_sync._pick_established_customer(["Ahmed - 19", "Ahmed"])
+
+        self.assertEqual(winner, "Ahmed")
+        order_by = captured["query"].split("ORDER BY")[1]
+        self.assertLess(
+            order_by.index("COUNT(*) DESC"),
+            order_by.index("MAX(`posting_date`) DESC"),
+            "invoice count must outrank recency",
+        )
 
     def test_falls_back_to_the_oldest_when_none_has_orders(self):
         with patch.object(customer_sync.frappe.db, "sql", return_value=[]), \
