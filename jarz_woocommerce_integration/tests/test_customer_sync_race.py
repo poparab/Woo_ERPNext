@@ -102,7 +102,8 @@ class TestSafeInsertCustomer(unittest.TestCase):
              patch.object(doc, "insert", side_effect=_raise_on_insert), \
              patch.object(customer_sync, "_field_exists", return_value=True), \
              patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
-             patch.object(customer_sync.frappe.db, "get_value", return_value="CUST-PHONE"):
+             patch.object(customer_sync.frappe.db, "get_value", return_value="CUST-PHONE"), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=["CUST-PHONE"]):
             result = self._call(doc, phone_norm="01012345678")
 
         self.assertEqual(result, "CUST-PHONE")
@@ -127,7 +128,8 @@ class TestSafeInsertCustomer(unittest.TestCase):
              patch.object(doc, "insert", side_effect=_raise_on_insert), \
              patch.object(customer_sync, "_field_exists", return_value=False), \
              patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
-             patch.object(customer_sync.frappe.db, "get_value", side_effect=_get_value):
+             patch.object(customer_sync.frappe.db, "get_value", side_effect=_get_value), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=[]):
             result = self._call(doc, woo_customer_id=None, phone_norm=None, username=None,
                                 email="ahmed@example.com")
 
@@ -150,7 +152,8 @@ class TestSafeInsertCustomer(unittest.TestCase):
              patch.object(doc, "insert", side_effect=_insert_side_effect), \
              patch.object(customer_sync, "_field_exists", return_value=False), \
              patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
-             patch.object(customer_sync.frappe.db, "get_value", return_value=None):
+             patch.object(customer_sync.frappe.db, "get_value", return_value=None), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=[]):
             result = self._call(doc, woo_customer_id=None, phone_norm=None,
                                 username=None, email=None, order_id=14476)
 
@@ -175,7 +178,8 @@ class TestSafeInsertCustomer(unittest.TestCase):
              patch.object(doc, "insert", side_effect=_insert_side_effect), \
              patch.object(customer_sync, "_field_exists", return_value=False), \
              patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
-             patch.object(customer_sync.frappe.db, "get_value", return_value=None):
+             patch.object(customer_sync.frappe.db, "get_value", return_value=None), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=[]):
             result = self._call(doc, woo_customer_id=None, phone_norm=None,
                                 username=None, email=None, order_id=14476)
 
@@ -221,6 +225,7 @@ class TestEnsureCustomerRedisFallback(unittest.TestCase):
 
         with patch.object(customer_sync.frappe, "get_doc", side_effect=_make_doc), \
              patch.object(customer_sync.frappe.db, "get_value", return_value=None), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=[]), \
              patch.object(customer_sync.frappe.db, "savepoint"), \
              patch.object(customer_sync.frappe.db, "release_savepoint"), \
              patch.object(customer_sync, "_field_exists", return_value=False), \
@@ -252,6 +257,7 @@ class TestEnsureCustomerRedisFallback(unittest.TestCase):
 
         with patch.object(customer_sync.frappe, "get_doc", side_effect=_make_doc), \
              patch.object(customer_sync.frappe.db, "get_value", return_value="CUST-EXISTING"), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=["CUST-EXISTING"]), \
              patch.object(customer_sync.frappe.db, "savepoint"), \
              patch.object(customer_sync.frappe.db, "rollback"), \
              patch.object(customer_sync, "_field_exists", return_value=False), \

@@ -103,10 +103,62 @@ def has_unmigrated_legacy_customer_woo_id(customer: Any) -> bool:
 
 
 def find_customer_by_woo_id(woo_customer_id: Any) -> str | None:
+    """Resolve the single Customer bound to *woo_customer_id*.
+
+    Returns ``None`` when the id is claimed by more than one Customer.  That is
+    not a defensive nicety: production has ids held by hundreds of unrelated
+    customers, minted when the outbound push generated a colliding placeholder
+    email and adopted whatever account WooCommerce matched it to.  This function
+    is step zero of every customer resolution, and an unordered ``get_value``
+    over a poisoned id returns an arbitrary stranger — silently attaching an
+    order to the wrong person.
+
+    Refusing to answer is the safe failure: the caller falls through to the phone
+    lookup, which is reliable.  The ambiguity is logged so the affected ids stay
+    visible rather than being papered over.
+    """
     normalized = normalize_woo_customer_id(woo_customer_id)
     if not normalized or not _customer_has_column("woo_customer_id"):
         return None
-    return frappe.db.get_value("Customer", {"woo_customer_id": normalized}, "name")
+
+    matches = frappe.get_all(
+        "Customer",
+        filters={"woo_customer_id": normalized},
+        pluck="name",
+        limit=2,
+        order_by="creation asc",
+    )
+    if not matches:
+        return None
+    if len(matches) > 1:
+        frappe.logger("woo").warning(
+            f"ambiguous_woo_customer_id id={normalized} claimed_by_multiple_customers "
+            f"(e.g. {matches[0]!r}, {matches[1]!r}); falling back to phone identity"
+        )
+        return None
+    return matches[0]
+
+
+def customer_woo_id_is_claimed_by_other(woo_customer_id: Any, customer_name: str) -> bool:
+    """Is *woo_customer_id* already stored on a Customer other than *customer_name*?
+
+    Guards every write of the field.  A Woo account maps to exactly one ERPNext
+    Customer; stamping a second one on it is what made ``find_customer_by_woo_id``
+    ambiguous in the first place.
+    """
+    normalized = normalize_woo_customer_id(woo_customer_id)
+    if not normalized or not _customer_has_column("woo_customer_id"):
+        return False
+    try:
+        holders = frappe.get_all(
+            "Customer",
+            filters={"woo_customer_id": normalized},
+            pluck="name",
+            limit=2,
+        )
+    except Exception:
+        return False
+    return any(holder != customer_name for holder in holders)
 
 
 def set_customer_woo_id(

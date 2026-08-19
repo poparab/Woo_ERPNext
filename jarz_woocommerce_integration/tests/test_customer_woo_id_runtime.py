@@ -6,6 +6,20 @@ from jarz_woocommerce_integration.services import customer_sync, outbound_sync
 from jarz_woocommerce_integration.utils import customer_woo_id
 
 
+def _with_get_values(namespace):
+    """Add the list form of get_value to a fake db.
+
+    The phone lookup asks for *every* Customer holding the number, not just one,
+    so a fake that only implements get_value would starve it.
+    """
+    def get_values(doctype, filters=None, fieldname="name", **_kwargs):
+        found = namespace.get_value(doctype, filters, fieldname)
+        return [found] if found else []
+
+    namespace.get_values = get_values
+    return namespace
+
+
 class DummyCustomerClient:
     def __init__(self):
         self.put_calls = []
@@ -38,7 +52,7 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
         def fake_set_value(doctype, name, values, update_modified=False):
             updates.append((doctype, name, values, update_modified))
 
-        fake_db = SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value)
+        fake_db = _with_get_values(SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value))
 
         with unittest.mock.patch.object(customer_sync.frappe, "db", fake_db), \
              unittest.mock.patch.object(customer_sync, "_field_exists", side_effect=lambda doctype, field: field in {"woo_customer_id", "woo_username"}):
@@ -73,7 +87,7 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
         def fake_set_value(doctype, name, values, update_modified=False):
             updates.append((doctype, name, values, update_modified))
 
-        fake_db = SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value)
+        fake_db = _with_get_values(SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value))
 
         with unittest.mock.patch.object(customer_sync.frappe, "db", fake_db), \
              unittest.mock.patch.object(customer_sync, "get_customer_woo_id", return_value="111"), \
@@ -115,7 +129,7 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
         def fake_get_value(doctype, name_or_filters, fieldname):
             return None
 
-        fake_db = SimpleNamespace(get_value=fake_get_value, set_value=lambda *args, **kwargs: None)
+        fake_db = _with_get_values(SimpleNamespace(get_value=fake_get_value, set_value=lambda *args, **kwargs: None))
 
         with unittest.mock.patch.object(customer_sync.frappe, "db", fake_db), \
              unittest.mock.patch.object(customer_sync.frappe, "get_doc", side_effect=lambda fields: DummyDoc(fields)), \
@@ -222,7 +236,7 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
         def fake_set_value(doctype, name, values, update_modified=False):
             updates.append((doctype, name, values, update_modified))
 
-        fake_db = SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value)
+        fake_db = _with_get_values(SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value))
 
         with unittest.mock.patch.object(customer_sync.frappe, "db", fake_db), \
              unittest.mock.patch.object(customer_sync, "_field_exists", side_effect=lambda doctype, field: field in {"woo_customer_id", "woo_username"}):
@@ -252,7 +266,14 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
             if isinstance(name_or_filters, dict):
                 if name_or_filters == {"woo_customer_id": "3095"}:
                     return None
-                if name_or_filters == {"mobile_no": "+201000000000"}:
+                # The phone lookup queries every stored spelling of the number,
+                # so the filter arrives as {"mobile_no": ["in", [...]]}.
+                mobile_filter = name_or_filters.get("mobile_no")
+                if isinstance(mobile_filter, list | tuple) and len(mobile_filter) == 2:
+                    _operator, candidates = mobile_filter
+                    if "+201000000000" in candidates:
+                        return "CUST-PHONE"
+                elif mobile_filter == "+201000000000":
                     return "CUST-PHONE"
                 if name_or_filters == {"woo_username": "woo-user"}:
                     return None
@@ -268,7 +289,16 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
         def fake_set_value(doctype, name, values, update_modified=False):
             updates.append((doctype, name, values, update_modified))
 
-        fake_db = SimpleNamespace(get_value=fake_get_value, set_value=fake_set_value)
+        def fake_get_values(doctype, filters=None, fieldname="name", **_kwargs):
+            if doctype != "Customer" or not isinstance(filters, dict):
+                return []
+            mobile_filter = filters.get("mobile_no")
+            candidates = mobile_filter[1] if isinstance(mobile_filter, list | tuple) else [mobile_filter]
+            return ["CUST-PHONE"] if "+201000000000" in (candidates or []) else []
+
+        fake_db = SimpleNamespace(
+            get_value=fake_get_value, get_values=fake_get_values, set_value=fake_set_value
+        )
 
         with unittest.mock.patch.object(customer_sync.frappe, "db", fake_db), \
              unittest.mock.patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
@@ -318,7 +348,7 @@ class TestCustomerWooIdRuntime(unittest.TestCase):
                 return "111"
             return None
 
-        fake_db = SimpleNamespace(get_value=fake_get_value, set_value=lambda *args, **kwargs: None)
+        fake_db = _with_get_values(SimpleNamespace(get_value=fake_get_value, set_value=lambda *args, **kwargs: None))
 
         with unittest.mock.patch.object(customer_sync.frappe, "db", fake_db), \
              unittest.mock.patch.object(customer_sync.frappe, "get_doc", side_effect=lambda fields: DummyDoc(fields)), \

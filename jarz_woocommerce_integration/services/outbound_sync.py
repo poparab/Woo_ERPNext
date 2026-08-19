@@ -24,6 +24,7 @@ from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_setti
     WooCommerceSettings,
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
+    customer_woo_id_is_claimed_by_other,
     get_customer_woo_id,
     get_legacy_customer_woo_id,
     has_unmigrated_legacy_customer_woo_id,
@@ -946,6 +947,40 @@ def _normalize_customer_sync_scopes(scope: str | None) -> set[str]:
     return scopes
 
 
+def _placeholder_email(customer_name: str, phone: str | None = None) -> str:
+    """Build the stand-in email for a Customer that has none of their own.
+
+    WooCommerce requires an email, and it treats that email as the account's
+    identity — so a placeholder that is not unique per customer does not just
+    look untidy, it *fuses accounts*.  The original implementation slugged the
+    docname with ``[^a-zA-Z0-9]``, which deletes every Arabic character: most of
+    the customer base collapsed onto ``customer@placeholder.com``, and names that
+    ERPNext had already disambiguated as ``… - 2`` collapsed onto
+    ``2@placeholder.com``.  WooCommerce then answered "email already registered",
+    the reconcile branch adopted that one shared account, and hundreds of
+    unrelated customers ended up sharing a single woo_customer_id.
+
+    The Latin-slug case is left byte-for-byte identical on purpose: those
+    customers already own a Woo account keyed to exactly this address, and
+    changing it would rename their account's login email on the next push.  Only
+    the spellings that genuinely collapse — empty, or a bare disambiguation
+    number — are given a unique identity, derived from the phone where one exists
+    and from a digest of the docname otherwise.
+    """
+    slug = re.sub(r'[^a-zA-Z0-9]', '', (customer_name or "").lower())
+
+    # A slug that survived with letters in it is already customer-specific.
+    if slug and not slug.isdigit():
+        return f"{slug}@placeholder.com"
+
+    digits = ''.join(ch for ch in str(phone or "") if ch.isdigit())
+    if digits and digits != "0000000000":
+        return f"cust{digits}@placeholder.com"
+
+    digest = hashlib.sha1((customer_name or "").encode("utf-8")).hexdigest()[:12]
+    return f"cust{digest}@placeholder.com"
+
+
 def _build_customer_payload(
     customer: frappe.model.document.Document,
     *,
@@ -983,10 +1018,7 @@ def _build_customer_payload(
     if not email:
         # Generate a default email for customers without email
         # WooCommerce requires email, so we create a placeholder using customer name
-        sanitized_name = re.sub(r'[^a-zA-Z0-9]', '', customer.name.lower())
-        if not sanitized_name:
-            sanitized_name = 'customer'
-        email = f"{sanitized_name}@placeholder.com"
+        email = _placeholder_email(customer.name, phone_val)
         LOGGER.info({
             "event": "woo_outbound_customer_default_email",
             "customer": customer.name,
@@ -1167,6 +1199,24 @@ def sync_customer(
                 if search_result and len(search_result) > 0:
                     existing_woo_customer = search_result[0]
                     woo_customer_id = existing_woo_customer.get("id")
+                    # A Woo account belongs to exactly one ERPNext Customer. If this
+                    # one is already claimed, adopting it would overwrite a stranger's
+                    # WooCommerce record and make woo_customer_id ambiguous for every
+                    # future lookup — the mechanism that put 215 customers on one id.
+                    if customer_woo_id_is_claimed_by_other(woo_customer_id, customer_name):
+                        detail = (
+                            f"WooCommerce account {woo_customer_id} (email {email}) is already "
+                            f"bound to a different ERPNext Customer; refusing to adopt it"
+                        )
+                        LOGGER.error({
+                            "event": "woo_outbound_customer_id_already_claimed",
+                            "customer": customer_name,
+                            "woo_id": woo_customer_id,
+                            "email": email,
+                            "detail": detail,
+                        })
+                        _mark_customer_status(customer_name, status="error", error=detail)
+                        return {"status": "error", "detail": detail}
                     LOGGER.info({
                         "event": "woo_outbound_customer_found",
                         "customer": customer_name,

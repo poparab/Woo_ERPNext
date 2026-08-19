@@ -25,6 +25,12 @@ def _make_fake_db(customer_store: dict[str, dict]) -> Any:
     customer_store: {erp_name: {"mobile_no": ..., "email_id": ..., "woo_customer_id": ..., "woo_username": ...}}
     """
 
+    def _matches(stored, expected):
+        """Equality, plus the ``["in", [...]]`` form the phone lookup now uses."""
+        if isinstance(expected, list | tuple) and len(expected) == 2 and expected[0] == "in":
+            return stored in expected[1]
+        return stored == expected
+
     def get_value(doctype, name_or_filters, fieldname=None):
         if doctype != "Customer":
             return None
@@ -32,18 +38,35 @@ def _make_fake_db(customer_store: dict[str, dict]) -> Any:
             # Filter lookup — search by field equality
             for cname, rec in customer_store.items():
                 for flt_field, flt_val in name_or_filters.items():
-                    if rec.get(flt_field) == flt_val:
+                    if _matches(rec.get(flt_field), flt_val):
                         return cname
             return None
         # Direct name + fieldname lookup
         rec = customer_store.get(name_or_filters, {})
         return rec.get(fieldname)
 
+    def get_values(doctype, filters=None, fieldname="name", **_kwargs):
+        """List form of get_value — the phone lookup uses it to see every match."""
+        if doctype != "Customer" or not isinstance(filters, dict):
+            return []
+        found = []
+        for cname, rec in customer_store.items():
+            if all(_matches(rec.get(f), v) for f, v in filters.items()):
+                found.append(cname)
+        return found
+
     def set_value(doctype, name, values, update_modified=False):
         if doctype == "Customer" and name in customer_store:
             customer_store[name].update(values if isinstance(values, dict) else {})
 
-    return SimpleNamespace(get_value=get_value, set_value=set_value)
+    def sql(*_a, **_kw):
+        # No Sales Invoices in these fixtures, so the "most recent order" probe
+        # finds nothing and the tie-break falls through to the oldest candidate.
+        return []
+
+    return SimpleNamespace(
+        get_value=get_value, get_values=get_values, set_value=set_value, sql=sql
+    )
 
 
 def _make_fake_get_doc(created_docs: list) -> Any:

@@ -20,6 +20,7 @@ from jarz_woocommerce_integration.services.geo_passthrough import (
     resolve_order_pins as _resolve_order_geo_pins,
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
+    customer_woo_id_is_claimed_by_other,
     find_customer_by_woo_id,
     get_legacy_customer_woo_id,
     get_customer_woo_id,
@@ -91,10 +92,153 @@ def _is_duplicate_key_error(exc: BaseException) -> bool:
 
 
 def _normalize_phone(p: Optional[str]) -> Optional[str]:
+    """Canonicalise a phone number to the local Egyptian form (``0XXXXXXXXXX``).
+
+    The store writes the same number two ways — ``01111034268`` from the POS and
+    checkout, ``+201111034268`` from WooCommerce accounts that stored the country
+    code.  Digit-stripping alone left those as two different identities, so the
+    phone step of :func:`_ensure_customer` was blind across the pair and minted a
+    fresh Customer every time it crossed the boundary.  Collapsing the country
+    code here makes the two spellings one key.
+
+    Non-Egyptian numbers keep a leading ``+`` and are otherwise returned as-is;
+    there is no attempt to guess a country for them.  Reads must still go through
+    :func:`_phone_variants` because historical rows are stored un-canonicalised.
+    """
     if not p:
         return None
     s = ''.join(ch for ch in str(p) if ch.isdigit() or ch == '+').strip()
-    return s or None
+    if not s:
+        return None
+
+    digits = s.lstrip('+')
+    if not digits.isdigit():
+        return s
+
+    # 00 20 ... -> 20 ...   (international prefix written out)
+    if digits.startswith('0020'):
+        digits = digits[2:]
+    # 20 1XXXXXXXXX (12 digits) -> 01XXXXXXXXX
+    if digits.startswith('20') and len(digits) == 12:
+        return '0' + digits[2:]
+    # 0020 1XXXXXXXXX already folded above; guard the 200XXXXXXXXXX spelling too
+    if digits.startswith('200') and len(digits) == 13:
+        return digits[2:]
+    return s
+
+
+def _phone_variants(p: str | None) -> list[str]:
+    """Every stored spelling of *p* that means the same number.
+
+    ``mobile_no`` is matched with an exact ``=``/``IN`` comparison, and production
+    holds the same subscriber as ``01111034268``, ``+201111034268`` and
+    ``201111034268``.  A lookup that queries only the canonical form silently
+    misses the other two, which is precisely how duplicate Customers were created.
+    Returns canonical-first so callers that only want one value can take ``[0]``.
+    """
+    canonical = _normalize_phone(p)
+    if not canonical:
+        return []
+
+    variants = [canonical]
+    if canonical.startswith('0') and len(canonical) == 11 and canonical.isdigit():
+        national = canonical[1:]
+        for variant in (f'+20{national}', f'20{national}', f'0020{national}'):
+            if variant not in variants:
+                variants.append(variant)
+
+    # The raw input may itself be a spelling we do not synthesise (e.g. spaces or
+    # dashes already stripped by the caller). Keep it so an exact stored match
+    # is never lost.
+    raw = ''.join(ch for ch in str(p) if ch.isdigit() or ch == '+').strip()
+    if raw and raw not in variants:
+        variants.append(raw)
+    return variants
+
+
+def _pick_established_customer(candidates: list[str]) -> str | None:
+    """Of several Customers sharing one identity, which should orders attach to?
+
+    The one the business is already using: the record carrying the most recent
+    submitted Sales Invoice.  This is not hypothetical tidiness — production has
+    504 phone numbers held by more than one Customer, and for the largest family
+    the *newer*, odd-looking ``<name>-<order_id>`` record is the real one while
+    the clean-named record is an empty shell.  So neither "oldest" nor "newest"
+    is the right tie-break; "wherever the orders already are" is, and it makes
+    every future order converge on that same record instead of splitting the
+    history further.
+
+    Falls back to the oldest candidate when none has ever been invoiced, so the
+    answer is always deterministic — an unordered ``get_value`` picking whichever
+    row the index happened to yield first is what we are replacing.
+    """
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    placeholders = ", ".join(["%s"] * len(candidates))
+    try:
+        rows = frappe.db.sql(
+            f"""
+            SELECT `customer`
+            FROM `tabSales Invoice`
+            WHERE `docstatus` = 1 AND `customer` IN ({placeholders})
+            GROUP BY `customer`
+            ORDER BY MAX(`posting_date`) DESC, MAX(`creation`) DESC
+            LIMIT 1
+            """,
+            tuple(candidates),
+        )
+        if rows and rows[0] and rows[0][0]:
+            return rows[0][0]
+    except Exception:
+        frappe.logger("woo").warning(
+            f"established_customer_lookup_failed candidates={candidates!r}"
+        )
+
+    try:
+        oldest = frappe.db.get_values(
+            "Customer",
+            {"name": ["in", candidates]},
+            "name",
+            order_by="creation asc",
+            pluck=True,
+        )
+        if oldest:
+            return oldest[0]
+    except Exception:
+        pass
+    return sorted(candidates)[0]
+
+
+def _find_customer_by_phone(phone: str | None) -> str | None:
+    """Resolve a Customer from any stored spelling of *phone*.
+
+    Checks ``mobile_no`` first, then ``phone``, mirroring the original lookup
+    order so an existing match keeps resolving to the same record.  Where the
+    number resolves to more than one Customer — the duplicates this module is
+    being fixed to stop creating — :func:`_pick_established_customer` decides,
+    rather than whichever row the index happened to return.
+    """
+    variants = _phone_variants(phone)
+    if not variants:
+        return None
+
+    for fieldname in ("mobile_no", "phone"):
+        if fieldname == "phone" and not _field_exists("Customer", "phone"):
+            continue
+        matches = frappe.db.get_values(
+            "Customer",
+            {fieldname: ["in", variants]},
+            "name",
+            order_by="creation asc",
+            pluck=True,
+        ) or []
+        if matches:
+            return _pick_established_customer(list(matches))
+    return None
 
 
 def _candidate_conflicts_with_woo_customer(name: Optional[str], woo_customer_id: Optional[int | str]) -> bool:
@@ -168,7 +312,16 @@ def _update_customer_identity(
             updates["customer_name"] = normalized_display_name
         current_woo_customer_id = get_customer_woo_id(name)
         if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and (overwrite_existing or not current_woo_customer_id) and current_woo_customer_id != normalized_woo_customer_id:
-            updates["woo_customer_id"] = normalized_woo_customer_id
+            # One Woo account maps to one Customer. Stamping an id that another
+            # Customer already holds is what made the field ambiguous across
+            # hundreds of records and broke identity resolution at step zero.
+            if customer_woo_id_is_claimed_by_other(normalized_woo_customer_id, name):
+                frappe.logger("woo").warning(
+                    f"skipped_woo_customer_id_write customer={name!r} id={normalized_woo_customer_id} "
+                    f"already_claimed_by_another_customer"
+                )
+            else:
+                updates["woo_customer_id"] = normalized_woo_customer_id
         current_username = str(frappe.db.get_value("Customer", name, "woo_username") or "") if _field_exists("Customer", "woo_username") else ""
         if username and _field_exists("Customer", "woo_username") and (overwrite_existing or not current_username) and current_username != username:
             updates["woo_username"] = username
@@ -235,9 +388,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
 
     # 1) phone-based
     if phone_norm:
-        name = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
-        if not name and _field_exists("Customer", "phone"):
-            name = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+        name = _find_customer_by_phone(phone_norm)
         # For guest orders, phone alone is not sufficient to reuse a Woo-bound customer;
         # require email to also match to confirm it is the same person.
         if name and not woo_customer_id and not _candidate_safe_for_guest(name):
@@ -359,9 +510,7 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
             if phone_norm:
-                _recheck = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
-                if not _recheck and _field_exists("Customer", "phone"):
-                    _recheck = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+                _recheck = _find_customer_by_phone(phone_norm)
                 if _recheck and not woo_customer_id and not _candidate_safe_for_guest(_recheck):
                     phone_email_match = bool(email and frappe.db.get_value("Customer", _recheck, "email_id") == email)
                     if not phone_email_match:
@@ -463,6 +612,101 @@ def _cache_customer(cache: dict | None, name: str, woo_cid, username, phone, ema
         cache[f"email:{email}"] = name
 
 
+def _read_committed_row(
+    doctype: str,
+    name: str,
+    fields: tuple[str, ...],
+    *,
+    for_update: bool = True,
+) -> dict | None:
+    """Read one row by primary key, bypassing this transaction's MVCC snapshot.
+
+    MariaDB runs REPEATABLE READ by default and Frappe never overrides it, so a
+    plain ``SELECT`` inside an open transaction is served from a snapshot taken at
+    that transaction's first read — a snapshot which, by construction, predates
+    the row a racing worker committed a moment ago.  The *unique index* is not
+    snapshotted; it is what raised the duplicate-key error in the first place.
+
+    That asymmetry is the whole bug: the recovery lookups re-read through the
+    stale snapshot, found nothing, and the caller concluded it had hit a genuine
+    name collision when it had actually hit the race the recovery exists for.
+
+    A *locking* read is the fix — InnoDB always serves those from the latest
+    committed version rather than from the snapshot.  This is a primary-key point
+    read, so it takes one record lock and no gap lock, and a duplicate-key error
+    already implies the racing transaction committed (InnoDB blocks the
+    conflicting insert until it does), so it never actually waits.
+
+    ``for_update`` picks the lock mode and matters: a caller that writes the row
+    afterwards must take the exclusive lock up front, because two workers both
+    holding a shared lock and then both upgrading to exclusive is a textbook
+    deadlock.  Read-only callers pass ``False`` and take the lighter shared lock.
+    """
+    if not name:
+        return None
+    columns = ", ".join(f"`{field}`" for field in fields)
+    lock_clause = "FOR UPDATE" if for_update else "LOCK IN SHARE MODE"
+    try:
+        rows = frappe.db.sql(
+            f"SELECT {columns} FROM `tab{doctype}` WHERE `name` = %s LIMIT 1 {lock_clause}",
+            (name,),
+            as_dict=True,
+        )
+    except Exception:
+        # Never let the recovery path itself abort the sync. Falling back to a
+        # plain read keeps the old behaviour rather than losing the order.
+        frappe.logger("woo").warning(
+            f"locking_read_failed doctype={doctype} name={name!r}; falling back to snapshot read"
+        )
+        try:
+            row = frappe.db.get_value(doctype, name, list(fields), as_dict=True)
+        except Exception:
+            return None
+        return dict(row) if row else None
+    return dict(rows[0]) if rows else None
+
+
+def _customer_is_same_identity(
+    row: dict,
+    *,
+    woo_customer_id: int | str | None,
+    username: str | None,
+    phone_norm: str | None,
+    email: str | None,
+) -> bool:
+    """Is the Customer in *row* the same person the caller is trying to insert?
+
+    Used to tell the two duplicate-key causes apart once the colliding row has
+    actually been read.  A shared identifier means a racing worker got there
+    first; no shared identifier means two different people happen to carry the
+    same display name, which is the one case where suffixing is correct.
+
+    Absence of evidence is deliberately *not* treated as a match: when neither
+    side carries any identifier the two records are genuinely indistinguishable,
+    and merging them on name alone would fuse unrelated customers.
+    """
+    existing_woo = normalize_woo_customer_id(row.get("woo_customer_id"))
+    incoming_woo = normalize_woo_customer_id(woo_customer_id)
+    if existing_woo and incoming_woo:
+        return existing_woo == incoming_woo
+
+    if phone_norm:
+        for fieldname in ("mobile_no", "phone"):
+            if _normalize_phone(row.get(fieldname)) == _normalize_phone(phone_norm):
+                return True
+
+    if username and str(row.get("woo_username") or "").strip() == str(username).strip():
+        return True
+
+    if email and str(row.get("email_id") or "").strip().lower() == str(email).strip().lower():
+        return True
+
+    return False
+
+
+_CUSTOMER_IDENTITY_FIELDS = ("name", "woo_customer_id", "woo_username", "mobile_no", "email_id")
+
+
 def _safe_insert_customer(
     doc,
     *,
@@ -476,15 +720,19 @@ def _safe_insert_customer(
 
     On a DuplicateEntryError the savepoint is rolled back and the full
     identifier-priority lookup chain is re-run to return the Customer already
-    inserted by a concurrent worker.  If no match is found after recovery
-    (genuine non-race name collision) the customer_name is suffixed with
-    the order_id and retried once before raising.
+    inserted by a concurrent worker.  Those lookups can be served from a stale
+    snapshot, so a miss is not proof of a genuine collision: the colliding row is
+    then re-read by primary key with :func:`_read_committed_row`, which sees the
+    latest committed data.  Only when that row exists and belongs to a *different*
+    person is the customer_name suffixed with the order_id and retried once.
     """
     sp = "woo_cust_ins"
     savepoint = getattr(frappe.db, "savepoint", None)
     release_savepoint = getattr(frappe.db, "release_savepoint", None)
     rollback = getattr(frappe.db, "rollback", None)
     supports_savepoints = callable(savepoint) and callable(release_savepoint) and callable(rollback)
+
+    colliding_name = str(getattr(doc, "name", "") or "").strip()
 
     try:
         if supports_savepoints:
@@ -496,6 +744,9 @@ def _safe_insert_customer(
     except Exception as exc:
         if not _is_duplicate_key_error(exc):
             raise
+        # Frappe names the Customer during insert(), so the key that collided is
+        # readable off the doc even though the insert failed.
+        colliding_name = str(getattr(doc, "name", "") or colliding_name or getattr(doc, "customer_name", "") or "").strip()
         if supports_savepoints:
             rollback(save_point=sp)
         frappe.logger("woo").info(
@@ -507,9 +758,7 @@ def _safe_insert_customer(
             if found:
                 return found
         if phone_norm:
-            found = frappe.db.get_value("Customer", {"mobile_no": phone_norm}, "name")
-            if not found and _field_exists("Customer", "phone"):
-                found = frappe.db.get_value("Customer", {"phone": phone_norm}, "name")
+            found = _find_customer_by_phone(phone_norm)
             if found:
                 return found
         if username and _field_exists("Customer", "woo_username"):
@@ -520,6 +769,38 @@ def _safe_insert_customer(
             found = frappe.db.get_value("Customer", {"email_id": email}, "name")
             if found:
                 return found
+
+        # Every lookup above reads through this transaction's snapshot, so a miss
+        # is not evidence that the racing row does not exist. Re-read the exact
+        # key that collided with a locking read, which sees committed data.
+        existing = _read_committed_row("Customer", colliding_name, _CUSTOMER_IDENTITY_FIELDS)
+        if existing:
+            if _customer_is_same_identity(
+                existing,
+                woo_customer_id=woo_customer_id,
+                username=username,
+                phone_norm=phone_norm,
+                email=email,
+            ):
+                frappe.logger("woo").info(
+                    f"recovered_race_via_committed_read customer='{existing.get('name')}' "
+                    f"woo_cid={woo_customer_id} order={order_id}"
+                )
+                _update_customer_identity(
+                    existing.get("name"),
+                    woo_customer_id=woo_customer_id,
+                    username=username,
+                    phone_norm=phone_norm,
+                    email=email,
+                    customer_cache=None,
+                )
+                return existing.get("name")
+            frappe.logger("woo").warning(
+                f"customer_name_collision_distinct_identity name={colliding_name!r} "
+                f"existing_woo_cid={existing.get('woo_customer_id')!r} incoming_woo_cid={woo_customer_id!r} "
+                f"order={order_id}"
+            )
+
         # Genuine non-race collision on the generated name — suffix once and retry.
         suffix = f"-{order_id}" if order_id else "-dup"
         doc.customer_name = f"{doc.customer_name}{suffix}"
@@ -894,6 +1175,49 @@ def _resolve_territory_from_state(state_value: str | None, territory_state_cache
     return result
 
 
+_ADDRESS_SIGNATURE_FIELDS = (
+    "name",
+    "address_line1",
+    "address_line2",
+    "city",
+    "state",
+    "pincode",
+    "country",
+)
+
+
+def _address_is_linked_to_customer(address_name: str, customer: str) -> bool:
+    """Does *address_name* carry a Dynamic Link to *customer*?
+
+    Read with a locking read for the same reason as :func:`_read_committed_row`:
+    the link row was written by the racing worker in the transaction that just
+    committed, so a snapshot read would report the address as unlinked and send
+    the caller down the suffix path it is trying to avoid.
+    """
+    if not address_name or not customer:
+        return False
+    try:
+        rows = frappe.db.sql(
+            """
+            SELECT 1
+            FROM `tabDynamic Link`
+            WHERE `parenttype` = 'Address'
+              AND `parent` = %s
+              AND `link_doctype` = 'Customer'
+              AND `link_name` = %s
+            LIMIT 1
+            LOCK IN SHARE MODE
+            """,
+            (address_name, customer),
+        )
+        return bool(rows)
+    except Exception:
+        frappe.logger("woo").warning(
+            f"address_link_locking_read_failed address={address_name!r} customer={customer!r}"
+        )
+        return False
+
+
 def _safe_insert_address(
     addr_doc,
     *,
@@ -905,14 +1229,19 @@ def _safe_insert_address(
 
     On a DuplicateEntryError the savepoint is rolled back and
     _find_existing_address_for_customer is re-run to return the Address
-    already inserted by a concurrent worker.  If still not found the
-    address_title is suffixed once and retried before raising.
+    already inserted by a concurrent worker.  That lookup reads through the
+    transaction snapshot, so a miss is re-checked against the colliding key with
+    :func:`_read_committed_row` before concluding this is a genuine collision —
+    the same stale-snapshot trap that produced suffixed duplicate Customers.
+    Only then is the address_title suffixed once and retried.
     """
     sp = "woo_addr_ins"
     savepoint = getattr(frappe.db, "savepoint", None)
     release_savepoint = getattr(frappe.db, "release_savepoint", None)
     rollback = getattr(frappe.db, "rollback", None)
     supports_savepoints = callable(savepoint) and callable(release_savepoint) and callable(rollback)
+
+    colliding_name = str(getattr(addr_doc, "name", "") or "").strip()
 
     try:
         if supports_savepoints:
@@ -924,6 +1253,7 @@ def _safe_insert_address(
     except Exception as exc:
         if not _is_duplicate_key_error(exc):
             raise
+        colliding_name = str(getattr(addr_doc, "name", "") or colliding_name or "").strip()
         if supports_savepoints:
             rollback(save_point=sp)
         frappe.logger("woo").info(
@@ -932,6 +1262,26 @@ def _safe_insert_address(
         found = _find_existing_address_for_customer(customer, addr_doc.address_type, data)
         if found:
             return found
+
+        # Snapshot-invisible race: re-read the exact key that collided. Read-only,
+        # so the lighter shared lock is enough.
+        existing = _read_committed_row(
+            "Address", colliding_name, _ADDRESS_SIGNATURE_FIELDS, for_update=False
+        )
+        if existing and _has_usable_source_address(data):
+            if _stored_address_signature(existing) == _source_address_signature(data) and (
+                _address_is_linked_to_customer(colliding_name, customer)
+            ):
+                frappe.logger("woo").info(
+                    f"recovered_race_via_committed_read address='{colliding_name}' "
+                    f"customer={customer} order={order_id}"
+                )
+                return colliding_name
+            frappe.logger("woo").warning(
+                f"address_title_collision_distinct_address name={colliding_name!r} "
+                f"customer={customer} order={order_id}"
+            )
+
         # Genuine collision — suffix address_title once and retry.
         suffix = f"-{order_id}" if order_id else "-dup"
         addr_doc.address_title = f"{addr_doc.address_title}{suffix}"
