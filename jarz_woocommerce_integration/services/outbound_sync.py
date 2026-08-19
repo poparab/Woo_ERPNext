@@ -4277,7 +4277,17 @@ def _build_order_creation_dates(invoice: frappe.model.document.Document) -> dict
     return dates
 
 
-def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[dict[str, str]]:
+def _resolve_delivery_window(invoice: frappe.model.document.Document):
+    """``(date, formatted_date, time_from, end_time)`` for the order's slot.
+
+    The single source for BOTH the ORDDD meta keys and the human-readable
+    "Delivery details" order note, so the two can never drift apart. The plugin
+    writes the same slot twice in different formats on a native checkout — 24h in
+    the meta, 12h in the note — and getting one right while the other rots is
+    exactly the kind of divergence this app exists to prevent.
+
+    Returns ``(None, "", None, None)`` when the invoice carries no delivery date.
+    """
     delivery_date = _coerce_delivery_date(
         _first_present(
             getattr(invoice, "custom_delivery_date", None),
@@ -4285,12 +4295,71 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
         )
     )
     if not delivery_date:
-        return []
+        return None, "", None, None
 
     # Mirror the shape the ORDDD plugin itself writes on a Woo-native checkout,
     # e.g. "4 August, 2026" — not "%A, %B %d, %Y". The plugin reads these keys
     # back when it renders/edits the slot in the order screen.
     formatted_date = f"{delivery_date.day} {delivery_date.strftime('%B')}, {delivery_date.year}"
+
+    time_from = _coerce_delivery_time(getattr(invoice, "custom_delivery_time_from", None))
+    duration_seconds = _coerce_delivery_duration_seconds(getattr(invoice, "custom_delivery_duration", None))
+    end_time = None
+    if time_from and duration_seconds and duration_seconds > 0:
+        # .time() rather than arithmetic on the clock: a slot that crosses
+        # midnight (23:00 + 90min) must land on 00:30, not 24:30.
+        end_time = (
+            datetime.combine(delivery_date, time_from) + timedelta(seconds=duration_seconds)
+        ).time()
+    else:
+        legacy_delivery_time = _coerce_delivery_time(
+            _first_present(
+                getattr(invoice, "custom_delivery_time", None),
+                getattr(invoice, "delivery_time", None),
+            )
+        )
+        if legacy_delivery_time:
+            # Legacy single-point time: a start with no end, as before.
+            time_from, end_time = legacy_delivery_time, None
+
+    return delivery_date, formatted_date, time_from, end_time
+
+
+def _build_delivery_details_note(invoice: frappe.model.document.Document) -> str:
+    """The plugin's own "Delivery details" order note, reproduced exactly.
+
+    On a native checkout the ORDDD plugin records the slot in THREE places: the
+    ``_orddd_*`` meta, the duplicated ``Delivery Date`` / ``Time Slot`` keys, and
+    a private order note. We wrote the first two and never the third, so a
+    POS-pushed order was missing the line staff actually read in the order
+    screen — order 16898 had it absent while native 16897 alongside it read:
+
+        Delivery details: <br><strong>Delivery Date</strong>: 19 August, 2026<br> <strong>Time Slot</strong>: 01:00 PM - 02:30 PM
+
+    Byte-for-byte that string, including the single space after the second
+    ``<br>``. Note the slot is **12-hour** here while the meta keys carry 24-hour
+    — that asymmetry is the plugin's, verified across orders 16895/16896/16897.
+    """
+    delivery_date, formatted_date, time_from, end_time = _resolve_delivery_window(invoice)
+    if not delivery_date:
+        return ""
+
+    body = f"Delivery details: <br><strong>Delivery Date</strong>: {formatted_date}"
+    if time_from and end_time:
+        body += (
+            f"<br> <strong>Time Slot</strong>: "
+            f"{time_from.strftime('%I:%M %p')} - {end_time.strftime('%I:%M %p')}"
+        )
+    elif time_from:
+        body += f"<br> <strong>Time Slot</strong>: {time_from.strftime('%I:%M %p')}"
+    return body
+
+
+def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[dict[str, str]]:
+    delivery_date, formatted_date, delivery_time_from, end_time = _resolve_delivery_window(invoice)
+    if not delivery_date:
+        return []
+
     midnight_timestamp = calendar.timegm(datetime.combine(delivery_date, dt_time(0, 0)).timetuple())
     metadata = [
         {"key": "_orddd_timestamp", "value": str(midnight_timestamp)},
@@ -4303,23 +4372,12 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
         {"key": "Delivery Date", "value": formatted_date},
     ]
 
-    delivery_time_from = _coerce_delivery_time(getattr(invoice, "custom_delivery_time_from", None))
-    delivery_duration_seconds = _coerce_delivery_duration_seconds(getattr(invoice, "custom_delivery_duration", None))
-
     time_slot_label = None
-    if delivery_time_from and delivery_duration_seconds and delivery_duration_seconds > 0:
-        end_datetime = datetime.combine(delivery_date, delivery_time_from) + timedelta(seconds=delivery_duration_seconds)
-        time_slot_label = f"{delivery_time_from.strftime('%H:%M')} - {end_datetime.strftime('%H:%M')}"
-    else:
-        legacy_delivery_time = _coerce_delivery_time(
-            _first_present(
-                getattr(invoice, "custom_delivery_time", None),
-                getattr(invoice, "delivery_time", None),
-            )
-        )
-        if legacy_delivery_time:
-            delivery_time_from = legacy_delivery_time
-            time_slot_label = legacy_delivery_time.strftime("%H:%M")
+    if delivery_time_from and end_time:
+        time_slot_label = f"{delivery_time_from.strftime('%H:%M')} - {end_time.strftime('%H:%M')}"
+    elif delivery_time_from:
+        # Legacy single-point time: a start with no end, exactly as before.
+        time_slot_label = delivery_time_from.strftime("%H:%M")
 
     if time_slot_label:
         slot_start_timestamp = midnight_timestamp + (
@@ -4613,6 +4671,25 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     # invoice has gone back to outstanding — see `_detect_unpayable_transition`.
     if unpayable_transition:
         _report_unpayable_transition(client, woo_id or woo_order_id, invoice_name)
+
+    # The ORDDD plugin records the slot in three places on a native checkout, and
+    # the order note is the one staff actually read in the order screen. We wrote
+    # the meta and skipped the note, so a POS-pushed order looked slot-less next
+    # to a website order carrying the same slot. `_post_woo_order_note` dedupes on
+    # the exact body, so re-syncing the same slot cannot duplicate it — while a
+    # genuine reschedule produces a new line, which is the audit trail you want.
+    delivery_note_body = _build_delivery_details_note(invoice)
+    if delivery_note_body:
+        outcome = _post_woo_order_note(client, woo_id or woo_order_id, delivery_note_body)
+        if outcome not in ("posted", "already_posted"):
+            # Never fatal: the order and its meta are already correct on the
+            # store, and a missing note must not fail an otherwise good push.
+            LOGGER.warning({
+                "event": "woo_delivery_details_note_failed",
+                "invoice": invoice_name,
+                "woo_order_id": woo_id or woo_order_id,
+                "outcome": outcome,
+            })
 
     # --- Verify WooCommerce accepted the desired status ------------------
     # Some WordPress plugins (e.g. delivery management) silently override the
