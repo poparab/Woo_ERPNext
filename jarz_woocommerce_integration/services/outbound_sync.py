@@ -1307,7 +1307,26 @@ def _enqueue_invoice_return_sync(
     customer's favour, and it used to leave the order reading ``completed``
     forever (F-16).
     """
-    if _is_outbound_suppressed(credit_note):
+    # Global suppression only — deliberately NOT the credit note's own doc flag.
+    #
+    # jarz_pos's return builder sets `cn.flags.ignore_woo_outbound = True` (and
+    # blanks woo_order_id/woo_order_number) to stop the credit note being pushed
+    # AS AN ORDER: those ids are copyable custom fields, so an unguarded push
+    # would re-open a completed order, or create a brand-new one once the id was
+    # blank. That concern is real, but it is already answered structurally —
+    # `_should_enqueue_invoice_event` refuses `is_return`, `sync_sales_invoice`
+    # refuses it again, and `enqueue_invoice_sync` routes every credit note here
+    # instead of down the order path. This handler never pushes the credit note.
+    #
+    # Honouring the doc flag here therefore disabled the whole F-16 reflection on
+    # the one path that matters: a return posted through the POS workflow
+    # returned at this line and the customer's order silently stayed "completed".
+    # The Desk/`make_return_doc` path did not set the flag, which is why tests
+    # that built credit notes that way saw it working.
+    #
+    # The GLOBAL flag is still honoured: it means "we are inside inbound sync,
+    # touch nothing on the store", and that must keep winning.
+    if _is_outbound_suppressed():
         return
     if method not in (None, "on_submit", "on_cancel") and not force:
         return
