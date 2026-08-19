@@ -99,6 +99,29 @@ WOO_ORDER_NOTE_MARKER = "— WooCommerce order note #"
 WOO_CUSTOMER_NOTE_MARKER = "— WooCommerce customer note "
 POS_OUTBOUND_NOTE_SIGNATURE = "(Jarz POS)"
 
+#: Note bodies this app writes OUTBOUND that carry neither signature below,
+#: because they are machine statements rather than someone's note:
+#: ``sync_invoice_return`` ("Jarz POS: Full return recorded against this order…",
+#: partial, and reversed) and ``_report_unpayable_transition`` ("Jarz POS: this
+#: order is no longer settled in ERPNext…"). Without this prefix they come back
+#: inbound as Jarz Invoice Notes duplicating information ERPNext already holds —
+#: the same echo the signatures below exist to stop, just from newer writers.
+POS_OUTBOUND_NOTE_PREFIX = "Jarz POS:"
+
+#: ``author`` values that mean "WooCommerce wrote this itself", not a person.
+#:
+#: The check used to compare against ``"system"``, which **this store never
+#: returns**. A census of every note on the six most recent orders came back
+#: ``{"WooCommerce": 7}`` — status-change logs, e-mail failures and notes posted
+#: through the REST API are ALL authored ``WooCommerce``. So the skip never fired
+#: and WooCommerce's own bookkeeping was being materialised as staff-visible
+#: Jarz Invoice Notes: one order had accumulated six of them.
+#:
+#: A note a human adds in wp-admin carries that person's display name instead
+#: (the status logs only mention the user inside the body), so real staff notes
+#: still come through. ``"system"`` is kept because other stores/plugins do use it.
+WOO_SYSTEM_NOTE_AUTHORS = frozenset({"system", "woocommerce"})
+
 #: ``outbound_sync.sync_invoice_note`` signs a note TWO ways, because the author
 #: is optional on ``Jarz Invoice Note``:
 #:
@@ -2916,6 +2939,7 @@ def _woo_note_is_ours(body: str) -> bool:
     return (
         POS_OUTBOUND_NOTE_SIGNATURE in text
         or POS_OUTBOUND_NOTE_SIGNATURE_NO_AUTHOR in text
+        or POS_OUTBOUND_NOTE_PREFIX in text
         or WOO_ORDER_NOTE_MARKER in text
     )
 
@@ -3070,7 +3094,7 @@ def sync_woo_order_notes(
         body = str(note.get("note") or "").strip()
         if not body or _woo_note_is_ours(body):
             continue
-        if str(note.get("author") or "").strip().lower() == "system":
+        if str(note.get("author") or "").strip().lower() in WOO_SYSTEM_NOTE_AUTHORS:
             continue
         note_id = str(note.get("id") or "").strip()
         if not note_id:
