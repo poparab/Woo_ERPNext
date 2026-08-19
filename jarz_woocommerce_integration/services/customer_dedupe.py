@@ -43,6 +43,11 @@ from typing import Any
 
 import frappe
 
+# The model-level function, not the `frappe.rename_doc` alias: only this one
+# accepts ignore_permissions, and a merge run must not depend on whose session
+# happens to be executing it.
+from frappe.model.rename_doc import rename_doc
+
 from jarz_woocommerce_integration.services.customer_sync import (
     _normalize_phone,
     _suppress_woo_outbound,
@@ -379,7 +384,7 @@ def merge_group(group: dict[str, Any], *, apply: bool = False,
         lead_statuses = _restore_lead_statuses(group["members"])
 
         for loser in losers:
-            frappe.rename_doc(
+            rename_doc(
                 "Customer", loser, survivor,
                 merge=True, force=True, ignore_permissions=True,
                 show_alert=False, rebuild_search=False,
@@ -389,7 +394,7 @@ def merge_group(group: dict[str, Any], *, apply: bool = False,
         clean = group.get("clean_name") or ""
         if restore_clean_name and clean and clean != survivor:
             if not frappe.db.exists("Customer", clean):
-                frappe.rename_doc(
+                rename_doc(
                     "Customer", survivor, clean,
                     merge=False, force=True, ignore_permissions=True,
                     show_alert=False, rebuild_search=False,

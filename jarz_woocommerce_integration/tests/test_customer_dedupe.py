@@ -160,6 +160,26 @@ class TestBuildPlanClassification(unittest.TestCase):
         self.assertEqual(plan["auto"][0]["size"], 2)
 
 
+class TestRenameEntryPoint(unittest.TestCase):
+    """Which rename_doc the tool calls is not incidental.
+
+    The `frappe.rename_doc` alias has no ignore_permissions parameter and raises
+    TypeError if handed one — caught only on a real bench, because the mocks
+    accept anything. The model-level function is the one with the full signature.
+    """
+
+    def test_uses_the_model_level_function(self):
+        import inspect
+
+        self.assertEqual(
+            customer_dedupe.rename_doc.__module__, "frappe.model.rename_doc"
+        )
+        params = inspect.signature(customer_dedupe.rename_doc).parameters
+        for required in ("merge", "force", "ignore_permissions", "rebuild_search"):
+            with self.subTest(param=required):
+                self.assertIn(required, params)
+
+
 class TestMergeGroupSafety(unittest.TestCase):
     """The invariants a merge must not break."""
 
@@ -178,7 +198,7 @@ class TestMergeGroupSafety(unittest.TestCase):
 
     def test_dry_run_never_writes(self):
         with patch.object(customer_dedupe, "_snapshot", return_value={}), \
-             patch.object(customer_dedupe.frappe, "rename_doc") as rename:
+             patch.object(customer_dedupe, "rename_doc") as rename:
             result = customer_dedupe.merge_group(self._group(), apply=False)
         rename.assert_not_called()
         self.assertFalse(result["applied"])
@@ -192,7 +212,7 @@ class TestMergeGroupSafety(unittest.TestCase):
 
         with patch.object(customer_dedupe, "_snapshot", side_effect=[before, after]), \
              patch.object(customer_dedupe, "_restore_lead_statuses", return_value={}), \
-             patch.object(customer_dedupe.frappe, "rename_doc"), \
+             patch.object(customer_dedupe, "rename_doc"), \
              patch.object(customer_dedupe.frappe.db, "savepoint"), \
              patch.object(customer_dedupe.frappe.db, "release_savepoint"), \
              patch.object(customer_dedupe.frappe.db, "commit") as commit, \
@@ -211,7 +231,7 @@ class TestMergeGroupSafety(unittest.TestCase):
                 "pe_rows": 0, "pe_paid": 0.0, "addresses": 0}
         with patch.object(customer_dedupe, "_snapshot", return_value=snap), \
              patch.object(customer_dedupe, "_restore_lead_statuses", return_value={}), \
-             patch.object(customer_dedupe.frappe, "rename_doc"), \
+             patch.object(customer_dedupe, "rename_doc"), \
              patch.object(customer_dedupe.frappe.db, "savepoint"), \
              patch.object(customer_dedupe.frappe.db, "release_savepoint"), \
              patch.object(customer_dedupe.frappe.db, "commit"), \
@@ -225,7 +245,7 @@ class TestMergeGroupSafety(unittest.TestCase):
     def test_an_exception_rolls_back_rather_than_propagating(self):
         with patch.object(customer_dedupe, "_snapshot", return_value={}), \
              patch.object(customer_dedupe, "_restore_lead_statuses", return_value={}), \
-             patch.object(customer_dedupe.frappe, "rename_doc",
+             patch.object(customer_dedupe, "rename_doc",
                           side_effect=RuntimeError("link exists")), \
              patch.object(customer_dedupe.frappe.db, "savepoint"), \
              patch.object(customer_dedupe.frappe.db, "rollback") as rollback:
@@ -242,7 +262,7 @@ class TestMergeGroupSafety(unittest.TestCase):
         with patch.object(customer_dedupe, "_snapshot", return_value=snap), \
              patch.object(customer_dedupe, "_restore_lead_statuses",
                           return_value={"LEAD-1": "Converted"}), \
-             patch.object(customer_dedupe.frappe, "rename_doc"), \
+             patch.object(customer_dedupe, "rename_doc"), \
              patch.object(customer_dedupe.frappe.db, "savepoint"), \
              patch.object(customer_dedupe.frappe.db, "release_savepoint"), \
              patch.object(customer_dedupe.frappe.db, "commit"), \
