@@ -1421,13 +1421,25 @@ class TestVariationAttributes(unittest.TestCase):
     Ours:   ``13777/495a/2/{}``  (order 16898, before this)
     """
 
-    def _woosb(self, client, cache=None):
+    def setUp(self):
+        # Every test here shares ONE fake cache. Without this the resolver
+        # reaches the site's real Redis, where a value cached by the previous
+        # test answers the next one — and a suite run on a server would leave
+        # entries behind it never owned.
+        self.cache = _FakeCache()
+        patcher = unittest.mock.patch.object(
+            outbound_sync.frappe, "cache", lambda: self.cache
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _woosb(self, client):
         line_items, _missing = _collect(
             _native_bundle_invoice(),
             _NATIVE_BUNDLE_MAPPING,
             registered={"12446"},
             client=client,
-            cache=cache,
+            cache=self.cache,
         )
         return _meta(line_items[0])["_woosb_ids"]
 
@@ -1485,28 +1497,27 @@ class TestVariationAttributes(unittest.TestCase):
         """A wrong attribute the store renders is worse than a missing one."""
         client = _FakeWooClient(error=RuntimeError("502 Bad Gateway"))
 
-        with unittest.mock.patch.object(outbound_sync.frappe, "cache", _FakeCache):
-            self.assertEqual(
-                outbound_sync._variation_attributes_json(client, "371", "13777"), "{}"
-            )
+        self.assertEqual(
+            outbound_sync._variation_attributes_json(client, "371", "13777"), "{}"
+        )
+        # A transient failure must not be cached as if it were the answer.
+        self.assertEqual(self.cache.store, {})
         # And the whole selection string still renders, rather than going empty.
         self.assertTrue(self._woosb(client))
 
     def test_no_client_means_no_lookup_and_no_guess(self):
-        with unittest.mock.patch.object(outbound_sync.frappe, "cache", _FakeCache):
-            self.assertEqual(outbound_sync._variation_attributes_json(None, "371", "13777"), "{}")
+        self.assertEqual(outbound_sync._variation_attributes_json(None, "371", "13777"), "{}")
 
     def test_each_variation_is_fetched_once(self):
-        cache = _FakeCache()
         client = _FakeWooClient(
             variations=_size_variations(("369", "13780"), ("367", "13783"), ("217", "13767"),
                                         ("2286", "13826"), ("2284", "13813")),
             terms=_SIZE_TERMS,
         )
 
-        self._woosb(client, cache=cache)
+        self._woosb(client)
         after_first = list(client.calls)
-        self._woosb(client, cache=cache)
+        self._woosb(client)
 
         self.assertEqual(client.calls, after_first, "the second push must be served from cache")
         # Five variations, and the shared Size terms fetched once for all of them.
