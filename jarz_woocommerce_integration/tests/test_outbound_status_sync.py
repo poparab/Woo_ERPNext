@@ -952,7 +952,13 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         self.assertEqual(missing, [])
         self.assertEqual(len(line_items), 1)
-        self.assertEqual(line_items[0]["name"], "Discounted Child")
+        # No `name`: WooCommerce names its own products now, and the line is
+        # identified by the item code it carries.
+        self.assertNotIn("name", line_items[0])
+        self.assertEqual(
+            line_items[0]["meta_data"][0],
+            {"key": "erpnext_item_code", "value": "ITEM-CHILD"},
+        )
         self.assertEqual(line_items[0]["subtotal"], "120.00")
         self.assertEqual(line_items[0]["total"], "60.00")
 
@@ -1009,7 +1015,8 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertEqual(len(line_items), 2)
 
         parent_entry = line_items[0]
-        self.assertEqual(parent_entry["name"], "Bundle Parent")
+        # No `name`: the store's own product title must survive the push.
+        self.assertNotIn("name", parent_entry)
         # The bundle price, taken from the children's ERPNext amounts.
         self.assertEqual(parent_entry["subtotal"], "120.00")
         self.assertEqual(parent_entry["total"], "120.00")
@@ -1028,7 +1035,7 @@ class TestOutboundStatusSync(unittest.TestCase):
         )
 
         child_entry = line_items[1]
-        self.assertEqual(child_entry["name"], "Bundle Child")
+        self.assertNotIn("name", child_entry)
         self.assertEqual(child_entry["subtotal"], "0.00")
         self.assertEqual(child_entry["total"], "0.00")
         self.assertEqual(child_entry["product_id"], 303)
