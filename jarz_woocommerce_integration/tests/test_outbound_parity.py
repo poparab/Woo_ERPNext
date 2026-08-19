@@ -15,6 +15,10 @@ website creates, measured against real production orders:
 * F-18  the already-in-sync comparison only looks at meta keys we own
 * F-19  the store must date the order when the sale happened
 * F-25  the realtime event must go to a room somebody is in
+
+Plus the line-level parity gaps found on order 16901: the bundle selection
+string must carry the chosen variation attributes, and we must not overwrite
+the store's own product title with ``Item.item_name``.
 """
 
 from types import SimpleNamespace
@@ -126,11 +130,64 @@ def _native_bundle_invoice():
     ])
 
 
-def _collect(invoice, mapping, *, registered=frozenset()):
+class _FakeCache:
+    """Enough of ``frappe.cache()`` for the variation-attribute lookups."""
+
+    def __init__(self):
+        self.store = {}
+
+    def get_value(self, key):
+        return self.store.get(key)
+
+    def set_value(self, key, value, expires_in_sec=None):
+        self.store[key] = value
+
+
+class _FakeWooClient:
+    """Answers the two catalogue endpoints the attribute resolver reads."""
+
+    def __init__(self, variations=None, terms=None, error=None):
+        #: (product_id, variation_id) -> the ``attributes`` array Woo returns
+        self.variations = variations or {}
+        #: attribute id -> the terms array
+        self.terms = terms or {}
+        self.error = error
+        self.calls = []
+
+    def get(self, resource, params=None):
+        self.calls.append(resource)
+        if self.error:
+            raise self.error
+        if resource.startswith("products/attributes/"):
+            attribute_id = resource.split("/")[2]
+            return self.terms.get(attribute_id, [])
+        _, product_id, _, variation_id = resource.split("/")
+        return {"attributes": self.variations.get((product_id, variation_id), [])}
+
+
+#: The real store: one global attribute (Size, id 15) whose term slugs are not
+#: reachable by lowercasing alone, which is why they are looked up.
+_SIZE_TERMS = {"15": [
+    {"id": 251, "name": "Large", "slug": "large"},
+    {"id": 250, "name": "Medium", "slug": "medium"},
+]}
+
+
+def _size_variations(*pairs, option="Medium"):
+    return {
+        pair: [{"id": 15, "name": "Size", "slug": "pa_size", "option": option}]
+        for pair in pairs
+    }
+
+
+def _collect(invoice, mapping, *, registered=frozenset(), client=None, cache=None):
     with unittest.mock.patch.object(
         outbound_sync, "_get_registered_bundle_product_ids", return_value=set(registered)
-    ), unittest.mock.patch.object(outbound_sync.frappe, "db", _item_db(mapping)):
-        return outbound_sync._collect_line_items(invoice)
+    ), unittest.mock.patch.object(outbound_sync.frappe, "db", _item_db(mapping)), \
+            unittest.mock.patch.object(
+                outbound_sync.frappe, "cache", lambda: cache or _FakeCache()
+            ):
+        return outbound_sync._collect_line_items(invoice, client=client)
 
 
 def _line_total_sum(line_items):
@@ -197,6 +254,8 @@ class TestBundleWireShape(unittest.TestCase):
             identifiers.append(parts[0])
             self.assertTrue(parts[1], "the WooSB token slot must not be empty")
             quantities.append(parts[2])
+            # No client here, so the attributes degrade to the empty object.
+            # TestVariationAttributes covers the resolved form.
             self.assertEqual(parts[3], "{}")
 
         # part[0] is the variation id, exactly as native order 16895 writes it.
@@ -1349,6 +1408,170 @@ class TestDeliveryDetailsNote(unittest.TestCase):
         # The date is spelled identically in both.
         self.assertEqual(meta["Delivery Date"], "19 August, 2026")
         self.assertIn(meta["Delivery Date"], note)
+
+
+# ---------------------------------------------------------------------------
+# The pushed line must read like the native one (order 16901 vs 16898)
+# ---------------------------------------------------------------------------
+
+class TestVariationAttributes(unittest.TestCase):
+    """``_woosb_ids`` part 3, measured against production order 16901.
+
+    Native: ``13777/anox/1/{"attribute_pa_size":"medium"}``
+    Ours:   ``13777/495a/2/{}``  (order 16898, before this)
+    """
+
+    def _woosb(self, client, cache=None):
+        line_items, _missing = _collect(
+            _native_bundle_invoice(),
+            _NATIVE_BUNDLE_MAPPING,
+            registered={"12446"},
+            client=client,
+            cache=cache,
+        )
+        return _meta(line_items[0])["_woosb_ids"]
+
+    def test_selected_size_reaches_the_selection_string(self):
+        client = _FakeWooClient(
+            variations=_size_variations(("369", "13780"), ("367", "13783"), ("217", "13767"),
+                                        ("2286", "13826"), ("2284", "13813")),
+            terms=_SIZE_TERMS,
+        )
+
+        for entry in order_sync._split_woosb_ids(self._woosb(client)):
+            self.assertEqual(entry.split("/", 3)[3], '{"attribute_pa_size":"medium"}')
+
+    def test_rendered_without_whitespace_like_the_store(self):
+        """A formatted copy would compare unequal and mark the order dirty forever."""
+        client = _FakeWooClient(
+            variations=_size_variations(("371", "13777")), terms=_SIZE_TERMS
+        )
+
+        rendered = outbound_sync._variation_attributes_json(client, "371", "13777")
+
+        self.assertEqual(rendered, '{"attribute_pa_size":"medium"}')
+        self.assertNotIn(" ", rendered)
+
+    def test_value_is_the_term_slug_not_the_lowercased_name(self):
+        """The store is the only authority on a term's slug."""
+        client = _FakeWooClient(
+            variations={("371", "13777"): [
+                {"id": 15, "name": "Size", "slug": "pa_size", "option": "Medium"}
+            ]},
+            terms={"15": [{"id": 250, "name": "Medium", "slug": "med-500ml"}]},
+        )
+
+        self.assertEqual(
+            outbound_sync._variation_attributes_json(client, "371", "13777"),
+            '{"attribute_pa_size":"med-500ml"}',
+        )
+
+    def test_large_and_medium_do_not_collide(self):
+        medium = _FakeWooClient(variations=_size_variations(("371", "13777")), terms=_SIZE_TERMS)
+        large = _FakeWooClient(
+            variations=_size_variations(("371", "13776"), option="Large"), terms=_SIZE_TERMS
+        )
+
+        self.assertEqual(
+            outbound_sync._variation_attributes_json(medium, "371", "13777"),
+            '{"attribute_pa_size":"medium"}',
+        )
+        self.assertEqual(
+            outbound_sync._variation_attributes_json(large, "371", "13776"),
+            '{"attribute_pa_size":"large"}',
+        )
+
+    def test_a_store_failure_degrades_to_the_old_empty_object(self):
+        """A wrong attribute the store renders is worse than a missing one."""
+        client = _FakeWooClient(error=RuntimeError("502 Bad Gateway"))
+
+        with unittest.mock.patch.object(outbound_sync.frappe, "cache", _FakeCache):
+            self.assertEqual(
+                outbound_sync._variation_attributes_json(client, "371", "13777"), "{}"
+            )
+        # And the whole selection string still renders, rather than going empty.
+        self.assertTrue(self._woosb(client))
+
+    def test_no_client_means_no_lookup_and_no_guess(self):
+        with unittest.mock.patch.object(outbound_sync.frappe, "cache", _FakeCache):
+            self.assertEqual(outbound_sync._variation_attributes_json(None, "371", "13777"), "{}")
+
+    def test_each_variation_is_fetched_once(self):
+        cache = _FakeCache()
+        client = _FakeWooClient(
+            variations=_size_variations(("369", "13780"), ("367", "13783"), ("217", "13767"),
+                                        ("2286", "13826"), ("2284", "13813")),
+            terms=_SIZE_TERMS,
+        )
+
+        self._woosb(client, cache=cache)
+        after_first = list(client.calls)
+        self._woosb(client, cache=cache)
+
+        self.assertEqual(client.calls, after_first, "the second push must be served from cache")
+        # Five variations, and the shared Size terms fetched once for all of them.
+        self.assertEqual(len([c for c in after_first if "variations" in c]), 5)
+        self.assertEqual(len([c for c in after_first if c.startswith("products/attributes/")]), 1)
+
+
+class TestLineItemNaming(unittest.TestCase):
+    """Woo honours a ``name`` we send, so sending one overwrote its own title.
+
+    Native 16901: ``Strawberry cheesecake jar<span> - </span>Medium``
+    Ours 16898:   ``Strawberry Medium``
+    """
+
+    def test_no_line_carries_a_name(self):
+        line_items, _missing = _collect(
+            _native_bundle_invoice(), _NATIVE_BUNDLE_MAPPING, registered={"12446"}
+        )
+
+        self.assertEqual(len(line_items), 6)
+        for entry in line_items:
+            self.assertNotIn("name", entry)
+
+    def test_the_erpnext_item_code_still_identifies_every_line(self):
+        """Dropping the name must not cost us the link back to ERPNext."""
+        line_items, _missing = _collect(
+            _native_bundle_invoice(), _NATIVE_BUNDLE_MAPPING, registered={"12446"}
+        )
+
+        self.assertEqual(
+            [_meta(entry)["erpnext_item_code"] for entry in line_items],
+            ["BUNDLE-12446", "JAR-369", "JAR-367", "JAR-217", "JAR-2286", "JAR-2284"],
+        )
+
+    def test_a_store_named_line_is_not_seen_as_a_change(self):
+        """Woo answers with its own title; that must not mark the order dirty."""
+        payload_lines = [{
+            "id": 59026, "product_id": 371, "variation_id": 13777, "quantity": 1,
+            "subtotal": "0.00", "total": "0.00",
+            "meta_data": [{"key": "erpnext_item_code", "value": "JAR-371"}],
+        }]
+        existing_lines = [dict(payload_lines[0],
+                               name="Strawberry cheesecake jar<span> - </span>Medium")]
+
+        self.assertFalse(outbound_sync._order_payload_requires_update(
+            {"status": "processing", "line_items": existing_lines},
+            {"status": "processing", "line_items": payload_lines},
+        ))
+
+    def test_an_existing_line_is_still_matched_without_a_name(self):
+        matched, added, orphaned = outbound_sync._attach_existing_line_ids(
+            [{
+                "product_id": 371, "variation_id": 13777, "quantity": 1,
+                "meta_data": [{"key": "erpnext_item_code", "value": "JAR-371"}],
+            }],
+            [{
+                "id": 59026, "product_id": 371, "variation_id": 13777, "quantity": 1,
+                "name": "Strawberry cheesecake jar<span> - </span>Medium",
+                "meta_data": [{"key": "erpnext_item_code", "value": "JAR-371"}],
+            }],
+        )
+
+        self.assertEqual(added, [])
+        self.assertEqual(orphaned, [])
+        self.assertEqual(matched[0]["id"], 59026)
 
 
 if __name__ == "__main__":

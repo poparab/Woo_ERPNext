@@ -2150,6 +2150,97 @@ def _woosb_selection_token(item_code: str) -> str:
     return digest[:4]
 
 
+#: Both caches key off immutable catalogue facts (a variation's chosen options,
+#: a global attribute's term slugs). A day is long enough to make the lookup
+#: free in practice and short enough that a catalogue edit lands on its own.
+_VARIATION_ATTRIBUTES_TTL = 24 * 60 * 60
+
+
+def _attribute_term_slugs(client, attribute_id: Any) -> dict[str, str]:
+    """``{term name casefolded: term slug}`` for one global product attribute.
+
+    A variation reports its selection as the term *name* ("Medium") while
+    WooSB writes the term *slug* ("medium"). Only the store knows the mapping —
+    a slug is not always the lowercased name — so we ask it, once per attribute.
+    """
+    cache_key = f"woo_attr_terms::{attribute_id}"
+    try:
+        cached = frappe.cache().get_value(cache_key)
+    except Exception:  # noqa: BLE001
+        cached = None
+    if cached is not None:
+        return cached
+
+    terms = client.get(f"products/attributes/{attribute_id}/terms", {"per_page": 100})
+    slugs = {
+        str(term.get("name") or "").strip().casefold(): str(term.get("slug") or "")
+        for term in (terms if isinstance(terms, list) else [])
+        if term.get("slug")
+    }
+    try:
+        frappe.cache().set_value(cache_key, slugs, expires_in_sec=_VARIATION_ATTRIBUTES_TTL)
+    except Exception:  # noqa: BLE001
+        pass
+    return slugs
+
+
+def _variation_attributes_json(client, product_id: Optional[int], variation_id: Optional[int]) -> str:
+    """Part 3 of a ``_woosb_ids`` entry: the child's selected variation options.
+
+    Native WooSB writes ``{"attribute_pa_size":"medium"}`` — taxonomy slug as
+    the key, term slug as the value. We used to write ``{}`` unconditionally
+    because ERPNext carries no variation attributes, so a pushed bundle
+    rendered without the size that a website bundle showed.
+
+    Read from the store rather than guessed off the Item name: "Strawberry
+    Medium" only *looks* decomposable, and inventing a value the store then
+    renders is the one outcome worse than omitting it. Every failure therefore
+    degrades to ``"{}"``, which is exactly the previous behaviour.
+    """
+    if client is None or not product_id or not variation_id:
+        return "{}"
+
+    cache_key = f"woo_variation_attributes::{product_id}::{variation_id}"
+    try:
+        cached = frappe.cache().get_value(cache_key)
+        if cached is not None:
+            return cached
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        variation = client.get(f"products/{product_id}/variations/{variation_id}") or {}
+        attributes: dict[str, str] = {}
+        for attribute in variation.get("attributes") or []:
+            slug = str(attribute.get("slug") or "").strip()
+            option = str(attribute.get("option") or "").strip()
+            if not slug or not option:
+                continue
+            value = option
+            if slug.startswith("pa_"):
+                # A global (taxonomy) attribute: the slug is what WooSB stores.
+                value = _attribute_term_slugs(client, attribute.get("id")).get(
+                    option.casefold()
+                ) or option.casefold()
+            attributes[f"attribute_{slug}"] = value
+        # Native writes no whitespace; a formatted copy would compare unequal.
+        rendered = json.dumps(attributes, separators=(",", ":"))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_variation_attributes_unresolved",
+            "product_id": product_id,
+            "variation_id": variation_id,
+            "detail": str(exc)[:200],
+        })
+        return "{}"
+
+    try:
+        frappe.cache().set_value(cache_key, rendered, expires_in_sec=_VARIATION_ATTRIBUTES_TTL)
+    except Exception:  # noqa: BLE001
+        pass
+    return rendered
+
+
 def _woosb_selection_identifier(product_id: Optional[int], variation_id: Optional[int]) -> str:
     """Part 0 of a ``_woosb_ids`` entry: the variation id, else the product id.
 
@@ -2190,7 +2281,11 @@ def _build_woosb_ids_value(children: list[dict[str, Any]]) -> str:
     return ",".join(entries)
 
 
-def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[dict], list[str]]:
+def _collect_line_items(
+    invoice: frappe.model.document.Document,
+    *,
+    client=None,
+) -> tuple[list[dict], list[str]]:
     """Render the invoice's items in the shape a website-created order has.
 
     Bundle wire format (F-10), taken from a genuinely native order:
@@ -2208,6 +2303,18 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
     into one line: ERPNext can legitimately produce the same item twice when a
     bundle asks for it from two different item groups, but a native order shows
     it once with the combined quantity.
+
+    No entry carries a ``name``. WooCommerce honours one when we send it, so
+    passing ``Item.item_name`` overwrote the store's own title: a pushed line
+    read "Strawberry Medium" where the identical native line read "Strawberry
+    cheesecake jar<span> - </span>Medium". That separator is rendered by the
+    store's own formatting, which we cannot reproduce faithfully — so we omit
+    the field and let WooCommerce name its own products. ``erpnext_item_code``
+    meta still ties every line back to ERPNext, and neither the payload
+    comparator nor ``_attach_existing_line_ids`` looks at ``name``.
+
+    ``client`` is optional only so the payload can still be built without a
+    session; without it the ``_woosb_ids`` attributes degrade to ``{}``.
     """
     line_items: list[dict] = []
     missing_products: list[str] = []
@@ -2281,7 +2388,6 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
                 # Priced after the loop, from the children's ERPNext amounts.
                 "subtotal": _format_money(0),
                 "total": _format_money(0),
-                "name": item.item_name or item.item_code,
                 "meta_data": [
                     {"key": "erpnext_item_code", "value": item.item_code},
                 ],
@@ -2355,7 +2461,6 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
                 # Native children are free; the money is on the parent line.
                 "subtotal": _format_money(0),
                 "total": _format_money(0),
-                "name": item.item_name or item.item_code,
                 "meta_data": [
                     {"key": "erpnext_item_code", "value": item.item_code},
                     {"key": "_woosb_parent_id", "value": str(parent_product_id)},
@@ -2373,9 +2478,7 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
                 "product_id": product_id,
                 "variation_id": variation_id,
                 "token": _woosb_selection_token(item.item_code),
-                # We do not carry Woo variation attributes in ERPNext, and an
-                # invented value would be a lie the store renders.
-                "attributes": "{}",
+                "attributes": _variation_attributes_json(client, product_id, variation_id),
             }
             child_slots[slot_key] = record
             parent_children.setdefault(bundle_key, []).append(record)
@@ -2398,7 +2501,6 @@ def _collect_line_items(invoice: frappe.model.document.Document) -> tuple[list[d
             "quantity": int(qty),
             "subtotal": _format_money(subtotal),
             "total": _format_money(amount),
-            "name": item.item_name or item.item_code,
             "meta_data": [
                 {"key": "erpnext_item_code", "value": item.item_code},
             ],
@@ -3653,11 +3755,12 @@ def _preserve_native_bundle_selection(
     """Never overwrite a ``_woosb_ids`` the store wrote itself.
 
     Ours is *reconstructed* from ERPNext rows: the WooSB token becomes a hash of
-    the item code and the attributes object is empty, because ERPNext does not
-    carry Woo variation attributes. That is right for an order we created and
-    wrong for one the website created — the store renders the bundle contents
-    from this string, so replacing the plugin's own value with our approximation
-    would degrade 10,000+ Woo-origin orders on their next status update.
+    the item code, and the attributes object is resolved from the catalogue
+    rather than from the shopper's actual click. That is right for an order we
+    created and wrong for one the website created — the store renders the bundle
+    contents from this string, so replacing the plugin's own value with our
+    approximation would degrade 10,000+ Woo-origin orders on their next status
+    update.
 
     Mutates ``payload_line_items`` in place, dropping only our own key.
     """
@@ -3970,10 +4073,11 @@ def _build_order_payload(
     cancel: bool = False,
     existing_order: Optional[dict] = None,
     is_create: Optional[bool] = None,
+    client=None,
 ) -> dict:
     if is_create is None:
         is_create = existing_order is None
-    line_items, missing_products = _collect_line_items(invoice)
+    line_items, missing_products = _collect_line_items(invoice, client=client)
     payload_line_items = list(line_items)
     added_line_items: list[dict] = []
     removed_line_items: list[dict] = []
@@ -4593,6 +4697,7 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
             cancel=cancel,
             existing_order=existing_order,
             is_create=not woo_order_id,
+            client=client,
         )
     except MissingWooProductError as exc:
         LOGGER.warning({
