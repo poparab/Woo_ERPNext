@@ -390,6 +390,12 @@ def merge_group(group: dict[str, Any], *, apply: bool = False,
                 show_alert=False, rebuild_search=False,
             )
 
+        # Check for leftovers here, before the clean-name restore. Afterwards the
+        # survivor may legitimately *hold* a loser's name — that is the whole
+        # point of the restore — and a later check cannot tell that apart from a
+        # loser that refused to merge.
+        leftovers = [n for n in losers if frappe.db.exists("Customer", n)]
+
         final_name = survivor
         clean = group.get("clean_name") or ""
         if restore_clean_name and clean and clean != survivor:
@@ -407,7 +413,6 @@ def merge_group(group: dict[str, Any], *, apply: bool = False,
         after = _snapshot([final_name])
         problems = _diff(before, after)
 
-        leftovers = [n for n in losers if frappe.db.exists("Customer", n)]
         if leftovers:
             problems.append(f"losers still present: {leftovers}")
         if not frappe.db.exists("Customer", final_name):

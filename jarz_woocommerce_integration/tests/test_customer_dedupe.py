@@ -242,6 +242,41 @@ class TestMergeGroupSafety(unittest.TestCase):
         self.assertTrue(any("still present" in p for p in result["problems"]))
         rollback.assert_called_once()
 
+    def test_restoring_the_clean_name_is_not_mistaken_for_a_failed_merge(self):
+        """The survivor ends up holding a loser's freed name — by design.
+
+        Checking for leftovers after the restore cannot tell that apart from a
+        loser that refused to merge, and rolled back three good merges.
+        """
+        group = dict(self._group(), clean_name="LOSER")
+        snap = {"submitted": 3, "draft": 0, "cancelled": 0, "revenue": 300.0,
+                "outstanding": 0.0, "gl_rows": 6, "gl_debit": 300.0,
+                "gl_credit": 300.0, "pe_rows": 1, "pe_paid": 300.0, "addresses": 1}
+        live = {"SURV", "LOSER"}
+
+        def _exists(_doctype, name):
+            return name in live
+
+        def _rename(_dt, old, new, **_kw):
+            # Absorbing frees the loser's name; the restore then claims it.
+            live.discard(old)
+            live.add(new)
+
+        with patch.object(customer_dedupe, "_snapshot", return_value=snap), \
+             patch.object(customer_dedupe, "_restore_lead_statuses", return_value={}), \
+             patch.object(customer_dedupe, "rename_doc", side_effect=_rename), \
+             patch.object(customer_dedupe.frappe.db, "savepoint"), \
+             patch.object(customer_dedupe.frappe.db, "release_savepoint"), \
+             patch.object(customer_dedupe.frappe.db, "commit"), \
+             patch.object(customer_dedupe.frappe.db, "rollback") as rollback, \
+             patch.object(customer_dedupe.frappe.db, "exists", side_effect=_exists):
+            result = customer_dedupe.merge_group(group, apply=True,
+                                                 restore_clean_name=True)
+
+        self.assertTrue(result["applied"], result["problems"])
+        self.assertEqual(result["final_name"], "LOSER")
+        rollback.assert_not_called()
+
     def test_an_exception_rolls_back_rather_than_propagating(self):
         with patch.object(customer_dedupe, "_snapshot", return_value={}), \
              patch.object(customer_dedupe, "_restore_lead_statuses", return_value={}), \
