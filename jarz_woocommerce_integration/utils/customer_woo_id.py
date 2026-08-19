@@ -121,13 +121,18 @@ def find_customer_by_woo_id(woo_customer_id: Any) -> str | None:
     if not normalized or not _customer_has_column("woo_customer_id"):
         return None
 
-    matches = frappe.get_all(
+    # frappe.db.get_values, not frappe.get_all: the query builder dereferences
+    # frappe.db.TableMissingError, and this module's callers routinely patch
+    # frappe.db with a plain namespace. Staying at the db layer also matches the
+    # rest of this file.
+    matches = frappe.db.get_values(
         "Customer",
-        filters={"woo_customer_id": normalized},
-        pluck="name",
-        limit=2,
+        {"woo_customer_id": normalized},
+        "name",
         order_by="creation asc",
-    )
+        limit=2,
+        pluck=True,
+    ) or []
     if not matches:
         return None
     if len(matches) > 1:
@@ -150,12 +155,13 @@ def customer_woo_id_is_claimed_by_other(woo_customer_id: Any, customer_name: str
     if not normalized or not _customer_has_column("woo_customer_id"):
         return False
     try:
-        holders = frappe.get_all(
+        holders = frappe.db.get_values(
             "Customer",
-            filters={"woo_customer_id": normalized},
-            pluck="name",
+            {"woo_customer_id": normalized},
+            "name",
             limit=2,
-        )
+            pluck=True,
+        ) or []
     except Exception:
         return False
     return any(holder != customer_name for holder in holders)

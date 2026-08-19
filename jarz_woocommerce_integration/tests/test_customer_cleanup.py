@@ -298,7 +298,11 @@ class TestCustomerCleanupPlanning(unittest.TestCase):
         desired = customer_cleanup._collect_desired_sources(payload)
         source = next(iter(desired["signatures"].values()))
 
-        self.assertEqual(source["phone"], "+201006709577")
+        # Canonical local form, not the +20 spelling the payload carried: the
+        # country code is folded so the same subscriber has one identity. The
+        # address dedup signature is built from the address lines, not the phone,
+        # so nothing about address matching changes with it.
+        self.assertEqual(source["phone"], "01006709577")
 
     def test_collect_desired_sources_normalizes_blank_city_and_country_like_stored_address(self):
         payload = {

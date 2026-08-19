@@ -18,37 +18,38 @@ class TestFindCustomerByWooId(unittest.TestCase):
 
     def test_returns_the_single_holder(self):
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", return_value=["CUST-0001"]):
+             patch.object(customer_woo_id.frappe.db, "get_values", return_value=["CUST-0001"]):
             self.assertEqual(customer_woo_id.find_customer_by_woo_id(5973), "CUST-0001")
 
     def test_refuses_to_guess_when_the_id_is_claimed_by_several(self):
         """Falling through to the phone lookup beats attaching an order to a stranger."""
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", return_value=["CUST-A", "CUST-B"]):
+             patch.object(customer_woo_id.frappe.db, "get_values", return_value=["CUST-A", "CUST-B"]):
             self.assertIsNone(customer_woo_id.find_customer_by_woo_id(3357))
 
     def test_returns_none_when_nothing_holds_the_id(self):
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", return_value=[]):
+             patch.object(customer_woo_id.frappe.db, "get_values", return_value=[]):
             self.assertIsNone(customer_woo_id.find_customer_by_woo_id(9999))
 
     def test_zero_and_blank_ids_are_never_looked_up(self):
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all") as get_all:
+             patch.object(customer_woo_id.frappe.db, "get_values") as get_values:
             for value in (0, "0", "", None, "abc"):
                 with self.subTest(value=value):
                     self.assertIsNone(customer_woo_id.find_customer_by_woo_id(value))
-            get_all.assert_not_called()
+            get_values.assert_not_called()
 
     def test_lookup_is_bounded_and_deterministic(self):
         captured = {}
 
-        def _get_all(_doctype, **kwargs):
+        def _get_values(_doctype, filters, fieldname, **kwargs):
+            captured["filters"] = filters
             captured.update(kwargs)
             return ["CUST-0001"]
 
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", side_effect=_get_all):
+             patch.object(customer_woo_id.frappe.db, "get_values", side_effect=_get_values):
             customer_woo_id.find_customer_by_woo_id(5973)
 
         self.assertEqual(captured["limit"], 2)
@@ -60,23 +61,23 @@ class TestCustomerWooIdIsClaimedByOther(unittest.TestCase):
 
     def test_true_when_another_customer_holds_it(self):
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", return_value=["CUST-OTHER"]):
+             patch.object(customer_woo_id.frappe.db, "get_values", return_value=["CUST-OTHER"]):
             self.assertTrue(customer_woo_id.customer_woo_id_is_claimed_by_other(3357, "CUST-MINE"))
 
     def test_false_when_only_this_customer_holds_it(self):
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", return_value=["CUST-MINE"]):
+             patch.object(customer_woo_id.frappe.db, "get_values", return_value=["CUST-MINE"]):
             self.assertFalse(customer_woo_id.customer_woo_id_is_claimed_by_other(3357, "CUST-MINE"))
 
     def test_false_when_unclaimed(self):
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", return_value=[]):
+             patch.object(customer_woo_id.frappe.db, "get_values", return_value=[]):
             self.assertFalse(customer_woo_id.customer_woo_id_is_claimed_by_other(3357, "CUST-MINE"))
 
     def test_query_failure_does_not_block_the_write(self):
         """A broken guard must not stop legitimate syncing."""
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
-             patch.object(customer_woo_id.frappe, "get_all", side_effect=RuntimeError("boom")):
+             patch.object(customer_woo_id.frappe.db, "get_values", side_effect=RuntimeError("boom")):
             self.assertFalse(customer_woo_id.customer_woo_id_is_claimed_by_other(3357, "CUST-MINE"))
 
 
