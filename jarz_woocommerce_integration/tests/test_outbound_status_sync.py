@@ -957,7 +957,7 @@ class TestOutboundStatusSync(unittest.TestCase):
         self.assertNotIn("name", line_items[0])
         self.assertEqual(
             line_items[0]["meta_data"][0],
-            {"key": "erpnext_item_code", "value": "ITEM-CHILD"},
+            {"key": "erpnext_item_code", "value": "ITEM-DISCOUNT"},
         )
         self.assertEqual(line_items[0]["subtotal"], "120.00")
         self.assertEqual(line_items[0]["total"], "60.00")
