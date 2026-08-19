@@ -1274,5 +1274,82 @@ class TestPayloadArithmetic(unittest.TestCase):
         self.assertEqual(payload["payment_method_title"], "Kashier Card")
 
 
+class TestDeliveryDetailsNote(unittest.TestCase):
+    """The ORDDD plugin records the slot in THREE places; we only wrote two.
+
+    The third is a private order note, and it is the line staff read in the order
+    screen. Production order 16898 (pushed) had no delivery line while native
+    16897 alongside it did. These pin the plugin's own wording byte-for-byte,
+    taken from real orders 16895/16896/16897, including the single space after
+    the second ``<br>`` and the fact that the note is 12-hour while the meta keys
+    are 24-hour.
+    """
+
+    def _inv(self, date_str, time_from, duration_seconds):
+        return _invoice(
+            [],
+            custom_delivery_date=date_str,
+            custom_delivery_time_from=time_from,
+            custom_delivery_duration=duration_seconds,
+        )
+
+    def test_note_matches_the_plugins_own_wording(self):
+        # Order 16897, verbatim.
+        self.assertEqual(
+            outbound_sync._build_delivery_details_note(
+                self._inv("2026-08-19", "13:00:00", 5400)
+            ),
+            "Delivery details: <br><strong>Delivery Date</strong>: 19 August, 2026"
+            "<br> <strong>Time Slot</strong>: 01:00 PM - 02:30 PM",
+        )
+
+    def test_midnight_slot_renders_12_am_not_00_am(self):
+        # Orders 16895 and 16896, verbatim. `%I` must give 12, never 00.
+        self.assertEqual(
+            outbound_sync._build_delivery_details_note(
+                self._inv("2026-08-19", "00:00:00", 3600)
+            ),
+            "Delivery details: <br><strong>Delivery Date</strong>: 19 August, 2026"
+            "<br> <strong>Time Slot</strong>: 12:00 AM - 01:00 AM",
+        )
+
+    def test_slot_crossing_midnight_wraps_the_end_time(self):
+        note = outbound_sync._build_delivery_details_note(
+            self._inv("2026-08-19", "23:00:00", 5400)
+        )
+        self.assertIn("11:00 PM - 12:30 AM", note)
+        self.assertNotIn("24:", note)
+
+    def test_no_delivery_date_yields_no_note(self):
+        self.assertEqual(outbound_sync._build_delivery_details_note(_invoice([])), "")
+
+    def test_date_without_a_slot_still_gets_the_date_line(self):
+        note = outbound_sync._build_delivery_details_note(
+            _invoice([], custom_delivery_date="2026-08-19")
+        )
+        self.assertEqual(
+            note,
+            "Delivery details: <br><strong>Delivery Date</strong>: 19 August, 2026",
+        )
+        self.assertNotIn("Time Slot", note)
+
+    def test_note_and_meta_come_from_one_source_and_agree(self):
+        """12-hour in the note, 24-hour in the meta — same underlying window.
+
+        Both read `_resolve_delivery_window`, so this fails the moment the two
+        formats are computed independently again and start to drift.
+        """
+        inv = self._inv("2026-08-19", "13:00:00", 5400)
+        meta = {row["key"]: row["value"] for row in outbound_sync._build_delivery_metadata(inv)}
+        note = outbound_sync._build_delivery_details_note(inv)
+
+        self.assertEqual(meta["Time Slot"], "13:00 - 14:30")
+        self.assertEqual(meta["_orddd_time_slot"], "13:00 - 14:30")
+        self.assertIn("01:00 PM - 02:30 PM", note)
+        # The date is spelled identically in both.
+        self.assertEqual(meta["Delivery Date"], "19 August, 2026")
+        self.assertIn(meta["Delivery Date"], note)
+
+
 if __name__ == "__main__":
     unittest.main()
