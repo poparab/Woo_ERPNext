@@ -39,6 +39,7 @@
   "payment_method_cod",
   "payment_method_instapay",
   "payment_method_wallet",
+  "order_origin_source",
   "shipping_section",
   "default_shipping_method_id",
   "default_shipping_method_title",
@@ -276,6 +277,13 @@
    "label": "Wallet Payment Method Code"
   },
   {
+   "default": "ERPNext POS",
+   "description": "Shown as the order Origin in WooCommerce (Orders list + Analytics → Attribution) for every order this app creates, e.g. \"Source: ERPNext POS\". Orders placed on the website keep their own attribution and are never overwritten.",
+   "fieldname": "order_origin_source",
+   "fieldtype": "Data",
+   "label": "Order Origin Label"
+  },
+  {
    "fieldname": "shipping_section",
    "fieldtype": "Section Break",
    "label": "Shipping Defaults"
@@ -437,7 +445,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-08-08 00:00:00.000000",
+ "modified": "2026-08-23 00:00:00.000000",
  "modified_by": "Administrator",
  "module": "Jarz WooCommerce Integration",
  "name": "WooCommerce Settings",

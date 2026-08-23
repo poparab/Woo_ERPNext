@@ -155,6 +155,19 @@ _APPROVED_INVOICE_OUTBOUND_STATUSES = frozenset({
     "refunded",
 })
 
+#: WooCommerce order-attribution meta prefix. The store's own front-end script
+#: posts these keys on a native checkout (``wc_order_attribution_*`` inputs,
+#: stored as ``_wc_order_attribution_*`` meta); an order created over the REST
+#: API carries none of them and therefore reads "Unknown" in the Origin column.
+_WOO_ATTRIBUTION_META_PREFIX = "_wc_order_attribution_"
+
+#: Our own plain mirror of the origin, independent of whatever WooCommerce does
+#: with its attribution meta.
+_ORIGIN_META_KEY = "_jarz_order_origin"
+
+#: Fallback when WooCommerce Settings has no ``order_origin_source``.
+_DEFAULT_ORDER_ORIGIN_SOURCE = "ERPNext POS"
+
 #: Line-item meta keys **we** own. Only these may take part in the
 #: already-in-sync comparison: WooCommerce adds keys of its own to every line
 #: (``_reduced_stock``, the variation attributes), so comparing the whole
@@ -207,6 +220,9 @@ class OutboundConfig:
     payment_wallet: str
     shipping_method_id: str
     shipping_method_title: str
+    #: Defaulted so every existing OutboundConfig(...) call site keeps working
+    #: and an un-migrated site still stamps a usable origin.
+    order_origin_source: str = _DEFAULT_ORDER_ORIGIN_SOURCE
 
 
 def _note_outbound_disabled(switch: str) -> None:
@@ -256,6 +272,10 @@ def _get_settings() -> tuple[WooCommerceSettings, OutboundConfig]:
         # from "nobody ever set this" and pick the native title accordingly.
         shipping_method_id=(getattr(settings, "default_shipping_method_id", None) or "").strip(),
         shipping_method_title=(getattr(settings, "default_shipping_method_title", None) or "").strip(),
+        order_origin_source=(
+            (getattr(settings, "order_origin_source", None) or "").strip()
+            or _DEFAULT_ORDER_ORIGIN_SOURCE
+        ),
     )
     return settings, cfg
 
@@ -4221,6 +4241,9 @@ def _build_order_payload(
     # re-sending it would be noise in the already-in-sync comparison.
     if is_create:
         payload.update(_build_order_creation_dates(invoice))
+        # Create-only: see _apply_origin_metadata. Sending this on an update
+        # would overwrite the real attribution of a web-born order.
+        _apply_origin_metadata(payload, invoice, cfg)
 
     payload["meta_data"].extend(_build_delivery_metadata(invoice))
     payload["meta_data"].extend(_build_paid_metadata(invoice, payment_method=payment_method, set_paid=bool(set_paid), cfg=cfg))
@@ -4407,6 +4430,71 @@ def _to_utc_naive(local_dt: datetime) -> datetime | None:
             "error": str(exc),
         })
         return None
+
+
+def _build_origin_metadata(
+    invoice: frappe.model.document.Document,
+    cfg: OutboundConfig,
+) -> list[dict[str, str]]:
+    """WooCommerce order-attribution meta so our orders stop reading "Unknown".
+
+    WooCommerce renders the Orders list "Origin" column (and the Analytics →
+    Attribution reports) from the ``_wc_order_attribution_*`` order meta that its
+    front-end sourcebuster script posts on a native checkout. An order created
+    through the REST API carries none of it, so every invoice we push showed up
+    as ``Unknown`` and the store could not tell a POS sale from a web sale.
+
+    ``source_type`` is the switch WooCommerce reads: ``typein`` → "Direct",
+    ``admin`` → "Web admin", anything unrecognised → "Unknown". Only ``utm``
+    lets us name our own source, so the column reads "Source: ERPNext POS"
+    (whatever ``order_origin_source`` is set to). ``device_type`` is deliberately
+    left unset — WooCommerce derives it from a real browser user agent, and
+    inventing one would put a fiction in the attribution report.
+
+    ``_jarz_order_origin`` is our own plain mirror of the same value: it survives
+    independently of whatever WooCommerce does with attribution meta and is what
+    to grep for when auditing which orders this app created.
+    """
+    source = (cfg.order_origin_source or "").strip() or _DEFAULT_ORDER_ORIGIN_SOURCE
+
+    # A POS profile is what separates a till sale from any other ERPNext-created
+    # invoice; Woo-native orders never reach this function (they already exist in
+    # the store, so their real attribution is left alone).
+    pos_profile = str(getattr(invoice, "pos_profile", None) or "").strip()
+    medium = "pos" if pos_profile else "erpnext"
+
+    metadata = [
+        {"key": f"{_WOO_ATTRIBUTION_META_PREFIX}source_type", "value": "utm"},
+        {"key": f"{_WOO_ATTRIBUTION_META_PREFIX}utm_source", "value": source},
+        {"key": f"{_WOO_ATTRIBUTION_META_PREFIX}utm_medium", "value": medium},
+        {"key": _ORIGIN_META_KEY, "value": source},
+    ]
+    if pos_profile:
+        # Which till/branch sold it, readable in Analytics → Attribution as the
+        # campaign. Only sent when we actually know it, never as an empty string.
+        metadata.append(
+            {"key": f"{_WOO_ATTRIBUTION_META_PREFIX}utm_campaign", "value": pos_profile}
+        )
+    return metadata
+
+
+def _apply_origin_metadata(
+    payload: dict,
+    invoice: frappe.model.document.Document,
+    cfg: OutboundConfig,
+) -> None:
+    """Stamp the origin meta onto a payload that is about to CREATE an order.
+
+    Create-only, and idempotent. Never on an update: an order that was born on
+    the web carries genuine attribution ("Organic: google", the campaign that
+    won the sale), and re-sending ours on every status PUT would overwrite it
+    with a POS label and quietly destroy the store's marketing data.
+    """
+    entries = payload.setdefault("meta_data", [])
+    existing = {str(entry.get("key")) for entry in entries if isinstance(entry, dict)}
+    for entry in _build_origin_metadata(invoice, cfg):
+        if entry["key"] not in existing:
+            entries.append(entry)
 
 
 def _build_order_creation_dates(invoice: frappe.model.document.Document) -> dict[str, str]:
@@ -4758,6 +4846,10 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
             response = client.post("orders", payload)
     except WooAPIError as exc:
         if woo_order_id and exc.status_code == 404:
+            # The order we meant to update is gone, so this POST creates a new
+            # one — and a created order is ours, which means it needs the origin
+            # the update payload was deliberately built without.
+            _apply_origin_metadata(payload, invoice, cfg)
             response = client.post("orders", payload)
         else:
             LOGGER.error({
