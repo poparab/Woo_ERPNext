@@ -242,6 +242,18 @@ fixtures = [
 				"dt",
 				"in",
 				[
+					# This app is the sole owner of the Territory custom fields and
+					# the only one that imports them — jarz_pos deliberately keeps
+					# "Territory" out of its own fixture filter so that two apps
+					# never import one field definition, where the last migrate to
+					# run would decide it.
+					#
+					# Note before deleting anything here: double_shipping_single_trip
+					# has NO reader in this app. Its only consumer is jarz_pos
+					# (doctype/delivery_trip), so a grep for it in this repo comes
+					# back empty and the field looks dead. Removing it from the
+					# fixture would silently switch off double-shipping there
+					# rather than raise.
 					"Territory",
 					"Sales Invoice",
 					"Sales Invoice Item",
