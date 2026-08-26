@@ -186,6 +186,22 @@ def _endpoint(settings: Any) -> str:
 MAX_FUTURE_SKEW_SEC = 120
 
 
+def _site_timezone():
+    """The site's timezone, falling back to UTC.
+
+    Read from Frappe rather than the host: the containers run UTC and the shop
+    runs on Cairo time, so the two disagree by 2-3 hours depending on DST.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        from frappe.utils import get_system_timezone
+
+        return ZoneInfo(str(get_system_timezone() or "UTC"))
+    except Exception:
+        return timezone.utc
+
+
 def normalise_updated_at(value: Any) -> str:
     """A courier ping's timestamp as UTC ISO-8601 with an explicit offset.
 
@@ -214,11 +230,13 @@ def normalise_updated_at(value: Any) -> str:
         return now.isoformat(timespec="seconds").replace("+00:00", "Z")
 
     if parsed.tzinfo is None:
-        # Naive: it came off a clock in the site's timezone, so read it there
-        # rather than pretending it is UTC.
-        parsed = parsed.astimezone() if hasattr(parsed, "astimezone") else parsed
-        if parsed.tzinfo is None:  # pragma: no cover - defensive
-            parsed = parsed.replace(tzinfo=timezone.utc)
+        # Naive: it came off a handset clock in the SITE's timezone (Africa/Cairo),
+        # which is not the server's. `astimezone()` on a naive datetime assumes the
+        # host's zone, and these containers run UTC — so a 18:44 Cairo fix became
+        # 18:44Z, three hours in the future, which is precisely the failure this
+        # function exists to prevent. The clamp below would catch it, but silently
+        # and by rewriting a timestamp that was recoverable.
+        parsed = parsed.replace(tzinfo=_site_timezone())
 
     parsed = parsed.astimezone(timezone.utc)
     if parsed > now + timedelta(seconds=MAX_FUTURE_SKEW_SEC):

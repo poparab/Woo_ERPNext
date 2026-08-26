@@ -130,6 +130,26 @@ class UpdatedAtTests(unittest.TestCase):
         parsed = datetime.fromisoformat(out.replace("Z", "+00:00"))
         self.assertGreater(parsed, datetime.now(timezone.utc) + timedelta(seconds=5))
 
+    def test_a_naive_timestamp_is_read_in_the_SITE_timezone(self):
+        """The bug real-stack verification caught that the mocks could not.
+
+        A handset writes a bare "YYYY-MM-DD HH:MM:SS" in Cairo time. The
+        containers run UTC, so reading it with the host's zone made an 18:44
+        Cairo fix into 18:44Z -- three hours ahead. That is the exact shape of
+        failure this whole function exists to prevent, and the clamp only hid
+        it by rewriting a timestamp that was perfectly recoverable.
+        """
+        from zoneinfo import ZoneInfo
+
+        with patch.object(
+            droppin_sync, "_site_timezone", return_value=ZoneInfo("Africa/Cairo")
+        ):
+            out = droppin_sync.normalise_updated_at("2026-08-20 18:44:12")
+        self.assertEqual(out, "2026-08-20T15:44:12Z")
+
+    def test_site_timezone_falls_back_to_utc_when_unreadable(self):
+        self.assertIsNotNone(droppin_sync._site_timezone())
+
     def test_garbage_falls_back_to_now_instead_of_raising(self):
         out = droppin_sync.normalise_updated_at("not a timestamp")
         self.assertTrue(out.endswith("Z"))
