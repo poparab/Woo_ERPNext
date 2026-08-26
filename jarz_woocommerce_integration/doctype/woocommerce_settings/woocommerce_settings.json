@@ -46,6 +46,10 @@
   "tracking_section",
   "enable_outbound_tracking_url",
   "tracking_base_url",
+  "droppin_section",
+  "enable_droppin_dispatch",
+  "droppin_base_url",
+  "droppin_shared_secret",
   "event_section",
   "enable_sync_event_ledger",
   "sync_event_shadow_mode",
@@ -317,6 +321,32 @@
    "fieldtype": "Data",
    "label": "Tracking Base URL",
    "description": "Public ERPNext tracking page, e.g. https://erp.orderjarz.com/track - the token is appended as a path segment. If the token belongs in the query string, use the {token} placeholder instead: https://erp.orderjarz.com/track?t={token}. Left blank, nothing is pushed and one Error Log is filed (a wrong link reaches customers by email and WhatsApp, so it is never guessed)."
+  },
+  {
+   "fieldname": "droppin_section",
+   "fieldtype": "Section Break",
+   "label": "DropPin Dispatch"
+  },
+  {
+   "default": "0",
+   "description": "Push delivery statuses, the driver card, trip legs and courier positions to the DropPin plugin on the WooCommerce store. Off by default and useless without the shared secret below. Orders are NOT received from DropPin \u2014 they keep arriving through the WooCommerce REST pull, which handles the pinless orders DropPin holds back from dispatch.",
+   "fieldname": "enable_droppin_dispatch",
+   "fieldtype": "Check",
+   "label": "Enable DropPin Dispatch Push"
+  },
+  {
+   "depends_on": "enable_droppin_dispatch",
+   "description": "Base URL of the WordPress site running DropPin, without a trailing slash. Leave blank to use the store URL above \u2014 set it only when DropPin lives on a different host from the shop being synced.",
+   "fieldname": "droppin_base_url",
+   "fieldtype": "Data",
+   "label": "DropPin Base URL"
+  },
+  {
+   "depends_on": "enable_droppin_dispatch",
+   "description": "Shared HMAC-SHA256 secret, issued by the shop and different per environment. Requests are signed with it in both directions. Without it nothing is sent at all \u2014 this app refuses to sign with an empty key rather than producing a signature anybody else with an empty key could also make.",
+   "fieldname": "droppin_shared_secret",
+   "fieldtype": "Password",
+   "label": "DropPin Shared Secret"
   },
   {
    "fieldname": "event_section",

@@ -172,8 +172,18 @@ doc_events = {
 	},
 	"Sales Invoice": {
 		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
-		"on_update_after_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
-		"on_cancel": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
+		"on_update_after_submit": [
+			"jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
+			# The trip leg lives on the invoice, so a courier tapping "Start
+			# delivery" arrives here and nowhere else. Listed after the order
+			# push: DropPin's timeline expects the status before the leg, and
+			# both are enqueued after commit so the ordering survives.
+			"jarz_woocommerce_integration.services.droppin_sync.enqueue_droppin_update",
+		],
+		"on_cancel": [
+			"jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
+			"jarz_woocommerce_integration.services.droppin_sync.enqueue_droppin_update",
+		],
 	},
 	"Payment Entry": {
 		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_linked_invoice_sync_for_payment_entry",
@@ -204,6 +214,16 @@ scheduler_events = {
 		# Live order sync every 2 minutes (creates unpaid submitted invoices, skips pending payment)
 		"*/2 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
+		],
+		# Courier positions for orders with an open trip leg. Cron is the finest
+		# granularity Frappe's scheduler offers, and DropPin asks for 20-30 s
+		# while a courier is driving, so this fires every minute and the courier
+		# app's leg-scoped fast mode supplies fixes faster than we forward them.
+		# One request per OPEN LEG, not per fix -- with one open leg per courier
+		# by construction, that is one request per active courier per minute,
+		# far inside DropPin's 300/min store-wide budget.
+		"* * * * *": [
+			"jarz_woocommerce_integration.services.droppin_sync.push_open_leg_positions"
 		],
 		# Cancelled/refunded catch-up sync every 15 minutes (by modified timestamp)
 		"7,22,37,52 * * * *": [

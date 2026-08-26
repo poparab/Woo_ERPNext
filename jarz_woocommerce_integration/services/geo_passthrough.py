@@ -5,7 +5,9 @@ Why this module exists
 The Woo checkout can carry a customer-supplied map pin. Two shapes exist on this
 store:
 
-1. Order meta ``_jarz_lat`` / ``_jarz_lng`` written by the checkout plugin.
+1. Order meta ``_jarz_lat`` / ``_jarz_lng`` written by our own checkout plugin,
+   or ``_dpn_lat`` / ``_dpn_lng`` written by DropPin's. Both are read; see the
+   key tuples below for why reading only one family is a silent failure.
 2. A Google Maps link typed into an address line at checkout.
 
 Both are supplied by the *customer*, so they land on the ``Address`` geo custom
@@ -136,13 +138,34 @@ _ADDRESS_READ_FIELDS = (
 # Payload keys
 # ---------------------------------------------------------------------------
 
-_ORDER_LAT_META_KEYS = ("_jarz_lat", "jarz_lat", "_jarz_latitude", "jarz_latitude")
+# Two checkout plugins can write a pin on this store, so both key families are
+# read. ``_jarz_*`` is our own plugin (MapLibre + OSM picker); ``_dpn_*`` is
+# DropPin's picker, which additionally does coverage checking we have no
+# equivalent for.
+#
+# Reading both is what makes the changeover safe in either direction. Our
+# extractor knowing only ``_jarz_*`` meant that the day DropPin's picker replaced
+# ours, every customer pin would stop reaching ERPNext -- no error, no failed
+# sync, just an Address that never gets coordinates and a `customer_pin` rung of
+# the confidence ladder that is permanently empty. Order matters only when an
+# order somehow carries both, which happens exactly while both plugins are
+# active; ``_jarz_*`` wins there because it is the one our own checkout wrote.
+_ORDER_LAT_META_KEYS = (
+    "_jarz_lat",
+    "jarz_lat",
+    "_jarz_latitude",
+    "jarz_latitude",
+    "_dpn_lat",
+    "dpn_lat",
+)
 _ORDER_LNG_META_KEYS = (
     "_jarz_lng",
     "jarz_lng",
     "_jarz_long",
     "_jarz_longitude",
     "jarz_longitude",
+    "_dpn_lng",
+    "dpn_lng",
 )
 # Some plugin builds pack both halves into one "lat,lng" (or a Maps URL) value.
 _ORDER_COMBINED_META_KEYS = ("_jarz_location", "jarz_location", "_jarz_latlng", "jarz_latlng")

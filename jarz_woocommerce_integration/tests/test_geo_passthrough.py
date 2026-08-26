@@ -253,6 +253,47 @@ class TestPinExtraction(unittest.TestCase):
     def test_order_without_pin_meta_returns_none(self):
         self.assertIsNone(geo_passthrough.extract_order_pin(_order()))
 
+    # ── DropPin's own key family ──────────────────────────────────────────
+    #
+    # Two checkout plugins can write a pin on this store. Before these keys were
+    # read, the day DropPin's picker replaced ours every customer pin would have
+    # stopped reaching ERPNext with no error anywhere — the sync would keep
+    # succeeding and Addresses would simply never get coordinates.
+
+    def test_droppin_meta_pin_is_extracted(self):
+        pin = geo_passthrough.extract_order_pin(_order(meta=[
+            {"key": "_dpn_lat", "value": "30.0444"},
+            {"key": "_dpn_lng", "value": "31.2357"},
+        ]))
+        self.assertIsNotNone(pin, "a DropPin pin must reach the geo ladder")
+        self.assertEqual((pin.latitude, pin.longitude), CAIRO)
+
+    def test_droppin_meta_falls_back_to_display_key_and_value(self):
+        pin = geo_passthrough.extract_order_pin(_order(meta=[
+            {"display_key": "_dpn_lat", "display_value": "30.0444"},
+            {"display_key": "_dpn_lng", "display_value": "31.2357"},
+        ]))
+        self.assertEqual((pin.latitude, pin.longitude), CAIRO)
+
+    def test_our_own_key_wins_when_an_order_carries_both(self):
+        """Only happens while both plugins are active. Ours wins because it is
+        the one our own checkout wrote."""
+        pin = geo_passthrough.extract_order_pin(_order(meta=[
+            {"key": "_jarz_lat", "value": "30.0444"},
+            {"key": "_jarz_lng", "value": "31.2357"},
+            {"key": "_dpn_lat", "value": "29.9000"},
+            {"key": "_dpn_lng", "value": "31.9000"},
+        ]))
+        self.assertEqual((pin.latitude, pin.longitude), CAIRO)
+
+    def test_droppin_garbage_is_rejected_like_any_other(self):
+        for lat, lng in (("", ""), ("abc", "31.2357"), ("0", "0")):
+            with self.subTest(lat=lat, lng=lng):
+                self.assertIsNone(geo_passthrough.extract_order_pin(_order(meta=[
+                    {"key": "_dpn_lat", "value": lat},
+                    {"key": "_dpn_lng", "value": lng},
+                ])))
+
     def test_numeric_meta_values_are_accepted(self):
         pin = geo_passthrough.extract_order_pin(_order(meta=[
             {"key": "_jarz_lat", "value": 30.0444},
