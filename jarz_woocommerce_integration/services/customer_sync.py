@@ -91,6 +91,34 @@ def _is_duplicate_key_error(exc: BaseException) -> bool:
     )
 
 
+#: Characters a customer uses to mean "here is *another* number", as opposed to
+#: the spaces/dashes/parens that merely format one.  Splitting on the latter
+#: would break ``0111-103-4268``, so they are deliberately absent here.
+_PHONE_LIST_SEPARATORS = re.compile(r"[/,;|\\\n\r\t،؛]+|\s+(?:or|and|و|أو)\s+", re.IGNORECASE)
+
+#: One Egyptian mobile in any spelling: optional ``+20``/``20``/``0`` trunk, then
+#: ``1`` and nine digits.  Used as the last-resort extractor when two numbers were
+#: typed with no separator we recognise (``+201210409690+201157355136``).
+_EGYPT_MOBILE_RE = re.compile(r"(?:\+?20|0)?(1\d{9})")
+
+#: Longest string Frappe's ``PHONE_NUMBER_PATTERN`` will accept.  A value beyond
+#: this is not a phone number, it is two of them stuck together.
+_MAX_PHONE_LEN = 20
+
+
+def _split_phone_candidates(p: Optional[str]) -> list[str]:
+    """Every distinct number a free-text phone field appears to contain.
+
+    Woo's checkout offers one phone box, so customers who want to give a second
+    contact number put both in it — ``01016518620/01062261342`` on order 17052.
+    Callers want the first one; :func:`_normalize_phone` is where that choice is
+    made, and this is only the splitting half of it.
+    """
+    if not p:
+        return []
+    return [part.strip() for part in _PHONE_LIST_SEPARATORS.split(str(p)) if part and part.strip()]
+
+
 def _normalize_phone(p: Optional[str]) -> Optional[str]:
     """Canonicalise a phone number to the local Egyptian form (``0XXXXXXXXXX``).
 
@@ -104,12 +132,42 @@ def _normalize_phone(p: Optional[str]) -> Optional[str]:
     Non-Egyptian numbers keep a leading ``+`` and are otherwise returned as-is;
     there is no attempt to guess a country for them.  Reads must still go through
     :func:`_phone_variants` because historical rows are stored un-canonicalised.
+
+    **Two numbers in one field collapse to the first.**  Stripping every
+    non-digit used to *fuse* them — ``01016518620/01062261342`` became the
+    22-digit ``0101651862001062261342``, which is not a phone number in any
+    spelling.  That value sailed through ``Customer.mobile_no`` (a Read Only
+    field, unvalidated) and then threw ``InvalidPhoneNumberError`` from
+    ``Address.phone`` a few lines later, which order_sync could only report as
+    the opaque ``customer_error:internal_error``.  Woo order 17052 was dropped
+    on the floor for 16 hours that way.  Seven such Customers exist on
+    production, the oldest from April, so this is a recurring input shape and
+    not a one-off.
     """
     if not p:
         return None
+
+    # A recognised separator is unambiguous: take the first number and stop.
+    candidates = _split_phone_candidates(p)
+    if len(candidates) > 1:
+        for candidate in candidates:
+            resolved = _normalize_phone(candidate)
+            if resolved:
+                return resolved
+        return None
+
     s = ''.join(ch for ch in str(p) if ch.isdigit() or ch == '+').strip()
     if not s:
         return None
+
+    # No separator we know, but too long to be one number — two were typed with
+    # nothing between them (``+201210409690+201157355136``). Recover the first.
+    # 14 digits is the longest legitimate spelling here (``00201111034268``), so
+    # the threshold sits just above it rather than at the mobile's own length.
+    if len(s) > _MAX_PHONE_LEN or (s.lstrip('+').isdigit() and len(s.lstrip('+')) > 14):
+        match = _EGYPT_MOBILE_RE.search(s)
+        if match:
+            return '0' + match.group(1)
 
     digits = s.lstrip('+')
     if not digits.isdigit():
@@ -125,6 +183,34 @@ def _normalize_phone(p: Optional[str]) -> Optional[str]:
     if digits.startswith('200') and len(digits) == 13:
         return digits[2:]
     return s
+
+
+def _safe_phone_value(p: Optional[str]) -> str:
+    """A phone string guaranteed to survive Frappe's ``Phone`` validator.
+
+    ``Address.phone`` is ``Data``/``Phone``, so Frappe runs
+    ``validate_phone_number(..., throw=True)`` on it and raises
+    ``InvalidPhoneNumberError`` for anything its pattern rejects — including any
+    value over 20 characters and anything containing ``/``.  ``Customer.mobile_no``
+    is ``Read Only``/``Mobile`` and is *not* validated, which is why a bad number
+    used to get half-way in: the Customer was created, the Address then threw, and
+    the whole order was abandoned with the Customer left orphaned.
+
+    A contact field must never be able to do that.  The order is the thing that
+    matters; an unusable phone is dropped rather than allowed to veto it.
+    """
+    from frappe.utils import validate_phone_number
+
+    raw = str(p or "").strip()
+    for candidate in (_normalize_phone(raw), raw):
+        if not candidate:
+            continue
+        try:
+            if len(candidate) <= _MAX_PHONE_LEN and validate_phone_number(candidate):
+                return candidate
+        except Exception:  # noqa: BLE001 - a validator must not break the sync
+            continue
+    return ""
 
 
 def _phone_variants(p: str | None) -> list[str]:
@@ -1313,7 +1399,9 @@ def _create_address(customer: str, address_type: str, data: dict, phone: str | N
         "state": data.get("state") or "",
         "pincode": data.get("postcode") or "",
         **({"country": country_val} if country_val else {}),
-        "phone": phone or "",
+        # Sanitised, never raw: Woo's phone box is free text and a value Frappe's
+        # Phone validator rejects would throw here and abandon the whole order.
+        "phone": _safe_phone_value(phone),
         "email_id": email or "",
         "links": [
             {

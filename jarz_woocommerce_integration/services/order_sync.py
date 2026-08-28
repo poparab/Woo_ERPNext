@@ -159,13 +159,42 @@ def _build_customer_error_result(
     *,
     detail: Any | None = None,
 ) -> dict[str, Any]:
+    """Report an order that could not get past customer/address creation.
+
+    This is a **dropped order**, not a skip: no Order Map row is written, so
+    nothing in the Desk or the POS shows that the order exists at all, and the
+    only trace is ``remote_response_json`` on a Sync Event nobody reads.  Woo
+    order 17052 sat here for 16 hours behind ``customer_error:internal_error``
+    while every ``CronLive`` run logged ``Success`` — skips are not counted as
+    errors, so the sync looked perfectly healthy the entire time.
+
+    So log it.  One Error Log per order per hour is the cheapest thing that
+    reaches a human, and ``internal_error`` is exactly the bucket where the
+    ``detail`` is the only clue to what actually broke.
+    """
+    code = _normalize_customer_error_code(reason)
     result = {
         "status": "skipped",
-        "reason": f"customer_error:{_normalize_customer_error_code(reason)}",
+        "reason": f"customer_error:{code}",
         "woo_order_id": woo_order_id,
     }
     if detail not in (None, ""):
         result["detail"] = str(detail)[:500]
+
+    _log_throttled_error(
+        key=f"customer_error:{woo_order_id}:{code}",
+        title=f"WooCommerce: order {woo_order_id} dropped ({code})",
+        message={
+            "woo_order_id": woo_order_id,
+            "reason": result["reason"],
+            "detail": result.get("detail"),
+            "impact": (
+                "No Sales Invoice and no WooCommerce Order Map row were created. "
+                "The order is invisible to the POS and to Desk. It will keep "
+                "retrying until the Sync Event exhausts its attempts, then stop."
+            ),
+        },
+    )
     return result
 
 
