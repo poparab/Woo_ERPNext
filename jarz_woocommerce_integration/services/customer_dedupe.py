@@ -52,6 +52,9 @@ from jarz_woocommerce_integration.services.customer_sync import (
     _normalize_phone,
     _suppress_woo_outbound,
 )
+from jarz_woocommerce_integration.utils.customer_woo_id import (
+    customer_woo_id_column_exists,
+)
 
 LOGGER = frappe.logger("jarz_woocommerce.customer_dedupe")
 
@@ -139,13 +142,28 @@ def pick_survivor(members: list[dict[str, Any]]) -> dict[str, Any]:
 
     Most submitted invoices first: that is where the account really lives.
     Ranking by recency instead would hand a 142-invoice account to a one-invoice
-    stray that happens to carry a newer order. Ties fall to the most recent
-    invoice, then the oldest record, so the answer never depends on row order.
+    stray that happens to carry a newer order.
+
+    A ``woo_customer_id`` breaks the tie next. ``rename_doc(merge=True)`` keeps the
+    *survivor's* field values and deletes the loser, so electing an unbound record
+    over an equally-established bound sibling throws the WooCommerce binding away
+    — and an unbound Customer's orders can never reach the shopper's My Account.
+    Preferring the bound member costs nothing when the counts are level.
+
+    It is deliberately *below* the invoice count rather than above it: an
+    established account must not be handed to a one-invoice stray merely because
+    the stray happens to be bound. When that case does arise the binding still
+    cannot be lost silently — :func:`_snapshot` records it and :func:`_diff`
+    aborts the merge for a human to look at.
+
+    Remaining ties fall to the most recent invoice, then the oldest record, so the
+    answer never depends on row order.
     """
     return sorted(
         members,
         key=lambda m: (
             -m["stats"]["submitted"],
+            0 if str(m.get("woo_customer_id") or "").strip() else 1,
             _neg_date(m["stats"]["last_date"]),
             str(m["creation"]),
             m["name"],
@@ -254,6 +272,39 @@ def _clean_target(members: list[dict[str, Any]], survivor: dict[str, Any]) -> st
 # ---------------------------------------------------------------------------
 
 
+def _woo_ids(names: list[str]) -> list[str]:
+    """The distinct WooCommerce bindings held across *names*.
+
+    A binding is not money and not a Link row, so none of the other invariants
+    notice when a merge drops one — the survivor simply keeps its own (empty)
+    ``woo_customer_id`` and the loser's is deleted with the record. The merge then
+    reports a clean success while the shopper's ERPNext identity has quietly been
+    severed from their store account, and their orders can never again appear
+    under My Account.
+
+    Returned as a sorted list of strings so the before/after comparison is a plain
+    equality on a stable value. Returns ``[]`` rather than raising when the column
+    is absent or the probe fails, which degrades to today's behaviour instead of
+    breaking a merge run.
+    """
+    if not names or not customer_woo_id_column_exists():
+        return []
+    placeholders = ", ".join(["%s"] * len(names))
+    try:
+        rows = frappe.db.sql(
+            f"SELECT woo_customer_id FROM `tabCustomer` WHERE name IN ({placeholders})",
+            tuple(names),
+        ) or []
+    except Exception:  # noqa: BLE001 - a diagnostic must not break the merge
+        return []
+    found = set()
+    for row in rows:
+        value = str((row[0] if row else "") or "").strip()
+        if value and value != "0":
+            found.add(value)
+    return sorted(found)
+
+
 def _snapshot(names: list[str]) -> dict[str, Any]:
     """Everything that must survive a merge unchanged, summed over *names*."""
     placeholders = ", ".join(["%s"] * len(names))
@@ -301,6 +352,7 @@ def _snapshot(names: list[str]) -> dict[str, Any]:
     )[0][0]
 
     return {
+        "woo_ids": _woo_ids(names),
         "submitted": int(invoices["submitted"] or 0),
         "draft": int(invoices["draft"] or 0),
         "cancelled": int(invoices["cancelled"] or 0),
@@ -327,6 +379,12 @@ def _diff(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     # Addresses may legitimately collapse if both records shared one, never grow.
     if after["addresses"] > before["addresses"]:
         problems.append(f"addresses: {before['addresses']} -> {after['addresses']}")
+    # A WooCommerce binding held by any member must still be held afterwards.
+    # ``.get`` rather than ``[]`` on purpose: callers hand-build snapshots, and a
+    # missing key must mean "not measured", never a crash mid-merge.
+    lost_bindings = sorted(set(before.get("woo_ids") or []) - set(after.get("woo_ids") or []))
+    if lost_bindings:
+        problems.append(f"woo_customer_id lost: {lost_bindings}")
     return problems
 
 

@@ -24,6 +24,7 @@ from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_setti
     WooCommerceSettings,
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
+    customer_woo_id_holders,
     customer_woo_id_is_claimed_by_other,
     get_customer_woo_id,
     get_legacy_customer_woo_id,
@@ -958,6 +959,56 @@ def _mark_customer_status(customer_name: str, *, status: str, error: str | None 
     frappe.db.set_value("Customer", customer_name, updates, update_modified=False)
 
 
+#: Every way WordPress and WooCommerce say "that account is already there".
+#:
+#: WooCommerce's own registration path answers "An account is already registered
+#: with your email address", which is where the original ``"already registered"``
+#: test came from.  But ``POST /customers`` also runs ``wp_insert_user``, and a
+#: username collision there is a *WordPress* error — ``existing_user_login`` /
+#: "Sorry, that username already exists!" — which contains neither the word
+#: "registered" nor the email wording.  Because ``_build_customer_payload`` sets
+#: ``username = email``, every customer whose Woo username equals their email hits
+#: that branch, skipped both the reconcile *and* the already-claimed guard, and
+#: died at the generic handler.  Production ``WOOEVT-490092`` for ``محمود - 9`` is
+#: exactly this, and it is why a second shadow record was minted 83 seconds after
+#: the first.
+_EXISTING_ACCOUNT_MESSAGE_FRAGMENTS = (
+    "already registered",
+    "already exists",
+    "already in use",
+)
+
+#: The machine-readable half of the same signal.  Checking the code as well as the
+#: message keeps this working when WordPress is running in a non-English locale,
+#: where the message is translated but the code never is.
+_EXISTING_ACCOUNT_ERROR_CODES = frozenset({
+    "registration-error-email-exists",
+    "registration-error-username-exists",
+    "existing_user_login",
+    "existing_user_email",
+})
+
+
+def _is_existing_woo_account_error(exc: WooAPIError) -> bool:
+    """Does this 400 mean "the account already exists" rather than "bad request"?
+
+    Answering yes routes the failure into the reconcile branch, which looks the
+    account up by email and then hands it to the already-claimed guard.  Answering
+    no drops it at the generic handler, where the customer is marked errored and
+    never binds — the outcome this predicate exists to stop.
+    """
+    if getattr(exc, "status_code", None) != 400:
+        return False
+
+    message = str(getattr(exc, "message", "") or "").lower()
+    if any(fragment in message for fragment in _EXISTING_ACCOUNT_MESSAGE_FRAGMENTS):
+        return True
+
+    payload = getattr(exc, "payload", None) or {}
+    code = str(payload.get("code") or "").strip().lower() if isinstance(payload, dict) else ""
+    return code in _EXISTING_ACCOUNT_ERROR_CODES
+
+
 def _normalize_customer_sync_scopes(scope: str | None) -> set[str]:
     if not scope:
         return {"full"}
@@ -1205,11 +1256,12 @@ def sync_customer(
             # create anew if stored id is stale - include password and username for recreation
             payload_with_password = _build_customer_payload(customer, include_password=True, include_username=True)
             response = client.post("customers", payload_with_password)
-        elif not woo_id and exc.status_code == 400 and "already registered" in exc.message.lower():
+        elif not woo_id and _is_existing_woo_account_error(exc):
             # Customer exists in WooCommerce but we don't have the ID - reconcile
             LOGGER.info({
                 "event": "woo_outbound_customer_reconcile",
                 "customer": customer_name,
+                "trigger": exc.message,
                 "detail": "Customer exists in WooCommerce, searching by email to reconcile",
             })
             try:
@@ -1224,15 +1276,24 @@ def sync_customer(
                     # WooCommerce record and make woo_customer_id ambiguous for every
                     # future lookup — the mechanism that put 215 customers on one id.
                     if customer_woo_id_is_claimed_by_other(woo_customer_id, customer_name):
+                        # Name the holder.  The refusal is correct and stays, but
+                        # for months it recorded only *that* the id was taken, so
+                        # every occurrence cost a production archaeology dig to
+                        # find the sibling record. The holder is one query away.
+                        holders = customer_woo_id_holders(
+                            woo_customer_id, exclude=customer_name, limit=5
+                        )
+                        held_by = ", ".join(holders) if holders else "unknown"
                         detail = (
                             f"WooCommerce account {woo_customer_id} (email {email}) is already "
-                            f"bound to a different ERPNext Customer; refusing to adopt it"
+                            f"bound to ERPNext Customer {held_by}; refusing to adopt it"
                         )
                         LOGGER.error({
                             "event": "woo_outbound_customer_id_already_claimed",
                             "customer": customer_name,
                             "woo_id": woo_customer_id,
                             "email": email,
+                            "held_by": holders,
                             "detail": detail,
                         })
                         _mark_customer_status(customer_name, status="error", error=detail)
@@ -1251,7 +1312,13 @@ def sync_customer(
                     # Retry with UPDATE
                     response = client.put(f"customers/{woo_customer_id}", update_payload)
                 else:
-                    raise ValueError(f"Could not find WooCommerce customer with email {email}")
+                    # Carry the original store error through. The trigger above is
+                    # deliberately broad, so a 400 that merely *looked* like an
+                    # existing account must not lose its real message here.
+                    raise ValueError(
+                        f"Could not find WooCommerce customer with email {email} "
+                        f"(store said: {exc.message})"
+                    )
             except Exception as search_exc:
                 LOGGER.error({
                     "event": "woo_outbound_customer_reconcile_failed",

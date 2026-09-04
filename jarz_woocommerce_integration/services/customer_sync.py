@@ -20,6 +20,7 @@ from jarz_woocommerce_integration.services.geo_passthrough import (
     resolve_order_pins as _resolve_order_geo_pins,
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
+    customer_woo_id_holders,
     customer_woo_id_is_claimed_by_other,
     find_customer_by_woo_id,
     get_legacy_customer_woo_id,
@@ -182,6 +183,20 @@ def _normalize_phone(p: Optional[str]) -> Optional[str]:
     # 0020 1XXXXXXXXX already folded above; guard the 200XXXXXXXXXX spelling too
     if digits.startswith('200') and len(digits) == 13:
         return digits[2:]
+
+    # 1XXXXXXXXX -> 01XXXXXXXXX: the trunk ``0`` dropped at the keyboard.  Woo
+    # order 17173 arrived as ``1097503380`` while the shopper's stored number is
+    # ``01097503380``; without this fold the phone step is blind across the pair
+    # and mints a shadow Customer that can never be bound to their Woo account.
+    #
+    # The shape is deliberately narrow so a genuine international number cannot
+    # be captured: a value that was written with a ``+`` is excluded outright,
+    # every Egyptian mobile's national number is ``1`` + nine digits, and no NANP
+    # area code may begin with ``1`` — so a bare ten-digit string starting ``1``
+    # is Egyptian or nothing.  An 11-digit bare number (a Chinese mobile, say)
+    # falls through untouched.
+    if not s.startswith('+') and len(digits) == 10 and digits.startswith('1'):
+        return '0' + digits
     return s
 
 
@@ -221,6 +236,12 @@ def _phone_variants(p: str | None) -> list[str]:
     ``201111034268``.  A lookup that queries only the canonical form silently
     misses the other two, which is precisely how duplicate Customers were created.
     Returns canonical-first so callers that only want one value can take ``[0]``.
+
+    A bare national number (``1097503380``, trunk ``0`` dropped) is folded to the
+    canonical ``01097503380`` by :func:`_normalize_phone`, so it reaches this
+    function already 11 digits and gets the full ``+20``/``20``/``0020`` set.  The
+    raw spelling is still appended below, so a row stored in the bare form keeps
+    matching too.
     """
     canonical = _normalize_phone(p)
     if not canonical:
@@ -341,27 +362,86 @@ def _candidate_conflicts_with_woo_customer(name: Optional[str], woo_customer_id:
     return bool(existing_woo_customer_id and existing_woo_customer_id != normalized_woo_customer_id)
 
 
-def _candidate_safe_for_guest(name: Optional[str]) -> bool:
-    """Return False if the candidate Customer is already bound to a Woo identity.
+def _guest_identity_confirmed(
+    name: Optional[str],
+    *,
+    email: Optional[str],
+    phone_norm: Optional[str],
+) -> bool:
+    """Does a guest checkout carry BOTH stored identifiers of *name*?
 
-    A customer with a woo_customer_id, legacy custom_woo_customer_id, or
-    woo_username belongs to a real Woo account and must never be recycled for a
-    guest order (woo_customer_id=0 / None).  Guest orders always create a fresh
-    customer in that case.
+    A guest order (``customer_id: 0``) matching an already-Woo-bound Customer on
+    a *single* field proves nothing: a shared handset or a recycled mailbox would
+    hand a stranger somebody else's account.  Matching on email **and** phone
+    together is a different claim — the shopper simply did not log in.
+
+    Refusing that second case is the shadow-Customer defect.  The fresh record it
+    mints can never be bound to the Woo account (the id is already held, and
+    stamping a second holder poisons :func:`find_customer_by_woo_id` for that id
+    permanently), so its orders stay ``customer_id: 0`` in the store forever and
+    never appear under the shopper's My Account → Orders.  Production carries 26
+    such records, 18 of them duplicating a bound sibling by phone or email.
+
+    Both identifiers are required, and the probe refuses on any error.  Loosening
+    this to "either one" is exactly the hijack the caller's guard exists to stop.
+    """
+    if not name or not email or not phone_norm:
+        return False
+
+    try:
+        stored_email = str(frappe.db.get_value("Customer", name, "email_id") or "").strip().lower()
+        if not stored_email or stored_email != str(email).strip().lower():
+            return False
+
+        wanted_phone = _normalize_phone(phone_norm)
+        if not wanted_phone:
+            return False
+
+        for fieldname in ("mobile_no", "phone"):
+            if fieldname == "phone" and not _field_exists("Customer", "phone"):
+                continue
+            stored_phone = _normalize_phone(frappe.db.get_value("Customer", name, fieldname))
+            if stored_phone and stored_phone == wanted_phone:
+                return True
+    except Exception:  # noqa: BLE001 - a failed probe must refuse, never adopt
+        return False
+    return False
+
+
+def _candidate_safe_for_guest(
+    name: Optional[str],
+    *,
+    email: Optional[str] = None,
+    phone_norm: Optional[str] = None,
+) -> bool:
+    """May a guest order (``woo_customer_id`` 0 / None) attach to *name*?
+
+    Yes when the candidate carries no Woo identity at all — no
+    ``woo_customer_id``, no legacy ``custom_woo_customer_id``, no
+    ``woo_username``.
+
+    Yes when it does carry one, but the order's email *and* phone both match what
+    that Customer stores (:func:`_guest_identity_confirmed`).  That is the
+    account holder checking out logged-out, and minting a second record for them
+    creates a shadow that can never bind.
+
+    No otherwise.  A single matching field is not identity, and recycling on it
+    would attach a stranger's order to somebody's real account.
+
+    Called without *email*/*phone_norm* the confirmation cannot succeed, so the
+    answer collapses to the original "bound means off-limits" behaviour.
     """
     if not name:
         return True
     try:
-        existing_woo_id = get_customer_woo_id(name) or get_legacy_customer_woo_id(name)
-        if existing_woo_id:
-            return False
-        if _field_exists("Customer", "woo_username"):
-            existing_username = frappe.db.get_value("Customer", name, "woo_username")
-            if existing_username:
-                return False
+        bound = get_customer_woo_id(name) or get_legacy_customer_woo_id(name)
+        if not bound and _field_exists("Customer", "woo_username"):
+            bound = frappe.db.get_value("Customer", name, "woo_username")
+        if not bound:
+            return True
     except Exception:
-        pass
-    return True
+        return True
+    return _guest_identity_confirmed(name, email=email, phone_norm=phone_norm)
 
 
 @contextmanager
@@ -407,9 +487,15 @@ def _update_customer_identity(
             # Customer already holds is what made the field ambiguous across
             # hundreds of records and broke identity resolution at step zero.
             if customer_woo_id_is_claimed_by_other(normalized_woo_customer_id, name):
+                # Name the holder for the same reason the outbound guard does:
+                # "already claimed" without a name is an investigation, with a
+                # name it is a report.
+                holders = customer_woo_id_holders(
+                    normalized_woo_customer_id, exclude=name, limit=5
+                )
                 frappe.logger("woo").warning(
                     f"skipped_woo_customer_id_write customer={name!r} id={normalized_woo_customer_id} "
-                    f"already_claimed_by_another_customer"
+                    f"already_claimed_by={holders or 'unknown'}"
                 )
             else:
                 updates["woo_customer_id"] = normalized_woo_customer_id
@@ -457,7 +543,12 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                 cached_name = customer_cache[cache_key]
                 if cache_key.startswith(("user:", "email:")) and (
                     _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id)
-                    or (not woo_customer_id and not _candidate_safe_for_guest(cached_name))
+                    or (
+                        not woo_customer_id
+                        and not _candidate_safe_for_guest(
+                            cached_name, email=email, phone_norm=phone_norm
+                        )
+                    )
                 ):
                     continue
                 return cached_name
@@ -480,16 +571,18 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     # 1) phone-based
     if phone_norm:
         name = _find_customer_by_phone(phone_norm)
-        # For guest orders, phone alone is not sufficient to reuse a Woo-bound customer;
-        # require email to also match to confirm it is the same person.
-        if name and not woo_customer_id and not _candidate_safe_for_guest(name):
-            phone_email_match = bool(email and frappe.db.get_value("Customer", name, "email_id") == email)
-            if not phone_email_match:
-                frappe.logger("woo").warning(
-                    f"woo_order={order_id} guest phone={phone_norm!r} matched Woo-bound "
-                    f"customer {name!r}; email mismatch — creating new guest customer"
-                )
-                name = None
+        # For guest orders, phone alone is not sufficient to reuse a Woo-bound
+        # customer; the email must match too before we accept it is the same
+        # person.  `_candidate_safe_for_guest` owns that rule for every step, so
+        # the phone / username / email branches cannot drift apart again.
+        if name and not woo_customer_id and not _candidate_safe_for_guest(
+            name, email=email, phone_norm=phone_norm
+        ):
+            frappe.logger("woo").warning(
+                f"woo_order={order_id} guest phone={phone_norm!r} matched Woo-bound "
+                f"customer {name!r}; email mismatch — creating new guest customer"
+            )
+            name = None
         if name:
             _update_customer_identity(
                 name,
@@ -506,7 +599,8 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     if username and _field_exists("Customer", "woo_username"):
         name = frappe.db.get_value("Customer", {"woo_username": username}, "name")
         if _candidate_conflicts_with_woo_customer(name, woo_customer_id) or (
-            not woo_customer_id and not _candidate_safe_for_guest(name)
+            not woo_customer_id
+            and not _candidate_safe_for_guest(name, email=email, phone_norm=phone_norm)
         ):
             if name:
                 frappe.logger("woo").warning(
@@ -530,7 +624,8 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     if email:
         name = frappe.db.get_value("Customer", {"email_id": email}, "name")
         if _candidate_conflicts_with_woo_customer(name, woo_customer_id) or (
-            not woo_customer_id and not _candidate_safe_for_guest(name)
+            not woo_customer_id
+            and not _candidate_safe_for_guest(name, email=email, phone_norm=phone_norm)
         ):
             if name:
                 frappe.logger("woo").warning(
@@ -589,7 +684,12 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     cached_name = customer_cache[cache_key]
                     if cache_key.startswith(("user:", "email:")) and (
                         _candidate_conflicts_with_woo_customer(cached_name, woo_customer_id)
-                        or (not woo_customer_id and not _candidate_safe_for_guest(cached_name))
+                        or (
+                            not woo_customer_id
+                            and not _candidate_safe_for_guest(
+                                cached_name, email=email, phone_norm=phone_norm
+                            )
+                        )
                     ):
                         continue
                     return cached_name
@@ -601,11 +701,15 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
                     _cache_customer(customer_cache, _recheck, woo_customer_id, username, phone_norm, email)
                     return _recheck
             if phone_norm:
+                # The same guest rule as the unlocked path above, and it has to be
+                # the same call: this branch is the one production actually takes
+                # (Redis is available there), so a stricter copy here would quietly
+                # revert the exact-match acceptance under a concurrent create.
                 _recheck = _find_customer_by_phone(phone_norm)
-                if _recheck and not woo_customer_id and not _candidate_safe_for_guest(_recheck):
-                    phone_email_match = bool(email and frappe.db.get_value("Customer", _recheck, "email_id") == email)
-                    if not phone_email_match:
-                        _recheck = None
+                if _recheck and not woo_customer_id and not _candidate_safe_for_guest(
+                    _recheck, email=email, phone_norm=phone_norm
+                ):
+                    _recheck = None
                 if _recheck:
                     _update_customer_identity(
                         _recheck,
@@ -620,7 +724,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             if username and _field_exists("Customer", "woo_username"):
                 _recheck = frappe.db.get_value("Customer", {"woo_username": username}, "name")
                 if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id) or (
-                    not woo_customer_id and not _candidate_safe_for_guest(_recheck)
+                    not woo_customer_id
+                    and not _candidate_safe_for_guest(
+                        _recheck, email=email, phone_norm=phone_norm
+                    )
                 ):
                     _recheck = None
                 if _recheck:
@@ -637,7 +744,10 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
             if email:
                 _recheck = frappe.db.get_value("Customer", {"email_id": email}, "name")
                 if _candidate_conflicts_with_woo_customer(_recheck, woo_customer_id) or (
-                    not woo_customer_id and not _candidate_safe_for_guest(_recheck)
+                    not woo_customer_id
+                    and not _candidate_safe_for_guest(
+                        _recheck, email=email, phone_norm=phone_norm
+                    )
                 ):
                     _recheck = None
                 if _recheck:

@@ -144,6 +144,49 @@ def find_customer_by_woo_id(woo_customer_id: Any) -> str | None:
     return matches[0]
 
 
+def customer_woo_id_column_exists() -> bool:
+    """Is ``Customer.woo_customer_id`` present on this site?
+
+    Public so callers that must distinguish "no binding" from "no column" — the
+    dedupe snapshot, which treats a lost binding as a merge failure — do not have
+    to reach into the private cache helper.
+    """
+    return _customer_has_column("woo_customer_id")
+
+
+def customer_woo_id_holders(
+    woo_customer_id: Any,
+    *,
+    exclude: str | None = None,
+    limit: int = 5,
+) -> list[str]:
+    """Which ERPNext Customers currently store *woo_customer_id*.
+
+    The guards below only ever needed a yes/no, and answering only that is why
+    diagnosing a refused binding took a production archaeology dig: the log said
+    the id was claimed but never said by whom.  Returning the names costs the
+    same query and turns the next occurrence into a report instead of an
+    investigation.
+
+    Returns ``[]`` — never raises — when the column is absent or the probe fails,
+    so a diagnostic can never be the thing that breaks a sync.
+    """
+    normalized = normalize_woo_customer_id(woo_customer_id)
+    if not normalized or not _customer_has_column("woo_customer_id"):
+        return []
+    try:
+        holders = frappe.db.get_values(
+            "Customer",
+            {"woo_customer_id": normalized},
+            "name",
+            limit=limit,
+            pluck=True,
+        ) or []
+    except Exception:
+        return []
+    return [holder for holder in holders if holder and holder != exclude]
+
+
 def customer_woo_id_is_claimed_by_other(woo_customer_id: Any, customer_name: str) -> bool:
     """Is *woo_customer_id* already stored on a Customer other than *customer_name*?
 
@@ -151,20 +194,7 @@ def customer_woo_id_is_claimed_by_other(woo_customer_id: Any, customer_name: str
     Customer; stamping a second one on it is what made ``find_customer_by_woo_id``
     ambiguous in the first place.
     """
-    normalized = normalize_woo_customer_id(woo_customer_id)
-    if not normalized or not _customer_has_column("woo_customer_id"):
-        return False
-    try:
-        holders = frappe.db.get_values(
-            "Customer",
-            {"woo_customer_id": normalized},
-            "name",
-            limit=2,
-            pluck=True,
-        ) or []
-    except Exception:
-        return False
-    return any(holder != customer_name for holder in holders)
+    return bool(customer_woo_id_holders(woo_customer_id, exclude=customer_name, limit=2))
 
 
 def set_customer_woo_id(

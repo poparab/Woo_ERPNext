@@ -6,8 +6,9 @@ A shared phone is not a shared person. Production holds 'فاديه توفيق' 
 duplicates the tool exists to clean up.
 """
 
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from jarz_woocommerce_integration.services import customer_dedupe
 
@@ -334,6 +335,219 @@ class TestDiff(unittest.TestCase):
     def test_addresses_may_collapse_but_never_grow(self):
         self.assertEqual(customer_dedupe._diff(self._snap(), self._snap(addresses=2)), [])
         self.assertTrue(customer_dedupe._diff(self._snap(), self._snap(addresses=4)))
+
+
+# ---------------------------------------------------------------------------
+# FIX 5 — a merge must not silently drop a WooCommerce binding
+# ---------------------------------------------------------------------------
+
+class TestSurvivorPrefersABoundRecord(unittest.TestCase):
+    """`rename_doc(merge=True)` keeps the survivor's fields and deletes the loser.
+
+    Electing an unbound shadow therefore throws the WooCommerce binding away, and
+    an unbound Customer's orders can never appear under the shopper's My Account.
+    """
+
+    def _member(self, name, submitted, woo="", last="", created="2026-06-01 00:00:00"):
+        return {"name": name, "creation": created, "woo_customer_id": woo,
+                "stats": _stats(submitted=submitted, last=last)}
+
+    def test_a_bound_record_wins_a_tie_against_an_unbound_one(self):
+        winner = customer_dedupe.pick_survivor([
+            self._member("shadow", 3, woo="", last="2026-08-01"),
+            self._member("bound", 3, woo="4211", last="2026-08-01"),
+        ])
+        self.assertEqual(winner["name"], "bound")
+
+    def test_the_preference_beats_recency_and_creation_order(self):
+        """Both weaker tie-breaks point at the shadow; the binding must still win."""
+        winner = customer_dedupe.pick_survivor([
+            self._member("shadow", 3, woo="", last="2026-08-30",
+                         created="2026-01-01 00:00:00"),
+            self._member("bound", 3, woo="4211", last="2026-02-01",
+                         created="2026-09-01 00:00:00"),
+        ])
+        self.assertEqual(winner["name"], "bound")
+
+    def test_invoice_history_still_outranks_a_binding(self):
+        """A one-invoice bound stray must not be handed a 142-invoice account.
+
+        When this happens the binding is not lost quietly — `_diff` aborts the
+        merge and the group is reported for a human.
+        """
+        winner = customer_dedupe.pick_survivor([
+            self._member("bound stray", 1, woo="4211", last="2026-08-30"),
+            self._member("account", 142, woo="", last="2026-07-01"),
+        ])
+        self.assertEqual(winner["name"], "account")
+
+    def test_a_blank_binding_is_not_treated_as_a_binding(self):
+        for empty in ("", "   ", None, 0):
+            with self.subTest(empty=empty):
+                winner = customer_dedupe.pick_survivor([
+                    self._member("a", 1, woo=empty, created="2026-01-01 00:00:00"),
+                    self._member("b", 1, woo="4211", created="2026-02-01 00:00:00"),
+                ])
+                self.assertEqual(winner["name"], "b")
+
+    def test_members_without_the_key_at_all_do_not_crash(self):
+        """`pick_survivor` is called with hand-built members in other callers."""
+        winner = customer_dedupe.pick_survivor([
+            {"name": "b", "creation": "2026-01-01 00:00:00", "stats": _stats(0)},
+            {"name": "a", "creation": "2026-01-01 00:00:00", "stats": _stats(0)},
+        ])
+        self.assertEqual(winner["name"], "a")
+
+    def test_build_plan_supplies_the_key_this_ranking_reads(self):
+        """Contract check, end to end through the planner.
+
+        The unbound ``Ahmed`` is older and sorts first by name, so every other
+        tie-break in the key points at it. Only the binding preference can make
+        ``Ahmed - 2`` survive — which is what stops the merge from deleting the
+        record that holds woo id 5973.
+        """
+        with patch.object(customer_dedupe, "_load_customers", return_value=[
+            _cust("Ahmed", "01111034268", "", created="2026-01-01 00:00:00"),
+            _cust("Ahmed - 2", "01111034268", "5973", created="2026-05-01 00:00:00"),
+        ]), patch.object(customer_dedupe, "_invoice_stats",
+                         side_effect=lambda names: {n: _stats() for n in names}):
+            plan = customer_dedupe.build_plan()
+
+        self.assertEqual(len(plan["auto"]), 1)
+        self.assertIn("woo_customer_id", plan["auto"][0]["members"][0])
+        self.assertEqual(plan["auto"][0]["survivor"], "Ahmed - 2")
+        self.assertEqual(plan["auto"][0]["losers"], ["Ahmed"])
+
+
+class TestWooIds(unittest.TestCase):
+    """The snapshot probe behind the abort."""
+
+    @staticmethod
+    def _db(sql):
+        """A whole `frappe.db` stand-in, so this runs with or without a site."""
+        return patch.object(customer_dedupe.frappe, "db",
+                            SimpleNamespace(sql=sql), create=True)
+
+    def _ids(self, rows, column=True):
+        with patch.object(customer_dedupe, "customer_woo_id_column_exists",
+                          return_value=column), \
+             self._db(lambda *_a, **_kw: rows):
+            return customer_dedupe._woo_ids(["A", "B"])
+
+    def test_collects_the_distinct_bindings(self):
+        self.assertEqual(self._ids([("4211",), ("5084",), ("4211",)]),
+                         ["4211", "5084"])
+
+    def test_blank_and_zero_are_not_bindings(self):
+        self.assertEqual(self._ids([("",), (None,), ("0",), ("  ",)]), [])
+
+    def test_a_missing_column_yields_nothing_and_is_not_queried(self):
+        sql = MagicMock()
+        with patch.object(customer_dedupe, "customer_woo_id_column_exists",
+                          return_value=False), self._db(sql):
+            self.assertEqual(customer_dedupe._woo_ids(["A"]), [])
+        sql.assert_not_called()
+
+    def test_a_failing_probe_degrades_instead_of_breaking_the_run(self):
+        def _boom(*_a, **_kw):
+            raise RuntimeError("boom")
+
+        with patch.object(customer_dedupe, "customer_woo_id_column_exists",
+                          return_value=True), self._db(_boom):
+            self.assertEqual(customer_dedupe._woo_ids(["A"]), [])
+
+    def test_an_empty_name_list_is_never_queried(self):
+        """An empty IN() clause is a SQL syntax error."""
+        sql = MagicMock()
+        with patch.object(customer_dedupe, "customer_woo_id_column_exists",
+                          return_value=True), self._db(sql):
+            self.assertEqual(customer_dedupe._woo_ids([]), [])
+        sql.assert_not_called()
+
+
+class TestDiffGuardsTheBinding(unittest.TestCase):
+
+    def _snap(self, **over):
+        base = {"submitted": 5, "draft": 0, "cancelled": 1, "revenue": 1000.0,
+                "outstanding": 50.0, "gl_rows": 12, "gl_debit": 1000.0,
+                "gl_credit": 950.0, "pe_rows": 3, "pe_paid": 950.0, "addresses": 3,
+                "woo_ids": ["4211"]}
+        base.update(over)
+        return base
+
+    def test_a_dropped_binding_is_a_problem(self):
+        problems = customer_dedupe._diff(self._snap(), self._snap(woo_ids=[]))
+        self.assertTrue(any("woo_customer_id lost" in p for p in problems), problems)
+        self.assertTrue(any("4211" in p for p in problems), problems)
+
+    def test_a_binding_that_survives_is_not_a_problem(self):
+        self.assertEqual(customer_dedupe._diff(self._snap(), self._snap()), [])
+
+    def test_losing_one_of_two_bindings_is_still_a_problem(self):
+        problems = customer_dedupe._diff(
+            self._snap(woo_ids=["4211", "5084"]), self._snap(woo_ids=["4211"])
+        )
+        self.assertTrue(any("5084" in p for p in problems), problems)
+
+    def test_a_snapshot_without_the_key_does_not_crash(self):
+        """Callers hand-build snapshots; a missing key means 'not measured'."""
+        bare = {k: v for k, v in self._snap().items() if k != "woo_ids"}
+        self.assertEqual(customer_dedupe._diff(bare, dict(bare)), [])
+
+
+class TestMergeAbortsOnALostBinding(unittest.TestCase):
+    """The latent hazard: a repair run would drive straight through this."""
+
+    def _group(self):
+        return {
+            "phone": "01097503380",
+            "survivor": "shadow",
+            "losers": ["bound"],
+            "clean_name": "",
+            "evidence": "identical base name",
+            "members": [
+                {"name": "shadow", "lead_name": ""},
+                {"name": "bound", "lead_name": ""},
+            ],
+        }
+
+    def _snap(self, **over):
+        base = {"submitted": 3, "draft": 0, "cancelled": 0, "revenue": 300.0,
+                "outstanding": 0.0, "gl_rows": 6, "gl_debit": 300.0,
+                "gl_credit": 300.0, "pe_rows": 1, "pe_paid": 300.0, "addresses": 1,
+                "woo_ids": ["4211"]}
+        base.update(over)
+        return base
+
+    def _merge(self, before, after):
+        with patch.object(customer_dedupe, "_snapshot", side_effect=[before, after]), \
+             patch.object(customer_dedupe, "_restore_lead_statuses", return_value={}), \
+             patch.object(customer_dedupe, "rename_doc"), \
+             patch.object(customer_dedupe.frappe.db, "savepoint"), \
+             patch.object(customer_dedupe.frappe.db, "release_savepoint"), \
+             patch.object(customer_dedupe.frappe.db, "commit") as commit, \
+             patch.object(customer_dedupe.frappe.db, "rollback") as rollback, \
+             patch.object(customer_dedupe.frappe.db, "exists",
+                          side_effect=lambda _dt, n: n == "shadow"):
+            result = customer_dedupe.merge_group(self._group(), apply=True)
+        return result, commit, rollback
+
+    def test_a_merge_that_drops_the_binding_is_rolled_back(self):
+        result, commit, rollback = self._merge(self._snap(), self._snap(woo_ids=[]))
+
+        self.assertFalse(result["applied"])
+        self.assertTrue(any("woo_customer_id lost" in p for p in result["problems"]),
+                        result["problems"])
+        rollback.assert_called_once()
+        commit.assert_not_called()
+
+    def test_a_merge_that_keeps_the_binding_still_succeeds(self):
+        """The guard must not turn every merge into a failure."""
+        result, commit, rollback = self._merge(self._snap(), self._snap())
+
+        self.assertTrue(result["applied"], result["problems"])
+        rollback.assert_not_called()
+        commit.assert_called_once()
 
 
 if __name__ == "__main__":
