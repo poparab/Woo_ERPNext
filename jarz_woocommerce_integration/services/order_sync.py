@@ -4520,7 +4520,38 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
 
             # Update custom acceptance status and sales invoice state based on WooCommerce status
             try:
-                if woo_status == "completed":
+                # A submitted invoice that has never been dispatched in ERPNext must
+                # not be written to "Delivered" / "Out for Delivery" from the store's
+                # status. Dispatch is what creates the Delivery Note (the only thing
+                # that moves stock), the courier position and the freight accrual;
+                # writing the state alone produced orders that could neither be
+                # cancelled (state) nor returned (no Delivery Note), with their whole
+                # total still on Debtors. Flag it for a human instead. The historical
+                # import keeps its behaviour: closed months carry no stock or courier.
+                _dispatched_in_erp = False
+                try:
+                    _dispatched_in_erp = bool(int(inv.get("custom_was_out_for_delivery") or 0)) or (
+                        str(inv.get("custom_sales_invoice_state") or "").strip() in ("Out for Delivery", "Delivered")
+                    )
+                except Exception:
+                    _dispatched_in_erp = False
+                _status_ahead_of_dispatch = (
+                    woo_status in ("completed", "out-for-delivery")
+                    and inv.docstatus == 1
+                    and not is_historical
+                    and not _dispatched_in_erp
+                )
+                if _status_ahead_of_dispatch:
+                    inv.db_set("custom_acceptance_status", "Accepted", commit=False)
+                    create_sync_log_entry(
+                        "StatusAheadOfDispatch",
+                        "NeedsReview",
+                        f"woo_status_ahead_of_dispatch: order {woo_id} is {woo_status!r} on WooCommerce "
+                        f"but {inv.name} was never dispatched in ERPNext; state left as "
+                        f"{inv.get('custom_sales_invoice_state')!r}. Dispatch it from the board.",
+                        woo_order_id=woo_id,
+                    )
+                elif woo_status == "completed":
                     inv.db_set("custom_acceptance_status", "Accepted", commit=False)
                     inv.db_set("custom_sales_invoice_state", "Delivered", commit=False)
                 elif woo_status == "out-for-delivery":
@@ -4599,7 +4630,20 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             if custom_payment_method:
                 inv_data["custom_payment_method"] = custom_payment_method
 
-            if woo_status == "completed":
+            if woo_status in ("completed", "out-for-delivery") and not is_historical:
+                # A live order the store already moved on before ERPNext first saw it.
+                # Creating it straight into Delivered / Out for Delivery would skip the
+                # Delivery Note, the courier position and the freight accrual (see the
+                # update path above). Accept it, leave it in the prep column, and flag it.
+                inv_data["custom_acceptance_status"] = "Accepted"
+                create_sync_log_entry(
+                    "StatusAheadOfDispatch",
+                    "NeedsReview",
+                    f"woo_status_ahead_of_dispatch: order {woo_id} arrived already {woo_status!r}; "
+                    "invoice created in the prep column — dispatch it from the board.",
+                    woo_order_id=woo_id,
+                )
+            elif woo_status == "completed":
                 inv_data["custom_acceptance_status"] = "Accepted"
                 inv_data["custom_sales_invoice_state"] = "Delivered"
             elif woo_status == "out-for-delivery":
