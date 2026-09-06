@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import patch
+
+import frappe
 
 from jarz_woocommerce_integration.services import customer_cleanup
 
@@ -327,7 +330,13 @@ class TestCustomerCleanupPlanning(unittest.TestCase):
             },
         }
 
-        desired = customer_cleanup._collect_desired_sources(payload)
+        # A blank country falls back to the site's default country, so these two
+        # addresses collapse to one signature. Pin that default instead of
+        # reading it off whichever site the suite runs on: on a fresh CI site it
+        # is unset, the blank country stays blank, the signatures stop matching,
+        # and the test fails on the environment rather than on the behaviour.
+        with patch.object(frappe.defaults, "get_global_default", return_value="Egypt"):
+            desired = customer_cleanup._collect_desired_sources(payload)
 
         self.assertEqual(len(desired["signatures"]), 1)
         signature = next(iter(desired["signatures"].keys()))
