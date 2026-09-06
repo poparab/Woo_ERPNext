@@ -505,6 +505,21 @@ def ensure_custom_fields():  # pragma: no cover - install / migration helper
     for spec in REQUIRED_FIELDS:
         dt = spec["dt"]
         fn = spec["fieldname"]
+        # Skip fields whose target DocType is not installed on this site.
+        # REQUIRED_FIELDS carries one entry for "Jarz Bundle", which belongs to
+        # jarz_pos, not to this app -- the two are meant to be independent, and
+        # this is the one place the Woo side reaches across. On the servers both
+        # apps are installed, so the field is created exactly as before; on a site
+        # without jarz_pos the Custom Field insert died with "Could not find
+        # DocType: Jarz Bundle" and took the whole install down with it, which is
+        # why this app could never be installed standalone -- and why CI could
+        # never get as far as running a test. Skipping is right rather than merely
+        # convenient: a field on an absent DocType has nothing to describe.
+        if not frappe.db.exists("DocType", dt):
+            frappe.logger("woo").info(
+                f"skipping custom field {dt}-{fn}: DocType {dt!r} is not installed"
+            )
+            continue
         # Skip if already present in DocType meta (standard or previously added custom field)
         try:
             meta = frappe.get_meta(dt)
