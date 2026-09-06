@@ -4,11 +4,18 @@ name: CI
 on:
   push:
     branches:
+      - main
       - develop
   pull_request:
+  workflow_dispatch:
 
 concurrency:
-  group: develop-jarz_woocommerce_integration-${{ github.event.number }}
+  # github.event.number is empty on a push, so without the sha fallback every
+  # push shares one group and cancel-in-progress makes each new push kill the
+  # previous commit's run, leaving that commit permanently unverified. Harmless
+  # while this only ran on develop (which nothing pushes to); not harmless now
+  # that main -- the branch this repo actually uses -- is covered.
+  group: ci-jarz_woocommerce_integration-${{ github.event.number || github.sha }}
   cancel-in-progress: true
 
 jobs:

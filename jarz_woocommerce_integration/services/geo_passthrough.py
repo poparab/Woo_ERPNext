@@ -50,11 +50,13 @@ shared source of truth -- ``tests/test_geo_passthrough.py`` holds the drift guar
 that keeps the two tables identical.
 
 **3b. Accuracy travels with the coordinates.**
-Any write that *moves* the pin also writes the accuracy, or explicitly NULLs it
-when the incoming source carries none. Woo pins carry none, so they NULL it: a
-radius measured for the previous point does not describe the new one, and
+Any write that *moves* the pin also writes the accuracy, or explicitly clears it
+to 0 when the incoming source carries none. Woo pins carry none, so they zero it:
+a radius measured for the previous point does not describe the new one, and
 leaving it silently corrupts the downstream consensus-hardening job. Accuracy is
 preserved when the coordinates are unchanged, because it is still true of them.
+Cleared to 0 rather than NULL because Frappe Float columns are NOT NULL DEFAULT
+0 -- see the note at the write site.
 
 **4. Only WooCommerce payloads are a source of ``customer_pin``.**
 This module deliberately does not scrape the stored ``address_line2``

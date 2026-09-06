@@ -419,8 +419,8 @@ class TestApplyGeoPin(unittest.TestCase):
             "custom_geo_source": "customer_pin",
             "custom_geo_confidence": CUSTOMER_PIN_RANK,
             # The pin moved (from nothing), so accuracy is written -- explicitly
-            # NULL, because a Woo payload carries none. Contract section 3.
-            "custom_geo_accuracy_m": None,
+            # 0, because a Woo payload carries none. Contract section 3.
+            "custom_geo_accuracy_m": 0.0,
         })
 
     def test_write_never_touches_the_document_layer(self):
@@ -542,12 +542,19 @@ class TestApplyGeoPin(unittest.TestCase):
 class TestAccuracyTravelsWithTheCoordinates(unittest.TestCase):
     """Contract section 3: a write that moves the pin must write accuracy too.
 
-    Woo pins carry no accuracy, so they NULL it. Leaving the previous value
-    behind produces a radius describing a point that is no longer there, which
-    silently corrupts the consensus-hardening job downstream.
+    Woo pins carry no accuracy, so they clear it to 0. Leaving the previous
+    value behind produces a radius describing a point that is no longer there,
+    which silently corrupts the consensus-hardening job downstream.
+
+    Cleared to 0 and not to NULL: Frappe creates Float columns NOT NULL
+    DEFAULT 0, so writing None raises (1048) and takes the whole pin write with
+    it -- which is what 2cbe203 fixed after every Woo pin write was failing on
+    staging. 0 means "no accuracy reported", not "accurate to 0 m". A mocked
+    set_value accepts None happily, so only these assertions keep the tests
+    honest about what the live column does.
     """
 
-    def test_stale_accuracy_is_nulled_when_a_woo_pin_overwrites_another_source(self):
+    def test_stale_accuracy_is_cleared_when_a_woo_pin_overwrites_another_source(self):
         # A pos_link pin (rank 20) measured to 4.5 m, now superseded by a
         # customer_pin (rank 30) at a genuinely different point.
         row = {
@@ -563,8 +570,9 @@ class TestAccuracyTravelsWithTheCoordinates(unittest.TestCase):
         self.assertTrue(applied)
         payload = writes[0]["fieldname"]
         self.assertIn("custom_geo_accuracy_m", payload)
-        self.assertIsNone(
+        self.assertEqual(
             payload["custom_geo_accuracy_m"],
+            0.0,
             "The 4.5 m radius describes the old point, not this one.",
         )
         self.assertNotEqual(payload["custom_geo_accuracy_m"], 4.5)
@@ -580,9 +588,9 @@ class TestAccuracyTravelsWithTheCoordinates(unittest.TestCase):
         with _patched_db(row) as writes:
             geo_passthrough.apply_geo_pin("ADDR-1", *CAIRO)
         self.assertIn("custom_geo_accuracy_m", writes[0]["fieldname"])
-        self.assertIsNone(writes[0]["fieldname"]["custom_geo_accuracy_m"])
+        self.assertEqual(writes[0]["fieldname"]["custom_geo_accuracy_m"], 0.0)
 
-    def test_a_first_pin_writes_a_null_accuracy_rather_than_omitting_it(self):
+    def test_a_first_pin_writes_a_zeroed_accuracy_rather_than_omitting_it(self):
         row = {
             "custom_geo_source": None,
             "custom_geo_confidence": 0,
@@ -591,7 +599,7 @@ class TestAccuracyTravelsWithTheCoordinates(unittest.TestCase):
         }
         with _patched_db(row) as writes:
             geo_passthrough.apply_geo_pin("ADDR-1", *CAIRO)
-        self.assertIsNone(writes[0]["fieldname"]["custom_geo_accuracy_m"])
+        self.assertEqual(writes[0]["fieldname"]["custom_geo_accuracy_m"], 0.0)
 
     def test_a_supplied_accuracy_is_written_not_nulled(self):
         row = {
