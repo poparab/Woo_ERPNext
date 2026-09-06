@@ -9,10 +9,18 @@ calls ``frappe.rename_doc(..., merge=True, ignore_permissions=True)`` with no
 gate at all, so any logged-in session could permanently merge and delete
 Customer records site-wide.
 
-This module gives every endpoint in the app the same two gates, mirroring the
-sibling ``jarz_pos`` app's ``_ensure_manager_access()`` pattern
+This module gives every endpoint a LOGGED-IN USER can reach the same two gates,
+mirroring the sibling ``jarz_pos`` app's ``_ensure_manager_access()`` pattern
 (``jarz_pos/api/cash_transfer.py``) and its ``constants.ROLES`` class — without
 importing from ``jarz_pos``. The two apps must never import from each other.
+
+Deliberately NOT covered here, because a role check is the wrong control for
+them: the webhook receivers in ``api/webhooks.py`` and ``api/webhook.py`` are
+called by WooCommerce itself rather than by a person, and are verified by HMAC
+signature; the developer-mode helpers alongside them gate on ``developer_mode``
+plus System Settings write. Read "every endpoint" below as "every endpoint with
+a human caller" — an earlier version of this docstring claimed more than the
+module delivers, which is how ``api/manual_sync.py`` sat ungated behind it.
 
 Two tiers:
 

@@ -6,7 +6,7 @@ is an explicit manual override from an authorised user.
 """
 
 import frappe
-from jarz_woocommerce_integration.services import sync_events
+from jarz_woocommerce_integration.services import access, sync_events
 from jarz_woocommerce_integration.services.outbound_sync import (
     sync_sales_invoice,
     sync_customer,
@@ -16,6 +16,7 @@ from jarz_woocommerce_integration.services.outbound_sync import (
 @frappe.whitelist()
 def push_sales_invoice(invoice_name: str) -> dict:
     """Manually push a Sales Invoice to WooCommerce."""
+    access.ensure_operator_access()
     frappe.has_permission("Sales Invoice", "write", invoice_name, throw=True)
     try:
         result = sync_sales_invoice(invoice_name, reason="manual_button", force=True)
@@ -38,6 +39,7 @@ def push_sales_invoice(invoice_name: str) -> dict:
 @frappe.whitelist()
 def push_customer(customer_name: str) -> dict:
     """Manually push a Customer to WooCommerce."""
+    access.ensure_operator_access()
     frappe.has_permission("Customer", "write", customer_name, throw=True)
     try:
         result = sync_customer(customer_name, reason="manual_button", force=True)

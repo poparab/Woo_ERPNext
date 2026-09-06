@@ -25,6 +25,7 @@ import frappe
 
 from jarz_woocommerce_integration.api import customers as customers_api
 from jarz_woocommerce_integration.api import geo as geo_api
+from jarz_woocommerce_integration.api import manual_sync as manual_sync_api
 from jarz_woocommerce_integration.api import sync_events as sync_event_api
 from jarz_woocommerce_integration.api import territories as territories_api
 from jarz_woocommerce_integration.constants import ROLES
@@ -277,6 +278,89 @@ class TestSpotCheckOperatorGatedEndpoints(unittest.TestCase):
              patch.object(geo_api.frappe, "has_permission", return_value=True) as has_permission:
             geo_api._ensure_geo_permission()  # must not raise
         has_permission.assert_called_once_with("Address", ptype="write", throw=True)
+
+
+class TestManualSyncGates(unittest.TestCase):
+    """``push_sales_invoice`` / ``push_customer`` previously checked only
+    ``frappe.has_permission(<doctype>, "write", <name>)`` — no operator gate —
+    while calling the outbound sync with ``force=True``, which (per
+    ``services/outbound_sync``'s own contract) bypasses the
+    ``enable_outbound_*`` settings check. That meant anyone with plain
+    Sales Invoice/Customer write permission could force a customer-visible
+    WooCommerce email. This is the regression coverage for that hole.
+    """
+
+    def test_push_sales_invoice_refuses_unprivileged_user_with_record_write(self):
+        has_permission = unittest.mock.MagicMock(return_value=True)
+        with patch.object(manual_sync_api.frappe, "session", _session("random@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["Sales User"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", has_permission):
+            with self.assertRaises(frappe.PermissionError):
+                manual_sync_api.push_sales_invoice("SINV-0001")
+        has_permission.assert_not_called()
+
+    def test_push_customer_refuses_unprivileged_user_with_record_write(self):
+        has_permission = unittest.mock.MagicMock(return_value=True)
+        with patch.object(manual_sync_api.frappe, "session", _session("random@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["Sales User"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", has_permission):
+            with self.assertRaises(frappe.PermissionError):
+                manual_sync_api.push_customer("CUST-0001")
+        has_permission.assert_not_called()
+
+    def test_push_sales_invoice_allows_jarz_manager(self):
+        with patch.object(manual_sync_api.frappe, "session", _session("jarz@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["JARZ Manager"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", return_value=True), \
+             patch.object(manual_sync_api, "sync_sales_invoice", return_value={"ok": True}), \
+             patch.object(manual_sync_api.sync_events, "record_manual_push_audit_event"):
+            result = manual_sync_api.push_sales_invoice("SINV-0001")
+        self.assertEqual(result, {"ok": True})
+
+    def test_push_sales_invoice_allows_sync_operator(self):
+        with patch.object(manual_sync_api.frappe, "session", _session("ops@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["WooCommerce Sync Operator"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", return_value=True), \
+             patch.object(manual_sync_api, "sync_sales_invoice", return_value={"ok": True}), \
+             patch.object(manual_sync_api.sync_events, "record_manual_push_audit_event"):
+            result = manual_sync_api.push_sales_invoice("SINV-0001")
+        self.assertEqual(result, {"ok": True})
+
+    def test_push_sales_invoice_allows_system_manager(self):
+        with patch.object(manual_sync_api.frappe, "session", _session("manager@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["System Manager"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", return_value=True), \
+             patch.object(manual_sync_api, "sync_sales_invoice", return_value={"ok": True}), \
+             patch.object(manual_sync_api.sync_events, "record_manual_push_audit_event"):
+            result = manual_sync_api.push_sales_invoice("SINV-0001")
+        self.assertEqual(result, {"ok": True})
+
+    def test_push_customer_allows_jarz_manager(self):
+        with patch.object(manual_sync_api.frappe, "session", _session("jarz@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["JARZ Manager"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", return_value=True), \
+             patch.object(manual_sync_api, "sync_customer", return_value={"ok": True}), \
+             patch.object(manual_sync_api.sync_events, "record_manual_push_audit_event"):
+            result = manual_sync_api.push_customer("CUST-0001")
+        self.assertEqual(result, {"ok": True})
+
+    def test_push_customer_allows_sync_operator(self):
+        with patch.object(manual_sync_api.frappe, "session", _session("ops@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["WooCommerce Sync Operator"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", return_value=True), \
+             patch.object(manual_sync_api, "sync_customer", return_value={"ok": True}), \
+             patch.object(manual_sync_api.sync_events, "record_manual_push_audit_event"):
+            result = manual_sync_api.push_customer("CUST-0001")
+        self.assertEqual(result, {"ok": True})
+
+    def test_push_customer_allows_system_manager(self):
+        with patch.object(manual_sync_api.frappe, "session", _session("manager@example.com")), \
+             patch.object(manual_sync_api.frappe, "get_roles", return_value=["System Manager"]), \
+             patch.object(manual_sync_api.frappe, "has_permission", return_value=True), \
+             patch.object(manual_sync_api, "sync_customer", return_value={"ok": True}), \
+             patch.object(manual_sync_api.sync_events, "record_manual_push_audit_event"):
+            result = manual_sync_api.push_customer("CUST-0001")
+        self.assertEqual(result, {"ok": True})
 
 
 if __name__ == "__main__":
