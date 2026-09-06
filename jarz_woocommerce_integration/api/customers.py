@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import frappe
+from jarz_woocommerce_integration.services import access
 from jarz_woocommerce_integration.services.customer_bulk_sync import sync_all_customers
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
@@ -15,12 +16,15 @@ def sync_all(per_page: int = 100, max_pages: int | None = None) -> dict:
     Example REST call:
     /api/method/jarz_woocommerce_integration.api.customers.sync_all?per_page=100
     """
+    access.ensure_operator_access()
     return {"success": True, "data": sync_all_customers(per_page=per_page, max_pages=max_pages)}
 
 
 @frappe.whitelist(allow_guest=False)
 def debug_customer(email: str):
     """Return Woo raw customer (first match) and ERPNext objects for a given email."""
+    # System Manager only: returns Customer PII (name, address, etc.) by email lookup.
+    access.ensure_system_manager()
     email = (email or "").strip().lower()
     if not email:
         frappe.throw("email required")
@@ -74,6 +78,7 @@ def customer_field_summary(limit: int = 20):
     Args:
         limit: number of customers to sample (pagination first pages)
     """
+    access.ensure_operator_access()
     settings = WooCommerceSettings.get_settings()
     client = WooClient(
         base_url=settings.base_url,

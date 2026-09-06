@@ -9,14 +9,18 @@ import frappe
 from frappe import _
 from frappe.utils import now_datetime
 
+from jarz_woocommerce_integration.constants import ROLES
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
 	WooCommerceSettings,
 )
-from jarz_woocommerce_integration.services import sync_events
+from jarz_woocommerce_integration.services import access, sync_events
 
 
 EVENT_DOCTYPE = sync_events.EVENT_DOCTYPE
-OPERATOR_ROLES = {"System Manager", "WooCommerce Sync Operator"}
+#: Kept as its own name (rather than a bare reference to ``ROLES.OPERATOR``)
+#: since this module owns an extra fallback branch (``frappe.has_permission``)
+#: that the shared helper deliberately does not have.
+OPERATOR_ROLES = set(ROLES.OPERATOR)
 ATTENTION_STATUSES = ("Failed", "NeedsReview", "DeadLetter")
 OPEN_STATUSES = ("Pending", "RetryScheduled", "Processing")
 RETRYABLE_STATUSES = ("Pending", "RetryScheduled", "Failed", "NeedsReview", "DeadLetter")
@@ -51,11 +55,17 @@ EVENT_LIST_FIELDS = [
 
 
 def _require_sync_event_access(*, write: bool = False) -> None:
-	if frappe.session.user == "Administrator":
+	# Delegates the Administrator / operator-role check to the shared helper —
+	# same membership as `OPERATOR_ROLES` above. This module additionally
+	# falls back to a generic `frappe.has_permission` check on the doctype
+	# itself, which the shared helper deliberately does not do (widening it
+	# there would loosen every other endpoint that calls it). That fallback
+	# is preserved here exactly as it behaved before this refactor.
+	try:
+		access.ensure_operator_access()
 		return
-	roles = set(frappe.get_roles() or [])
-	if roles.intersection(OPERATOR_ROLES):
-		return
+	except frappe.PermissionError:
+		pass
 	if frappe.has_permission(EVENT_DOCTYPE, ptype="write" if write else "read"):
 		return
 	frappe.throw(_("Not permitted to access WooCommerce Sync operations"), frappe.PermissionError)

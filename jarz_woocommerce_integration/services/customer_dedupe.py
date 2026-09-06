@@ -48,6 +48,7 @@ import frappe
 # happens to be executing it.
 from frappe.model.rename_doc import rename_doc
 
+from jarz_woocommerce_integration.services import access
 from jarz_woocommerce_integration.services.customer_sync import (
     _normalize_phone,
     _suppress_woo_outbound,
@@ -511,6 +512,7 @@ def run_dedupe(apply: bool = False, limit: int | None = None,
     hundreds of Customers, and without this each one would queue a push and
     rewrite the store.
     """
+    access.ensure_system_manager()
     apply = frappe.utils.cint(apply) == 1 if isinstance(apply, str) else bool(apply)
     restore_clean_name = (
         frappe.utils.cint(restore_clean_name) == 1
@@ -556,5 +558,71 @@ def run_dedupe(apply: bool = False, limit: int | None = None,
 
 @frappe.whitelist()
 def review_report() -> list[dict[str, Any]]:
-    """The groups this tool refuses to merge, for a human to decide on."""
-    return build_plan()["review"]
+    """The duplicate-phone groups the dedupe tool refuses to auto-merge, for a
+    human to decide on. Backs the mobile review screen.
+
+    Every entry is a group of Customer records that share a phone number but
+    could not be proven to be the same person (see the module docstring for
+    what counts as proof) — the autopilot never rewrites a Customer this
+    endpoint reports on.
+
+    Return shape — a JSON-serializable list of groups::
+
+        [
+            {
+                "group_id": "<normalized phone>",  # stable identifier for the
+                                                     # group across calls
+                "phone": "<normalized phone>",      # same value; kept under
+                                                     # its original key too
+                "size": <int>,                      # number of members
+                "reason": "<why this group was not auto-merged>",
+                "candidates": [
+                    {
+                        "name": "<Customer docname>",
+                        "customer_name": "<display name>",
+                        "phone": "<normalized phone>",
+                        "email": "<email_id, '' if none>",
+                        "created": "<creation timestamp as str>",
+                        "disabled": 0 | 1,
+                        "woo_customer_id": "<str, '' if none>",
+                        "invoice_count": <int>,           # submitted + draft
+                        "submitted_invoice_count": <int>,
+                        "revenue": <float>,                # submitted grand_total
+                    },
+                    ...
+                ],
+                "members": [ ... ],  # original shape, unchanged, kept for any
+                                      # existing caller of this function
+            },
+            ...
+        ]
+
+    ``candidates`` is the mobile-ready shape added for the review screen: flat
+    fields, no nested ``stats`` dict to unpack, cheap invoice counts computed
+    from the same batched query :func:`build_plan` already runs. ``members``
+    is the shape this function returned before and is left untouched so any
+    existing caller keeps working.
+    """
+    access.ensure_operator_access()
+    review = build_plan()["review"]
+    for entry in review:
+        entry["group_id"] = entry["phone"]
+        entry["candidates"] = [
+            {
+                "name": member["name"],
+                "customer_name": member["customer_name"],
+                "phone": entry["phone"],
+                "email": member.get("email_id") or "",
+                "created": member.get("creation") or "",
+                "disabled": int(member.get("disabled") or 0),
+                "woo_customer_id": member.get("woo_customer_id") or "",
+                "invoice_count": (
+                    int(member.get("stats", {}).get("submitted", 0) or 0)
+                    + int(member.get("stats", {}).get("draft", 0) or 0)
+                ),
+                "submitted_invoice_count": int(member.get("stats", {}).get("submitted", 0) or 0),
+                "revenue": float(member.get("stats", {}).get("revenue", 0.0) or 0.0),
+            }
+            for member in entry.get("members", [])
+        ]
+    return review

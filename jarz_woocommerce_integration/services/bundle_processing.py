@@ -11,6 +11,8 @@ import frappe
 from frappe import _
 from frappe.utils import cint, flt
 
+from jarz_woocommerce_integration.services import access
+
 
 BUNDLE_LOGGER = "jarz_woocommerce.bundle"
 BUNDLE_DOCTYPE = "Woo Jarz Bundle"
@@ -483,6 +485,7 @@ def validate_bundle_configuration_by_item(bundle_identifier: str) -> tuple[bool,
 
 @frappe.whitelist()
 def test_bundle_pricing(bundle_identifier: str, qty: int = 1) -> dict:
+    access.ensure_operator_access()
     processor = BundleProcessor(bundle_identifier, qty)
     processor.load_bundle()
     discount_pct, total_child_price, bundle_price = processor.calculate_child_discount_percentage()

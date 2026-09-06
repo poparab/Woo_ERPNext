@@ -19,11 +19,18 @@ from typing import Any
 
 import frappe
 
-from jarz_woocommerce_integration.services import geo_passthrough
+from jarz_woocommerce_integration.services import access, geo_passthrough
 
 
 def _ensure_geo_permission() -> None:
-    """Writing a pin is an Address write; previewing one is an Address read."""
+    """Writing a pin is an Address write; previewing one is an Address read.
+
+    A generic ``Address``/``write`` permission is not enough on its own — most
+    logged-in users can write an Address, and these endpoints exist
+    specifically for Woo sync operators to repair pins. Require the operator
+    role tier in addition to the doctype-level permission.
+    """
+    access.ensure_operator_access()
     frappe.has_permission("Address", ptype="write", throw=True)
 
 

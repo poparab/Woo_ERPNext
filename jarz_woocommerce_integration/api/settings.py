@@ -5,6 +5,7 @@ from frappe.utils.password import get_decrypted_password
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
 )
+from jarz_woocommerce_integration.services import access
 from jarz_woocommerce_integration.services.order_sync import (
     _minutes_ago_for_woo,
     pull_recent_orders_phase1,
@@ -29,6 +30,22 @@ def test_connection(base_url: str | None = None, consumer_key: str | None = None
 
     Returns:
         dict: { success: bool, store_info: {...}, rate_limit: {...} }
+    """
+    # Restricted to System Manager, not the general operator tier: unlike
+    # `test_saved_connection`, this takes an arbitrary caller-supplied
+    # base_url and makes a server-side outbound request to it (SSRF surface).
+    access.ensure_system_manager()
+    return _test_connection_impl(base_url, consumer_key, consumer_secret, api_version)
+
+
+def _test_connection_impl(base_url: str | None, consumer_key: str | None, consumer_secret: str | None, api_version: str = "v3"):
+    """Shared implementation, deliberately ungated.
+
+    Callers that already hold their own gate (``test_saved_connection``, which
+    only ever passes the URL from WooCommerce Settings — never a caller
+    -supplied one) call this directly instead of the whitelisted
+    ``test_connection`` so they are not additionally required to pass the
+    stricter System Manager check that guards the arbitrary-URL entry point.
     """
     if not (base_url and consumer_key and consumer_secret):
         frappe.throw(_("Missing required parameters: base_url, consumer_key, consumer_secret"))
@@ -72,13 +89,13 @@ def test_connection(base_url: str | None = None, consumer_key: str | None = None
 @frappe.whitelist(allow_guest=False)
 def test_saved_connection():
     """Test WooCommerce connectivity using credentials stored in WooCommerce Settings."""
-
+    access.ensure_operator_access()
     settings = WooCommerceSettings.get_settings()
     secret = get_decrypted_password("WooCommerce Settings", settings.name, "consumer_secret")
     if not (getattr(settings, "base_url", None) and getattr(settings, "consumer_key", None) and secret):
         frappe.throw(_("WooCommerce Settings are missing base_url, consumer_key, or consumer_secret"))
 
-    return test_connection(
+    return _test_connection_impl(
         base_url=settings.base_url,
         consumer_key=settings.consumer_key,
         consumer_secret=secret,
@@ -176,6 +193,7 @@ def _get_order_webhook_status_data(client: WooClient) -> dict:
 @frappe.whitelist(allow_guest=False)
 def get_order_webhook_status():
     """Inspect required Woo order webhooks on the connected store."""
+    access.ensure_operator_access()
     _settings, client = _get_saved_client()
     data = _get_order_webhook_status_data(client)
     return {"success": True, **data}
@@ -184,6 +202,7 @@ def get_order_webhook_status():
 @frappe.whitelist(allow_guest=False)
 def ensure_order_webhooks():
     """Create or reactivate the required Woo order.created and order.updated webhooks."""
+    access.ensure_system_manager()
     settings, client = _get_saved_client()
     secret = _get_saved_webhook_secret(settings)
     if not secret:
@@ -216,6 +235,7 @@ def ensure_order_webhooks():
 @frappe.whitelist(allow_guest=False)
 def validate_inbound_setup():
     """Validate the inbound Woo order pipeline prerequisites and run a tiny dry-run poll probe."""
+    access.ensure_operator_access()
     settings, client = _get_saved_client()
     webhook_status = _get_order_webhook_status_data(client)
 

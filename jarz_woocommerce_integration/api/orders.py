@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import frappe
+from jarz_woocommerce_integration.services import access
 from jarz_woocommerce_integration.services.order_sync import (
     backfill_orders_by_ids_phase1,
     create_sync_log_entry,
@@ -135,6 +136,7 @@ def pull_recent_phase1(limit: int = 20, dry_run: int = 0, force: int = 0):
         limit: max orders to evaluate (1..100)
         dry_run: if truthy, don't create anything
     """
+    access.ensure_operator_access()
     limit = max(1, min(int(limit), 100))
     return {
         "success": True,
@@ -151,6 +153,7 @@ def pull_order_phase1(order_id: int | str = None, dry_run: int = 0, force: int =
         dry_run: simulate without DB writes
         force: delete existing mapping record and reprocess
     """
+    access.ensure_operator_access()
     if not order_id:
         frappe.throw("order_id required")
     data = pull_single_order_phase1(
@@ -167,6 +170,7 @@ def backfill_order_ids_phase1(
     allow_update: int = 1,
 ):
     """Backfill a comma-separated list of Woo order ids using the standard inbound processor."""
+    access.ensure_operator_access()
     if not order_ids:
         frappe.throw("order_ids required")
 
@@ -188,6 +192,7 @@ def reconcile_recent_phase1(
     allow_update: int = 1,
 ):
     """Run the broad recent-order reconciliation sweep on demand."""
+    access.ensure_operator_access()
     data = reconcile_recent_orders_phase1(
         lookback_minutes=int(lookback_minutes or 0) or None,
         dry_run=bool(int(dry_run)),
@@ -205,6 +210,7 @@ def pull_recent_pos_profile_update():
     This is used to quickly populate Sales Invoice.pos_profile based on Territory.pos_profile
     after deploying the mapping logic, without wrestling with CLI kwargs quoting.
     """
+    access.ensure_operator_access()
     return {
         "success": True,
         "data": pull_recent_orders_phase1(limit=10, dry_run=False, force=True, allow_update=True),
@@ -232,6 +238,7 @@ def start_historical_migration(
         /api/method/jarz_woocommerce_integration.api.orders.start_historical_migration
         /api/method/jarz_woocommerce_integration.api.orders.start_historical_migration?date_from=2024-06-01&statuses=completed,cancelled
     """
+    access.ensure_system_manager()
     batch_size = max(1, min(int(batch_size or 50), 100))
 
     # Prevent launching if one is already running
@@ -274,6 +281,7 @@ def migration_status():
     Example:
         /api/method/jarz_woocommerce_integration.api.orders.migration_status
     """
+    access.ensure_operator_access()
     return {"success": True, "data": get_migration_progress()}
 
 
