@@ -201,8 +201,22 @@ doc_events = {
 # Customer incremental sync every 15 minutes
 scheduler_events = {
 	"cron": {
+		# WARNING: this key must stay unique within this dict. A duplicate
+		# "* * * * *" entry here previously shadowed process_due_sync_events —
+		# Python keeps only the last value for a repeated dict key, so the
+		# retry-queue cron silently vanished at import with no error anywhere.
+		# Any new every-minute job must be appended to this same list.
 		"* * * * *": [
-			"jarz_woocommerce_integration.services.sync_events.process_due_sync_events"
+			"jarz_woocommerce_integration.services.sync_events.process_due_sync_events",
+			# Courier positions for orders with an open trip leg. Cron is the
+			# finest granularity Frappe's scheduler offers, and DropPin asks
+			# for 20-30 s while a courier is driving, so this fires every
+			# minute and the courier app's leg-scoped fast mode supplies
+			# fixes faster than we forward them. One request per OPEN LEG,
+			# not per fix -- with one open leg per courier by construction,
+			# that is one request per active courier per minute, far inside
+			# DropPin's 300/min store-wide budget.
+			"jarz_woocommerce_integration.services.droppin_sync.push_open_leg_positions",
 		],
 		"*/15 * * * *": [
 			"jarz_woocommerce_integration.services.customer_sync.sync_customers_cron"
@@ -214,16 +228,6 @@ scheduler_events = {
 		# Live order sync every 2 minutes (creates unpaid submitted invoices, skips pending payment)
 		"*/2 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
-		],
-		# Courier positions for orders with an open trip leg. Cron is the finest
-		# granularity Frappe's scheduler offers, and DropPin asks for 20-30 s
-		# while a courier is driving, so this fires every minute and the courier
-		# app's leg-scoped fast mode supplies fixes faster than we forward them.
-		# One request per OPEN LEG, not per fix -- with one open leg per courier
-		# by construction, that is one request per active courier per minute,
-		# far inside DropPin's 300/min store-wide budget.
-		"* * * * *": [
-			"jarz_woocommerce_integration.services.droppin_sync.push_open_leg_positions"
 		],
 		# Cancelled/refunded catch-up sync every 15 minutes (by modified timestamp)
 		"7,22,37,52 * * * *": [

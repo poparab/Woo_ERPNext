@@ -195,6 +195,44 @@ class TestSafeInsertCustomer(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self._call(doc)
 
+    def test_suffix_retry_clears_sticky_name_set_flag_before_reinsert(self):
+        """flags.name_set is sticky across the failed first insert() — set_new_name()
+        short-circuits when it is already True, so clearing .name alone is not
+        enough. The retry must also reset doc.flags.name_set to False, or the
+        second insert keeps name=None."""
+        doc = _make_customer_doc()
+        doc.customer_name = "Ahmed Mohamed"
+        # Simulate the first, failed insert() having already flipped this, as
+        # real Document.insert() does before it fails.
+        doc.flags.name_set = True
+
+        def _insert_side_effect(*_a, **_kw):
+            raise frappe.DuplicateEntryError("duplicate")
+
+        with patch.object(customer_sync.frappe.db, "savepoint"), \
+             patch.object(customer_sync.frappe.db, "rollback"), \
+             patch.object(customer_sync, "_field_exists", return_value=False), \
+             patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
+             patch.object(customer_sync.frappe.db, "get_value", return_value=None), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=[]):
+            # First insert raises DuplicateEntryError; second (retry) succeeds
+            # and, crucially, must be entered with flags.name_set already False.
+            seen_name_set_on_retry = {}
+
+            def _insert(*_a, **_kw):
+                if not hasattr(_insert, "called"):
+                    _insert.called = True
+                    raise frappe.DuplicateEntryError("duplicate")
+                seen_name_set_on_retry["value"] = doc.flags.name_set
+                doc.name = "CUST-SUFFIXED"
+
+            with patch.object(doc, "insert", side_effect=_insert):
+                result = self._call(doc, woo_customer_id=None, phone_norm=None,
+                                     username=None, email=None, order_id=14476)
+
+        self.assertFalse(seen_name_set_on_retry["value"])
+        self.assertEqual(result, "CUST-SUFFIXED")
+
 
 # ---------------------------------------------------------------------------
 # _ensure_customer Redis-fallback path

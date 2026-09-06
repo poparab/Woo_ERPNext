@@ -1006,6 +1006,15 @@ def _safe_insert_customer(
         suffix = f"-{order_id}" if order_id else "-dup"
         doc.customer_name = f"{doc.customer_name}{suffix}"
         doc.name = None
+        # Document.set_new_name() short-circuits when flags.name_set is already
+        # True — and the first, failed insert() above set that flag. Clearing
+        # .name alone is NOT enough: without this, autonaming is skipped and
+        # name stays None. This currently survives only because db_insert()
+        # re-names when name is falsy and Woo Customers carry no populated
+        # child tables — see the identical, currently-triggering bug in
+        # _safe_insert_address for what happens the moment a child table is
+        # populated (e.g. Dynamic Link rows getting parent=None).
+        doc.flags.name_set = False
         doc.insert(ignore_permissions=True)
         frappe.logger("woo").warning(
             f"customer_name_suffix_applied customer='{doc.name}' order={order_id}"
@@ -1487,6 +1496,13 @@ def _safe_insert_address(
         suffix = f"-{order_id}" if order_id else "-dup"
         addr_doc.address_title = f"{addr_doc.address_title}{suffix}"
         addr_doc.name = None
+        # Document.set_new_name() short-circuits when flags.name_set is already
+        # True — and the first, failed insert() above set that flag. Clearing
+        # .name alone is NOT enough: without this, autonaming is skipped, name
+        # stays None, set_parent_in_children() stamps parent=None on the
+        # Dynamic Link child rows in Address.links, and _validate_mandatory
+        # raises MandatoryError("[Address, None]: parent"), dropping the order.
+        addr_doc.flags.name_set = False
         addr_doc.insert(ignore_permissions=True)
         frappe.logger("woo").warning(
             f"address_title_suffix_applied address='{addr_doc.name}' order={order_id}"

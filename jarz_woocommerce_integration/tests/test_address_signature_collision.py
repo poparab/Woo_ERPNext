@@ -108,6 +108,38 @@ class TestSafeInsertAddress(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self._call(addr)
 
+    def test_suffix_retry_clears_sticky_name_set_flag_before_reinsert(self):
+        """flags.name_set is sticky across the failed first insert() — set_new_name()
+        short-circuits when it is already True, so clearing .name alone is not
+        enough. Without resetting flags.name_set, the retry insert leaves
+        addr_doc.name as None, set_parent_in_children() stamps parent=None on
+        the Address.links Dynamic Link rows, and _validate_mandatory raises
+        MandatoryError("[Address, None]: parent")."""
+        addr = _make_addr_doc()
+        addr.address_title = "Ahmed Mohamed"
+        # Simulate the first, failed insert() having already flipped this, as
+        # real Document.insert() does before it fails.
+        addr.flags.name_set = True
+
+        seen_name_set_on_retry = {}
+
+        def _insert_side_effect(*_a, **_kw):
+            if not hasattr(_insert_side_effect, "called"):
+                _insert_side_effect.called = True
+                raise frappe.DuplicateEntryError("duplicate")
+            seen_name_set_on_retry["value"] = addr.flags.name_set
+            addr.name = "ADDR-SUFFIXED"
+
+        with patch.object(customer_sync.frappe.db, "savepoint"), \
+             patch.object(customer_sync.frappe.db, "rollback"), \
+             patch.object(addr, "insert", side_effect=_insert_side_effect), \
+             patch.object(customer_sync, "_find_existing_address_for_customer",
+                          return_value=None):
+            result = self._call(addr, order_id=14476)
+
+        self.assertFalse(seen_name_set_on_retry["value"])
+        self.assertEqual(result, "ADDR-SUFFIXED")
+
 
 # ---------------------------------------------------------------------------
 # _create_address — Redis lock + re-check path
