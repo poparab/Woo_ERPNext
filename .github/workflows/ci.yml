@@ -59,7 +59,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v3
         with:
-          node-version: 18
+          # frappe v16's package.json requires node >=24; 18 fails yarn install.
+          node-version: 24
           check-latest: true
 
       - name: Cache pip
