@@ -51,6 +51,14 @@ class TestEnsureOperatorAccess(unittest.TestCase):
              patch.object(access.frappe, "get_roles", return_value=["WooCommerce Sync Operator"]):
             access.ensure_operator_access()  # must not raise
 
+    def test_jarz_manager_is_allowed(self):
+        """Managers operate Woo sync. Frappe roles do not inherit, so this is
+        expressed as membership in ROLES.OPERATOR rather than by assigning the
+        dedicated operator role to each manager's user record."""
+        with patch.object(access.frappe, "session", _session("jarz@example.com")), \
+             patch.object(access.frappe, "get_roles", return_value=["JARZ Manager"]):
+            access.ensure_operator_access()  # must not raise
+
     def test_unprivileged_user_is_refused(self):
         with patch.object(access.frappe, "session", _session("random@example.com")), \
              patch.object(access.frappe, "get_roles", return_value=["Sales User"]):
@@ -75,6 +83,16 @@ class TestEnsureSystemManager(unittest.TestCase):
              patch.object(access.frappe, "get_roles", return_value=["System Manager"]):
             access.ensure_system_manager()  # must not raise
 
+    def test_jarz_manager_alone_is_refused(self):
+        """The load-bearing half of widening OPERATOR to JARZ Manager: it must
+        NOT have widened the strict tier with it. Merging customer records,
+        rewriting the live store's webhooks and calling a caller-supplied URL
+        from the server stay System-Manager-only."""
+        with patch.object(access.frappe, "session", _session("jarz@example.com")), \
+             patch.object(access.frappe, "get_roles", return_value=["JARZ Manager"]):
+            with self.assertRaises(frappe.PermissionError):
+                access.ensure_system_manager()
+
     def test_sync_operator_role_alone_is_refused(self):
         """The stricter gate: operator tier is not enough for a destructive op."""
         with patch.object(access.frappe, "session", _session("ops@example.com")), \
@@ -91,9 +109,16 @@ class TestEnsureSystemManager(unittest.TestCase):
 
 class TestRolesConstants(unittest.TestCase):
     def test_operator_set_membership(self):
-        self.assertEqual(ROLES.OPERATOR, {"System Manager", "WooCommerce Sync Operator"})
+        self.assertEqual(
+            ROLES.OPERATOR,
+            {"System Manager", "WooCommerce Sync Operator", "JARZ Manager"},
+        )
         self.assertIn(ROLES.SYSTEM_MANAGER, ROLES.OPERATOR)
         self.assertIn(ROLES.SYNC_OPERATOR, ROLES.OPERATOR)
+        self.assertIn(ROLES.JARZ_MANAGER, ROLES.OPERATOR)
+        # This set is mirrored by the Flutter client's `canAccessWooSync`
+        # getter. If they drift, the drawer offers a tile that 403s on every
+        # call behind it — update both or neither.
 
 
 class TestSyncEventsFallbackPreserved(unittest.TestCase):
