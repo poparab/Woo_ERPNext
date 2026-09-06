@@ -100,9 +100,15 @@ jobs:
       - name: Install
         working-directory: /home/runner/frappe-bench
         run: |
+          # This app's custom fields target ERPNext DocTypes (Sales Invoice,
+          # Customer, ...), so installing it on a bare frappe site fails with
+          # "Could not find DocType: Sales Invoice". The servers run erpnext
+          # 16.x alongside frappe 16.x; match that.
+          bench get-app --branch version-16 erpnext
           bench get-app jarz_woocommerce_integration $GITHUB_WORKSPACE
           bench setup requirements --dev
           bench new-site --db-root-password root --admin-password admin test_site
+          bench --site test_site install-app erpnext
           bench --site test_site install-app jarz_woocommerce_integration
           bench build
         env:
