@@ -277,7 +277,17 @@ class TestEnsureCustomerRedisFallback(unittest.TestCase):
         self.assertEqual(result, "CUST-NEW")
 
     def test_redis_unavailable_safe_insert_recovers_duplicate(self):
-        """With Redis down and a racing insert, _safe_insert_customer recovery path is hit."""
+        """With Redis down and a racing insert, _safe_insert_customer recovers.
+
+        The racing row has to be *invisible* to the lookups that run before the
+        insert and visible to the recovery lookup afterwards.  That asymmetry is
+        the race, and it is the only reason an insert is ever attempted: a
+        ``get_value`` answering ``"CUST-EXISTING"`` from the outset instead
+        resolves the order on the email step of :func:`_ensure_customer` and
+        returns without ever reaching the create branch — correct behaviour,
+        pinned by :meth:`test_existing_email_match_returns_without_inserting`,
+        but it leaves ``_safe_insert_customer`` untouched.
+        """
         insert_calls = {"n": 0}
 
         def _make_doc(fields):
@@ -293,9 +303,14 @@ class TestEnsureCustomerRedisFallback(unittest.TestCase):
             d.customer_name = fields.get("customer_name", "Unknown")
             return d
 
+        def _get_value_racing(*_a, **_kw):
+            # The concurrent worker commits between our lookup and our insert:
+            # nothing to find beforehand, the winner's row afterwards.
+            return "CUST-EXISTING" if insert_calls["n"] else None
+
         with patch.object(customer_sync.frappe, "get_doc", side_effect=_make_doc), \
-             patch.object(customer_sync.frappe.db, "get_value", return_value="CUST-EXISTING"), \
-             patch.object(customer_sync.frappe.db, "get_values", return_value=["CUST-EXISTING"]), \
+             patch.object(customer_sync.frappe.db, "get_value", side_effect=_get_value_racing), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=[]), \
              patch.object(customer_sync.frappe.db, "savepoint"), \
              patch.object(customer_sync.frappe.db, "rollback"), \
              patch.object(customer_sync, "_field_exists", return_value=False), \
@@ -308,5 +323,32 @@ class TestEnsureCustomerRedisFallback(unittest.TestCase):
 
         # Recovery should have returned the pre-existing customer
         self.assertEqual(result, "CUST-EXISTING")
-        # Insert was attempted
-        self.assertGreater(insert_calls["n"], 0)
+        # Insert was attempted — and exactly once: the recovery lookup found the
+        # racing row, so the suffix-and-retry branch must not have been reached.
+        self.assertEqual(insert_calls["n"], 1)
+
+    def test_existing_email_match_returns_without_inserting(self):
+        """An unbound exact email match resolves the order; no insert is attempted.
+
+        Step 3 of :func:`_ensure_customer` exists precisely to stop a second
+        Customer being minted for somebody already on file, so returning here
+        without reaching the create branch is the point rather than a shortcut.
+        Pinned explicitly because the race test above used to assert this by
+        accident, and so never exercised the path it is named for.
+        """
+        def _fail_on_create(fields):
+            raise AssertionError(f"no Customer should be created; got {fields!r}")
+
+        with patch.object(customer_sync.frappe, "get_doc", side_effect=_fail_on_create), \
+             patch.object(customer_sync.frappe.db, "get_value", return_value="CUST-EXISTING"), \
+             patch.object(customer_sync.frappe.db, "get_values", return_value=[]), \
+             patch.object(customer_sync, "_update_customer_identity"), \
+             patch.object(customer_sync, "_field_exists", return_value=False), \
+             patch.object(customer_sync, "find_customer_by_woo_id", return_value=None), \
+             patch("frappe.utils.background_jobs.get_redis_conn", side_effect=Exception("Redis down")):
+            result = customer_sync._ensure_customer(
+                "ahmed@example.com", "Ahmed", "Mohamed", 14476,
+                username=None, phone=None, woo_customer_id=None,
+            )
+
+        self.assertEqual(result, "CUST-EXISTING")
