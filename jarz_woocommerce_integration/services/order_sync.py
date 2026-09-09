@@ -1301,35 +1301,20 @@ def _build_bundle_selections_from_parent_meta(
     return selected_items
 
 
-def _build_bundle_selections(
+def _build_bundle_selections_from_children(
     line_items: list[dict],
     parent_product_id: int | str,
     parent_qty: int,
     cache: "MigrationCache | None" = None,
-    parent_line: dict | None = None,
 ) -> dict:
-    """Parse WooCommerce child line items to build *selected_items* for BundleProcessor.
+    """Build *selected_items* by scanning the WooSB child line items.
 
-    WooCommerce Smart Bundles (WOOSB) may send parent-specific ``_woosb_ids`` on
-    the bundle parent. When present, that metadata is preferred because it is tied
-    to a specific parent line instance. Otherwise, fall back to scanning child rows
-    whose ``meta_data`` contains ``_woosb_parent_id == parent_product_id``.
-
-    Returns
-    -------
-    dict
-        ``{item_group_name: [{"item_code": ..., "selected_qty": ...}, ...]}``
-        Empty dict when any child cannot be mapped (caller should fall back to
-        default bundle expansion).
+    Children are the rows whose ``meta_data`` carries
+    ``_woosb_parent_id == parent_product_id``. Returns ``{}`` when there are no
+    such rows, when any one of them cannot be mapped to an ERPNext Item, or when
+    a mapped Item has no ``item_group`` — a partial reconstruction is worse than
+    none, because the caller can still fall back to something truthful.
     """
-    parent_meta_selections = (
-        _build_bundle_selections_from_parent_meta(parent_line, parent_qty, cache=cache)
-        if parent_line
-        else {}
-    )
-    if parent_line and _get_line_meta_value(parent_line.get("meta_data"), "_woosb_ids"):
-        return parent_meta_selections
-
     parent_pid_str = str(parent_product_id)
 
     # Collect Woo child lines belonging to this bundle parent
@@ -1402,6 +1387,98 @@ def _build_bundle_selections(
             f"{{{', '.join(f'{g}: {len(v)} item(s)' for g, v in selected_items.items())}}}"
         )
     return selected_items
+
+
+def _count_bundle_parent_instances(
+    line_items: list[dict],
+    parent_product_id: int | str,
+) -> int:
+    """How many lines on this order are bundle-parent instances of one product.
+
+    A "parent instance" is a line for the same ``product_id`` that carries a
+    ``_woosb_ids`` of its own. Two of them means the shopper put the same bundle
+    in the cart twice with different contents each time.
+    """
+    parent_pid_str = str(parent_product_id)
+    count = 0
+    for li in line_items or []:
+        if str(li.get("product_id")) != parent_pid_str:
+            continue
+        if _get_line_meta_value(li.get("meta_data"), "_woosb_ids"):
+            count += 1
+    return count
+
+
+def _build_bundle_selections(
+    line_items: list[dict],
+    parent_product_id: int | str,
+    parent_qty: int,
+    cache: "MigrationCache | None" = None,
+    parent_line: dict | None = None,
+) -> dict:
+    """Build *selected_items* for BundleProcessor from a Woo order's bundle lines.
+
+    Precedence rule: **the child line items win over a ``_woosb_ids`` that
+    disagrees with them.**
+
+    Why. WooSB rewrites the child lines on every edit of the order, so they are
+    what the store actually bills, picks and ships. ``_woosb_ids`` is a *selection
+    string* rendered on the parent — and our own outbound sync deliberately
+    freezes the store's copy of it (``_preserve_native_bundle_selection``) rather
+    than overwrite a value the plugin wrote. That freeze made the two sources
+    drift: on Woo order 17278 (2026-09-09) a POS operator amended the jar mix of a
+    "Jarz Royal Feast", the push rewrote the children to 4/3/3 but left the parent
+    string saying 4/4/1/1, and the ``order.updated`` echo of our own push was read
+    back as a customer edit — reverting the operator's amendment and shipping the
+    wrong jars. When the two disagree, believe the children.
+
+    ``_woosb_ids`` still wins in the one case where it is the *only attributable*
+    source: two or more instances of the same bundle product on one order. Every
+    WooSB child carries ``_woosb_parent_id = <product_id>``, which is identical
+    for both parent lines, so the children cannot be split between them — whereas
+    ``_woosb_ids`` is per-parent-line. It is also the fallback whenever the child
+    scan yields nothing (no children on the payload, or a child we cannot map).
+
+    Returns
+    -------
+    dict
+        ``{item_group_name: [{"item_code": ..., "selected_qty": ...}, ...]}``
+        Empty dict when nothing could be reconstructed from either source (the
+        caller then falls back to default bundle expansion, or refuses the line
+        when the order clearly declared an explicit selection).
+    """
+    parent_woosb_ids = (
+        _get_line_meta_value(parent_line.get("meta_data"), "_woosb_ids") if parent_line else None
+    )
+    parent_meta_selections = (
+        _build_bundle_selections_from_parent_meta(parent_line, parent_qty, cache=cache)
+        if parent_line
+        else {}
+    )
+
+    # Ambiguous-by-construction case: the children of two identical bundles are
+    # indistinguishable, so only the per-line selection string can attribute them.
+    if parent_woosb_ids and _count_bundle_parent_instances(line_items, parent_product_id) > 1:
+        return parent_meta_selections
+
+    child_selections = _build_bundle_selections_from_children(
+        line_items, parent_product_id, parent_qty, cache=cache
+    )
+    if child_selections:
+        if parent_woosb_ids and child_selections != parent_meta_selections:
+            # Not an error: this is exactly the drift the rule above exists for.
+            # Logged because it is also the fingerprint of a stale frozen string.
+            frappe.logger().info(
+                "Bundle selection: child line items disagree with parent _woosb_ids on "
+                f"product {parent_product_id}; using the children (they are what the "
+                "store bills and ships)"
+            )
+        return child_selections
+
+    # No usable children (none present, or one of them was unmappable). The
+    # selection string is then the best evidence we have — better than silently
+    # expanding the bundle's defaults, which would invent a mix nobody chose.
+    return parent_meta_selections
 
 
 def _build_invoice_items(order: dict, price_list: str | None = None, cache: "MigrationCache | None" = None, is_historical: bool = False) -> Tuple[list[dict], list[dict], dict[str, Any]]:
@@ -4291,6 +4368,60 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
                     return {
                         "status": "skipped",
                         "reason": "submitted_frozen",
+                        "woo_order_id": woo_id,
+                        "invoice": inv.name,
+                    }
+
+                # --- Our own echo must never amend anything --------------------
+                # WooCommerce fires `order.updated` a second after every outbound
+                # PUT we make, and that echo is indistinguishable from a customer
+                # edit by content alone. The Order Map hash refresh was meant to
+                # absorb it, but it races: on Woo order 17278 (2026-09-09) the
+                # webhook worker read the map ~0.6s before the outbound
+                # transaction committed, saw the pre-push hash, and enqueued an
+                # amendment that reverted the operator's jar-mix edit — the wrong
+                # jars were shipped. The outbound path now sets an explicit
+                # in-flight marker BEFORE its request, which does not depend on
+                # transaction timing.
+                #
+                # Deliberately narrow: it only blocks the amendment branches
+                # below. Everything above (address correction, OFD detection,
+                # terminal cancellation) still runs, because those are safe and
+                # idempotent even on an echo.
+                outbound_echo = False
+                if hash_changed:
+                    try:
+                        from jarz_woocommerce_integration.services.outbound_sync import (
+                            outbound_push_recently_pushed,
+                        )
+
+                        outbound_echo = outbound_push_recently_pushed(woo_id)
+                    except Exception:
+                        # Import/cache trouble must not stop inbound work; we
+                        # simply lose the extra protection for this pass.
+                        outbound_echo = False
+
+                if hash_changed and outbound_echo:
+                    # No manual-review flag: this is our own write, not a customer
+                    # edit, and flagging it would train staff to ignore the flag.
+                    #
+                    # The stored hash is deliberately left ALONE. Writing the echo's
+                    # hash here would bless whatever the store currently holds; by
+                    # leaving it stale, the next order poll re-evaluates against the
+                    # real payload — which is also how a genuine customer edit that
+                    # landed inside the suppression window is still caught.
+                    create_sync_log_entry(
+                        "InboundSkip",
+                        "Skipped",
+                        f"outbound_echo_suppressed: {inv.name} — order {woo_id} was pushed "
+                        f"by this app inside the outbound suppression window; "
+                        f"treating the hash change as the echo of our own write "
+                        f"(item_lines_changed={item_lines_changed}, woo_status={woo_status!r})",
+                        woo_order_id=woo_id,
+                    )
+                    return {
+                        "status": "skipped",
+                        "reason": "outbound_echo_suppressed",
                         "woo_order_id": woo_id,
                         "invoice": inv.name,
                     }

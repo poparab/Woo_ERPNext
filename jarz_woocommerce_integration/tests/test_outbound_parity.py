@@ -686,9 +686,17 @@ class TestLineItemComparator(unittest.TestCase):
         )
 
     def test_only_the_keys_we_own_take_part(self):
+        """``_woosb_ids`` left this set when outbound started writing it again.
+
+        It was safe to compare only while `_preserve_native_bundle_selection`
+        stripped it from every payload the store already had a value for. Now
+        that we refresh it on orders we created, comparing a string whose WooSB
+        token we can only approximate — and whose attributes render ``{}`` on a
+        cold cache — would mark every bundle order dirty forever (F-18).
+        """
         self.assertEqual(
             outbound_sync._ORDER_LINE_META_KEYS_TO_COMPARE,
-            frozenset({"erpnext_item_code", "discount_percentage", "_woosb_parent_id", "_woosb_ids"}),
+            frozenset({"erpnext_item_code", "discount_percentage", "_woosb_parent_id"}),
         )
 
     def test_a_key_we_deliberately_do_not_send_is_not_compared(self):
@@ -717,32 +725,77 @@ class TestLineItemComparator(unittest.TestCase):
 
 
 class TestNativeBundleSelectionPreserved(unittest.TestCase):
-    def test_a_store_written_selection_string_is_left_alone(self):
-        payload_lines = [{
+    @staticmethod
+    def _payload_lines():
+        return [{
             "id": 5,
             "meta_data": [
                 {"key": "erpnext_item_code", "value": "BUNDLE-12446"},
                 {"key": "_woosb_ids", "value": "13780/abcd/2/{}"},
             ],
         }]
-        existing_order = {"line_items": [{
+
+    @staticmethod
+    def _existing_line():
+        return {
             "id": 5,
             "meta_data": [
                 {"key": "_woosb_ids", "value": '13780/88zq/2/{"attribute_pa_size":"medium"}'},
             ],
-        }]}
+        }
+
+    def test_a_store_written_selection_string_is_left_alone(self):
+        """A website order: the plugin's own string must survive our push."""
+        payload_lines = self._payload_lines()
+        existing_order = {
+            "created_via": "checkout",
+            "meta_data": [{"key": "_wc_order_attribution_source_type", "value": "organic"}],
+            "line_items": [self._existing_line()],
+        }
 
         outbound_sync._preserve_native_bundle_selection(payload_lines, existing_order)
 
         keys = {meta["key"] for meta in payload_lines[0]["meta_data"]}
         self.assertEqual(keys, {"erpnext_item_code"})
 
+    def test_an_order_we_created_gets_our_refreshed_selection_string(self):
+        """Woo 17278: freezing our own string is what reverted the operator's edit.
+
+        The store's copy is one WE wrote at creation; the child lines in this very
+        payload are the current truth, so the parent string must follow them.
+        """
+        payload_lines = self._payload_lines()
+        existing_order = {
+            "created_via": "checkout",  # ignored: the origin meta is decisive
+            "meta_data": [{"key": "_jarz_order_origin", "value": "ERPNext POS"}],
+            "line_items": [self._existing_line()],
+        }
+
+        outbound_sync._preserve_native_bundle_selection(payload_lines, existing_order)
+
+        values = {meta["key"]: meta["value"] for meta in payload_lines[0]["meta_data"]}
+        self.assertEqual(values["_woosb_ids"], "13780/abcd/2/{}")
+
+    def test_created_via_rest_api_alone_identifies_the_order_as_ours(self):
+        """The second signal, for orders created before the origin meta existed."""
+        payload_lines = self._payload_lines()
+        existing_order = {
+            "created_via": "rest-api",
+            "meta_data": [],
+            "line_items": [self._existing_line()],
+        }
+
+        outbound_sync._preserve_native_bundle_selection(payload_lines, existing_order)
+
+        values = {meta["key"]: meta["value"] for meta in payload_lines[0]["meta_data"]}
+        self.assertEqual(values["_woosb_ids"], "13780/abcd/2/{}")
+
     def test_our_own_selection_string_survives_when_the_store_has_none(self):
         payload_lines = [{
             "id": 5,
             "meta_data": [{"key": "_woosb_ids", "value": "13780/abcd/2/{}"}],
         }]
-        existing_order = {"line_items": [{"id": 5, "meta_data": []}]}
+        existing_order = {"created_via": "checkout", "line_items": [{"id": 5, "meta_data": []}]}
 
         outbound_sync._preserve_native_bundle_selection(payload_lines, existing_order)
 
@@ -751,9 +804,35 @@ class TestNativeBundleSelectionPreserved(unittest.TestCase):
     def test_a_brand_new_line_is_untouched(self):
         payload_lines = [{"meta_data": [{"key": "_woosb_ids", "value": "13780/abcd/2/{}"}]}]
 
-        outbound_sync._preserve_native_bundle_selection(payload_lines, {"line_items": [{"id": 9}]})
+        outbound_sync._preserve_native_bundle_selection(
+            payload_lines, {"created_via": "checkout", "line_items": [{"id": 9}]}
+        )
 
         self.assertEqual(payload_lines[0]["meta_data"][0]["key"], "_woosb_ids")
+
+
+class TestOrderIsJarzOriginated(unittest.TestCase):
+    """Be conservative: only a positive signal makes an order ours."""
+
+    def test_origin_meta_key(self):
+        self.assertTrue(outbound_sync._order_is_jarz_originated(
+            {"meta_data": [{"key": outbound_sync._ORIGIN_META_KEY, "value": "Jarz POS"}]}
+        ))
+
+    def test_created_via_rest_api_is_case_and_space_insensitive(self):
+        self.assertTrue(outbound_sync._order_is_jarz_originated({"created_via": " REST-API "}))
+
+    def test_storefront_checkout_is_not_ours(self):
+        self.assertFalse(outbound_sync._order_is_jarz_originated(
+            {"created_via": "checkout", "meta_data": [{"key": "_billing_address_index"}]}
+        ))
+
+    def test_wp_admin_order_is_not_ours(self):
+        self.assertFalse(outbound_sync._order_is_jarz_originated({"created_via": "admin"}))
+
+    def test_missing_order_is_not_ours(self):
+        self.assertFalse(outbound_sync._order_is_jarz_originated(None))
+        self.assertFalse(outbound_sync._order_is_jarz_originated({}))
 
 
 # ---------------------------------------------------------------------------

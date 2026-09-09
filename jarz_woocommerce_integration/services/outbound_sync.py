@@ -174,12 +174,91 @@ _DEFAULT_ORDER_ORIGIN_SOURCE = "ERPNext POS"
 #: (``_reduced_stock``, the variation attributes), so comparing the whole
 #: ``meta_data`` tuple meant our payload could never equal the store's and every
 #: order looked dirty forever — a PUT per sync, on every order (F-18).
+#:
+#: ``_woosb_ids`` is deliberately NOT in this set. It used to be safe to compare
+#: because `_preserve_native_bundle_selection` stripped it from every payload
+#: whenever the store already held one, so it never reached the comparison. Now
+#: that we write it on orders we created, comparing it would put us back in F-18:
+#: part 2 of each entry is a WooSB-internal token we can only approximate, and
+#: part 3 renders ``{}`` whenever the variation-attribute cache is cold, so our
+#: value can differ from the store's for reasons that have nothing to do with
+#: what was sold — and every bundle order would look dirty forever.
+#:
+#: The parent string still gets corrected: it rides along on any PUT we make for
+#: a real reason, and a changed bundle mix always is one, because the child lines
+#: move with it. It simply may never trigger a push on its own.
 _ORDER_LINE_META_KEYS_TO_COMPARE = frozenset({
     "erpnext_item_code",
     "discount_percentage",
     "_woosb_parent_id",
-    "_woosb_ids",
 })
+
+
+#: How long an outbound write keeps suppressing the inbound echo it causes.
+#: WooCommerce fires ``order.updated`` within a second or two of our PUT, but the
+#: webhook worker, the retry queue and a scheduled poll can all replay it later;
+#: three minutes covers every observed replay while staying far below the order
+#: poll interval, so a genuine customer edit made during the window is picked up
+#: on the very next poll rather than lost.
+_OUTBOUND_ECHO_TTL = 180  # seconds
+
+
+def _outbound_echo_cache_key(woo_order_id) -> str:
+    return f"woo_outbound_push_in_flight::{str(woo_order_id).strip()}"
+
+
+def _mark_outbound_push_in_flight(woo_order_id) -> None:
+    """Suppress the ``order.updated`` webhook our own write is about to cause.
+
+    Set immediately BEFORE the request, never cleared afterwards. Both halves of
+    that sentence matter.
+
+    Before, because the store fires the webhook while our request is still open:
+    on Woo order 17278 the PUT went out at 05:20:33, the webhook worker read the
+    Order Map at ~05:20:35.0, and the outbound transaction — which refreshes the
+    map's ``hash`` from the PUT response — only committed at 05:20:35.6. The
+    worker therefore compared the incoming payload against a stale hash, called
+    our own echo a customer edit, and enqueued an amendment that reverted the
+    operator's jar-mix change.
+
+    Never cleared, because clearing it at the end of the request would reopen
+    exactly that race: the delete would have to be ordered against the same
+    commit. Letting the key lapse on its TTL makes the guard independent of
+    transaction timing, which is the whole point.
+
+    Cache failures are swallowed: an echo we fail to suppress is a bad day, a
+    push we fail to make is a wrong order on the customer's screen.
+    """
+    if not woo_order_id:
+        return
+    try:
+        frappe.cache().set_value(
+            _outbound_echo_cache_key(woo_order_id), "1", expires_in_sec=_OUTBOUND_ECHO_TTL
+        )
+    except Exception:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_echo_marker_failed",
+            "woo_order_id": woo_order_id,
+        })
+
+
+def outbound_push_recently_pushed(woo_order_id) -> bool:
+    """True when we wrote this Woo order ourselves within ``_OUTBOUND_ECHO_TTL``.
+
+    Read by the inbound amendment gate (``order_sync``) to tell our own echo from
+    a real website edit.
+
+    Returns ``False`` on any cache error. Failing *closed* (treating an unknown
+    as "ours") would be safer for the echo case in isolation, but a Redis outage
+    would then silently freeze every inbound amendment on the site — a much
+    larger blast radius than the hash comparison it falls back to.
+    """
+    if not woo_order_id:
+        return False
+    try:
+        return bool(frappe.cache().get_value(_outbound_echo_cache_key(woo_order_id)))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _resolve_order_map_link_field() -> str:
@@ -3835,11 +3914,38 @@ def _attach_existing_line_ids(
     return mapped, unmapped, orphaned
 
 
+def _order_is_jarz_originated(existing_order: dict | None) -> bool:
+    """True when THIS app created the Woo order, on evidence from the store.
+
+    Two independent signals, either of which is enough:
+
+    * ``_jarz_order_origin`` in the order meta — ``_apply_origin_metadata``
+      stamps it on every order we create, and nothing else writes it.
+    * ``created_via == "rest-api"`` — WooCommerce sets this itself at creation:
+      ``checkout`` for the storefront, ``admin`` for wp-admin, ``rest-api`` for
+      the REST API. We are the only REST client on this store.
+
+    Deliberately conservative: an order we cannot positively identify as ours is
+    treated as the store's, because the cost of being wrong is asymmetric (see
+    ``_preserve_native_bundle_selection``).
+    """
+    if not isinstance(existing_order, dict):
+        return False
+
+    for entry in existing_order.get("meta_data") or []:
+        if isinstance(entry, dict) and str(entry.get("key") or "") == _ORIGIN_META_KEY:
+            return True
+
+    return str(existing_order.get("created_via") or "").strip().lower() == "rest-api"
+
+
 def _preserve_native_bundle_selection(
     payload_line_items: list[dict],
     existing_order: dict | None,
+    *,
+    order_is_ours: bool | None = None,
 ) -> None:
-    """Never overwrite a ``_woosb_ids`` the store wrote itself.
+    """Never overwrite a ``_woosb_ids`` **the store** wrote itself.
 
     Ours is *reconstructed* from ERPNext rows: the WooSB token becomes a hash of
     the item code, and the attributes object is resolved from the catalogue
@@ -3849,8 +3955,29 @@ def _preserve_native_bundle_selection(
     approximation would degrade 10,000+ Woo-origin orders on their next status
     update.
 
+    The test used to be only "the existing line already carries a ``_woosb_ids``",
+    which is true of OUR orders too — we wrote it at creation. So on a POS-created
+    order the guard froze the bundle recipe forever: a jar-mix amendment rewrote
+    the child lines and left the parent string stating the original mix. Woo order
+    17278 (2026-09-09) then had that stale string read back by the inbound gate,
+    which reverted the operator's edit and shipped the wrong jars. ``created_via``
+    is ``rest-api`` and the meta carries ``_jarz_order_origin`` on such an order,
+    so we can tell the two apart and only freeze what is genuinely the store's.
+
     Mutates ``payload_line_items`` in place, dropping only our own key.
     """
+    if order_is_ours is None:
+        order_is_ours = _order_is_jarz_originated(existing_order)
+    if order_is_ours:
+        # Our own order: the string on the store is one WE wrote, and the child
+        # lines in this very payload are the current truth. Overwrite it so the
+        # store's bundle display stays consistent with what it will ship.
+        LOGGER.info({
+            "event": "woo_outbound_native_bundle_selection_refreshed",
+            "woo_order_id": (existing_order or {}).get("id"),
+        })
+        return
+
     existing_by_id: dict[int, dict] = {}
     for entry in (existing_order or {}).get("line_items") or []:
         line_id = cint((entry or {}).get("id") or 0)
@@ -4906,6 +5033,10 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         return {"skipped": True, "reason": "already_in_sync", "woo_order_id": woo_order_id}
 
     response: Dict[str, Any]
+    # Mark BEFORE the write: WooCommerce fires `order.updated` while the request
+    # is still open, so a marker set afterwards would already have lost the race
+    # (see `_mark_outbound_push_in_flight`).
+    _mark_outbound_push_in_flight(woo_order_id)
     try:
         if woo_order_id:
             response = client.put(f"orders/{woo_order_id}", payload)
@@ -4932,6 +5063,12 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     woo_id = response.get("id") if isinstance(response, dict) else None
     woo_number = response.get("number") if isinstance(response, dict) else None
     desired_woo_status = payload.get("status") or ""
+
+    # A POST (or a PUT that 404'd into a POST) only learns the order id from the
+    # response, so the pre-write marker could not name it. Mark it now: a created
+    # order also emits webhooks, and the inbound gate keys on this id.
+    if woo_id and str(woo_id) != str(woo_order_id or ""):
+        _mark_outbound_push_in_flight(woo_id)
 
     # The store has accepted the order, so record what we know about it BEFORE
     # deciding whether we are happy with the answer. The verification guards
