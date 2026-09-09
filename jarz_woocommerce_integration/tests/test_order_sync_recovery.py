@@ -140,7 +140,17 @@ class TestOrderSyncRecovery(unittest.TestCase):
         assert summary["errors"] == 1
         assert summary["skipped"] == 0
 
-    def test_pull_single_order_phase1_locked_skip_is_not_success(self):
+    def _assert_lock_skip_is_success(self, reason: str):
+        """A pull skipped because a peer worker holds the order is a success.
+
+        This asserted ``success is False`` until 2026-09-09. It was written on
+        2026-05-22 (c5e9692); three months later ebf3146 deliberately added
+        ``locked`` and ``db_locked`` to ``SKIPPED_SUCCESS_REASONS``, because
+        counting them as errors made ``cancellation_reconcile`` report failures
+        for orders that another connection was processing correctly. The lock
+        doing its job is not a failed pull — the other worker finishes the
+        order — so the test was the stale side, not the code.
+        """
         settings = SimpleNamespace(
             base_url="https://example.com",
             consumer_key="ck_test",
@@ -162,14 +172,27 @@ class TestOrderSyncRecovery(unittest.TestCase):
         self.monkeypatch.setattr(
             order_sync,
             "process_order_phase1",
-            lambda *args, **kwargs: {"status": "skipped", "reason": "locked", "woo_order_id": 14763},
+            lambda *args, **kwargs: {"status": "skipped", "reason": reason, "woo_order_id": 14763},
         )
 
         result = order_sync.pull_single_order_phase1(14763)
 
         assert result["status"] == "skipped"
-        assert result["reason"] == "locked"
-        assert result["success"] is False
+        assert result["reason"] == reason
+        assert result["success"] is True
+
+    def test_pull_single_order_phase1_locked_skip_is_success(self):
+        assert "locked" in order_sync.SKIPPED_SUCCESS_REASONS
+        self._assert_lock_skip_is_success("locked")
+
+    def test_pull_single_order_phase1_db_locked_skip_is_success(self):
+        """``db_locked`` went into the set alongside ``locked`` and had no test.
+
+        It is the more dangerous of the two: the MySQL named lock is held for
+        the life of the worker's DB session rather than expiring on a TTL.
+        """
+        assert "db_locked" in order_sync.SKIPPED_SUCCESS_REASONS
+        self._assert_lock_skip_is_success("db_locked")
 
     def test_process_order_phase1_normalizes_duplicate_customer_error(self):
         duplicate = frappe.UniqueValidationError(
@@ -199,6 +222,51 @@ class TestOrderSyncRecovery(unittest.TestCase):
         assert result["status"] == "skipped"
         assert result["reason"] == "customer_error:internal_error"
         assert result["detail"] == "boom"
+
+    def test_process_order_phase1_customer_skip_does_not_leak_outbound_flag(self):
+        """The customer skip paths must not leave outbound suppression ON.
+
+        ``_process_order_phase1`` raises ``frappe.flags.ignore_woo_outbound``
+        before the customer work but only lowers it in a ``finally`` ~1000
+        lines further down, so all nine early returns before that ``try``
+        walked out with suppression still set. In a background worker that
+        lasts for the rest of the job: every later Customer / Address / Sales
+        Invoice save silently skips its WooCommerce push, with no error and no
+        log. The public wrapper now restores the flag on every exit path.
+
+        Without the wrapper this leak was invisible here and surfaced as an
+        unrelated failure in ``test_outbound_status_sync`` once the suite ran
+        in one process, which is how CI runs it.
+        """
+        self.monkeypatch.setattr(order_sync.frappe.flags, "ignore_woo_outbound", False)
+        _patch_customer_failure_path(self.monkeypatch, RuntimeError("boom"))
+
+        result = order_sync.process_order_phase1(
+            {"id": 15012, "status": "processing", "billing": {}, "shipping": {}},
+            SimpleNamespace(),
+        )
+
+        assert result["reason"] == "customer_error:internal_error"
+        assert not order_sync.frappe.flags.ignore_woo_outbound
+
+    def test_process_order_phase1_preserves_outer_outbound_suppression(self):
+        """Restore the previous value, not ``False``.
+
+        An inbound order processed inside an existing suppression context —
+        ``_bulk_repair_free_shipping`` (order_sync 2496/2620) and
+        ``customer_sync._suppress_woo_outbound`` both open one — must hand the
+        flag back as it found it. Resetting to ``False`` tore the outer context
+        down and let that caller's remaining saves echo back to WooCommerce.
+        """
+        self.monkeypatch.setattr(order_sync.frappe.flags, "ignore_woo_outbound", True)
+        _patch_customer_failure_path(self.monkeypatch, RuntimeError("boom"))
+
+        order_sync.process_order_phase1(
+            {"id": 15013, "status": "processing", "billing": {}, "shipping": {}},
+            SimpleNamespace(),
+        )
+
+        assert order_sync.frappe.flags.ignore_woo_outbound is True
 
     def test_refresh_order_contact_snapshot_updates_invoice_and_map(self):
         settings = SimpleNamespace(

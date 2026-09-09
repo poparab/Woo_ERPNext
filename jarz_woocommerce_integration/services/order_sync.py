@@ -3794,6 +3794,50 @@ def _unlock_order(result: dict, lock, db_lock_key: str, db_lock_acquired: bool) 
 
 def process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None, skip_payment_entry: bool = False, amended_from: "str | None" = None) -> dict:
     """Process a single Woo order into a Sales Invoice.
+
+    Thin wrapper whose only job is to keep ``frappe.flags.ignore_woo_outbound``
+    scoped to this call. ``_process_order_phase1`` raises the flag before the
+    customer work and only lowers it in a ``finally`` that sits ~1000 lines
+    later, so all nine early ``return _unlock_order(...)`` paths in between
+    (``no_address``, the three customer errors, ``unmapped_items``,
+    ``no_lines``, ``pending_payment``, ``already_mapped``, ``processing``)
+    walked out with outbound suppression still ON. In a background worker that
+    is permanent for the life of the job: every later Customer / Address /
+    Sales Invoice save silently skips its WooCommerce push, with no error and
+    no log (``outbound_sync.py`` reads the flag at 805-808, 1297 and 4917).
+
+    Restoring the *previous* value rather than ``False`` also stops an inbound
+    order from tearing down an outer suppression context — the same
+    save-and-restore ``_bulk_repair_free_shipping`` (2496/2620) and
+    ``customer_sync._suppress_woo_outbound`` already use.
+
+    Args:
+        order: WooCommerce order dict
+        settings: WooCommerce Settings singleton
+        allow_update: Whether to update existing invoices
+        is_historical: True for historical migration (paid invoices), False for live orders (unpaid)
+        cache: Optional MigrationCache for fast lookups during historical migration
+        skip_payment_entry: When True, skip Payment Entry creation even for paid completed orders.
+            Use with _run_full_historical_migration(defer_payment_entries=True) to defer PE creation
+            to a separate batch pass via _batch_create_payment_entries().
+    """
+    previous_ignore_woo_outbound = getattr(frappe.flags, "ignore_woo_outbound", False)
+    try:
+        return _process_order_phase1(
+            order,
+            settings,
+            allow_update=allow_update,
+            is_historical=is_historical,
+            cache=cache,
+            skip_payment_entry=skip_payment_entry,
+            amended_from=amended_from,
+        )
+    finally:
+        frappe.flags.ignore_woo_outbound = previous_ignore_woo_outbound
+
+
+def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_historical: bool = False, cache: "MigrationCache | None" = None, skip_payment_entry: bool = False, amended_from: "str | None" = None) -> dict:
+    """Process a single Woo order into a Sales Invoice.
     
     Args:
         order: WooCommerce order dict
@@ -4009,7 +4053,9 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
 
     # Suppress outbound sync hooks while processing inbound WooCommerce data.
     # Must be set BEFORE customer operations to prevent Customer.on_update from
-    # pushing data back to WooCommerce during migration.
+    # pushing data back to WooCommerce during migration. The public
+    # process_order_phase1 wrapper restores the previous value on every exit
+    # path, including the early returns below that precede this body's try.
     frappe.flags.ignore_woo_outbound = True
 
     # Ensure customer and at least one address before proceeding
@@ -5036,8 +5082,8 @@ def process_order_phase1(order: dict, settings, allow_update: bool = True, is_hi
             pass
         return {"status": "error", "reason": str(e), "woo_order_id": woo_id}
     finally:
-        # Always clear the outbound-suppression flag
-        frappe.flags.ignore_woo_outbound = False
+        # The outbound-suppression flag is restored by the process_order_phase1
+        # wrapper, which covers the early returns above this try as well.
         # Same release the early returns use, via _unlock_order. Idempotent, so a
         # path that already released does no harm reaching here.
         _release_order_locks(lock, db_lock_key, db_lock_acquired)
