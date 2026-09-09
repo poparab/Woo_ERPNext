@@ -1,6 +1,8 @@
+import unittest
 from types import SimpleNamespace
 
 from jarz_woocommerce_integration.services import bundle_processing, order_sync
+from jarz_woocommerce_integration.tests._monkeypatch import MonkeyPatch
 
 
 class DummyTerritoryCache:
@@ -109,641 +111,655 @@ def _fake_frappe_for_delivery_rule(rule, customer_group="Retail"):
     )
 
 
-def test_bundle_processor_aggregates_duplicate_item_group_requirements(monkeypatch):
-    bundle_doc = SimpleNamespace(
-        erpnext_item="EID-BUNDLE-PARENT",
-        items=[
-            SimpleNamespace(item_group="Medium", quantity=4),
-            SimpleNamespace(item_group="Medium", quantity=1),
-        ],
-    )
-    item_docs = {
-        "EID-BUNDLE-PARENT": SimpleNamespace(
-            name="EID-BUNDLE-PARENT",
-            item_name="The Sweet Eid",
-            standard_rate=480,
-            valuation_rate=0,
-        ),
-        "BLUEBERRY-MEDIUM": SimpleNamespace(
-            name="BLUEBERRY-MEDIUM",
-            item_name="Blueberry Medium",
-            standard_rate=120,
-            valuation_rate=0,
-        ),
-        "CHOCO-MEDIUM": SimpleNamespace(
-            name="CHOCO-MEDIUM",
-            item_name="Chocolate Medium",
-            standard_rate=120,
-            valuation_rate=0,
-        ),
-    }
-
-    def fake_get_doc(doctype, name):
-        if doctype == bundle_processing.BUNDLE_DOCTYPE:
-            assert name == "EID-BUNDLE"
-            return bundle_doc
-        if doctype == "Item":
-            return item_docs[name]
-        raise AssertionError(f"unexpected get_doc({doctype!r}, {name!r})")
-
-    def fake_get_all(doctype, filters=None, fields=None, **kwargs):
-        assert doctype == "Item"
-        assert filters["item_group"] == "Medium"
-        return [{"name": "BLUEBERRY-MEDIUM"}, {"name": "CHOCO-MEDIUM"}]
-
-    monkeypatch.setattr(bundle_processing.frappe, "get_doc", fake_get_doc)
-    monkeypatch.setattr(bundle_processing.frappe, "get_all", fake_get_all)
-    monkeypatch.setattr(
-        bundle_processing.frappe,
-        "logger",
-        lambda *args, **kwargs: SimpleNamespace(
-            info=lambda *a, **k: None,
-            warning=lambda *a, **k: None,
-        ),
-    )
-
-    processor = bundle_processing.BundleProcessor(
-        "EID-BUNDLE",
-        selected_items={
-            "Medium": [
-                {"item_code": "BLUEBERRY-MEDIUM", "selected_qty": 4},
-                {"item_code": "CHOCO-MEDIUM", "selected_qty": 1},
-            ]
-        },
-    )
-
-    processor.load_bundle()
-
-    assert [
-        (entry["item"].name, entry["qty"], entry["item_group"])
-        for entry in processor.bundle_items
-    ] == [
-        ("BLUEBERRY-MEDIUM", 4, "Medium"),
-        ("CHOCO-MEDIUM", 1, "Medium"),
-    ]
 
 
-def test_resolve_delivery_charge_policy_uses_territory_only():
-    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
-
-    decision = order_sync._resolve_delivery_charge_policy(
-        "EG6OCT",
-        has_free_shipping_bundle=False,
-        cache=cache,
-    )
-
-    assert decision == {
-        "amount": 60.0,
-        "description": "Shipping Income (EG6OCT)",
-        "reason": "territory_delivery_income",
-    }
 
 
-def test_resolve_delivery_charge_policy_honors_free_shipping_bundle():
-    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
-
-    decision = order_sync._resolve_delivery_charge_policy(
-        "EG6OCT",
-        has_free_shipping_bundle=True,
-        cache=cache,
-    )
-
-    assert decision == {
-        "amount": 0.0,
-        "description": None,
-        "reason": "free_shipping_bundle",
-    }
 
 
-def test_apply_delivery_charge_policy_replaces_existing_shipping_with_territory(monkeypatch):
-    monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
-    invoice = DummyInvoice(
-        taxes=[
-            {"charge_type": "Actual", "description": "Shipping Income (WooCommerce)", "tax_amount": 45},
-            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
-        ]
-    )
-    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
-
-    decision = order_sync._apply_delivery_charge_policy(
-        invoice,
-        territory_name="EG6OCT",
-        has_free_shipping_bundle=False,
-        cache=cache,
-    )
-
-    assert decision["changed"] is True
-    assert decision["after_rows"] == [
-        {"description": "Shipping Income (EG6OCT)", "tax_amount": 60.0}
-    ]
-    assert invoice.calculate_calls == 1
-    assert invoice.get("taxes") == [
-        {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
-        {
-            "charge_type": "Actual",
-            "description": "Shipping Income (EG6OCT)",
-            "tax_amount": 60.0,
-            "account_head": "Freight - TEST",
-        },
-    ]
 
 
-def test_apply_delivery_charge_policy_removes_shipping_for_free_bundle(monkeypatch):
-    monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
-    invoice = DummyInvoice(
-        taxes=[
-            {"charge_type": "Actual", "description": "Shipping Income (EG6OCT)", "tax_amount": 60},
-            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
-        ]
-    )
-    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
-
-    decision = order_sync._apply_delivery_charge_policy(
-        invoice,
-        territory_name="EG6OCT",
-        has_free_shipping_bundle=True,
-        cache=cache,
-    )
-
-    assert decision["changed"] is True
-    assert decision["after_rows"] == []
-    assert invoice.calculate_calls == 1
-    assert invoice.get("taxes") == [
-        {"charge_type": "Actual", "description": "VAT", "tax_amount": 14}
-    ]
 
 
-def test_apply_delivery_charge_policy_honors_delivery_promotion(monkeypatch):
-    monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
-    monkeypatch.setattr(order_sync, "frappe", _fake_frappe_for_delivery_rule(_mock_delivery_rule()))
-
-    invoice = DummyInvoice(
-        taxes=[
-            {"charge_type": "Actual", "description": "Shipping Income (EG6OCT)", "tax_amount": 60},
-            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
-        ],
-        items=[
-            {"item_code": "ITEM-1", "qty": 2, "price_list_rate": 500},
-        ],
-    )
-    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
-
-    decision = order_sync._apply_delivery_charge_policy(
-        invoice,
-        territory_name="EG6OCT",
-        has_free_shipping_bundle=False,
-        cache=cache,
-        customer_name="CUST-001",
-        pos_profile_name="Main POS",
-        channel="woo",
-    )
-
-    assert decision["reason"] == "delivery_promotion"
-    assert decision["promotion_rule_name"] == "Free Delivery >= 999 EGP"
-    assert decision["after_rows"] == []
-    assert invoice.get("taxes") == [
-        {"charge_type": "Actual", "description": "VAT", "tax_amount": 14}
-    ]
-    assert "[DELIVERY PROMO] Free Delivery >= 999 EGP | merchandise_subtotal=1000.00" in invoice.remarks
 
 
-def test_apply_delivery_charge_policy_ignores_non_woo_channel_restriction(monkeypatch):
-    monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
-    monkeypatch.setattr(
-        order_sync,
-        "frappe",
-        _fake_frappe_for_delivery_rule(_mock_delivery_rule(channels=["flutter"])),
-    )
-
-    invoice = DummyInvoice(
-        taxes=[
-            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
-        ],
-        items=[
-            {"item_code": "ITEM-1", "qty": 2, "price_list_rate": 500},
-        ],
-    )
-    cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
-
-    decision = order_sync._apply_delivery_charge_policy(
-        invoice,
-        territory_name="EG6OCT",
-        has_free_shipping_bundle=False,
-        cache=cache,
-        customer_name="CUST-001",
-        pos_profile_name="Main POS",
-        channel="woo",
-    )
-
-    assert decision["reason"] == "territory_delivery_income"
-    assert decision["after_rows"] == [
-        {"description": "Shipping Income (EG6OCT)", "tax_amount": 60.0}
-    ]
-    assert invoice.get("taxes") == [
-        {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
-        {
-            "charge_type": "Actual",
-            "description": "Shipping Income (EG6OCT)",
-            "tax_amount": 60.0,
-            "account_head": "Freight - TEST",
-        },
-    ]
-    assert invoice.remarks == ""
 
 
-def test_woo_order_has_free_shipping_when_zero_total_and_free_shipping_method():
-    assert order_sync._woo_order_has_free_shipping(
-        {
-            "shipping_total": "0.00",
-            "shipping_lines": [
-                {"method_id": "free_shipping", "method_title": "Free Delivery", "total": "0.00"}
+
+
+
+
+
+
+
+
+# The Woo 17278 bundle-echo regressions live in
+# tests/test_woo_bundle_echo_revert.py, which imports DummyBundleCache from
+# here. Keep adding tests for that behaviour there, so the incident's guards
+# stay in one readable place.
+
+
+class TestOrderSyncDelivery(unittest.TestCase):
+    """Bundle aggregation, delivery-charge policy and invoice item building."""
+
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
+
+    def test_bundle_processor_aggregates_duplicate_item_group_requirements(self):
+        bundle_doc = SimpleNamespace(
+            erpnext_item="EID-BUNDLE-PARENT",
+            items=[
+                SimpleNamespace(item_group="Medium", quantity=4),
+                SimpleNamespace(item_group="Medium", quantity=1),
             ],
+        )
+        item_docs = {
+            "EID-BUNDLE-PARENT": SimpleNamespace(
+                name="EID-BUNDLE-PARENT",
+                item_name="The Sweet Eid",
+                standard_rate=480,
+                valuation_rate=0,
+            ),
+            "BLUEBERRY-MEDIUM": SimpleNamespace(
+                name="BLUEBERRY-MEDIUM",
+                item_name="Blueberry Medium",
+                standard_rate=120,
+                valuation_rate=0,
+            ),
+            "CHOCO-MEDIUM": SimpleNamespace(
+                name="CHOCO-MEDIUM",
+                item_name="Chocolate Medium",
+                standard_rate=120,
+                valuation_rate=0,
+            ),
         }
-    ) is True
 
+        def fake_get_doc(doctype, name):
+            if doctype == bundle_processing.BUNDLE_DOCTYPE:
+                assert name == "EID-BUNDLE"
+                return bundle_doc
+            if doctype == "Item":
+                return item_docs[name]
+            raise AssertionError(f"unexpected get_doc({doctype!r}, {name!r})")
 
-def test_woo_order_has_free_shipping_rejects_positive_shipping_total():
-    assert order_sync._woo_order_has_free_shipping(
-        {
-            "shipping_total": "50.00",
-            "shipping_lines": [
-                {"method_id": "flat_rate", "method_title": "Shipping", "total": "50.00"}
+        def fake_get_all(doctype, filters=None, fields=None, **kwargs):
+            assert doctype == "Item"
+            assert filters["item_group"] == "Medium"
+            return [{"name": "BLUEBERRY-MEDIUM"}, {"name": "CHOCO-MEDIUM"}]
+
+        self.monkeypatch.setattr(bundle_processing.frappe, "get_doc", fake_get_doc)
+        self.monkeypatch.setattr(bundle_processing.frappe, "get_all", fake_get_all)
+        self.monkeypatch.setattr(
+            bundle_processing.frappe,
+            "logger",
+            lambda *args, **kwargs: SimpleNamespace(
+                info=lambda *a, **k: None,
+                warning=lambda *a, **k: None,
+            ),
+        )
+
+        processor = bundle_processing.BundleProcessor(
+            "EID-BUNDLE",
+            selected_items={
+                "Medium": [
+                    {"item_code": "BLUEBERRY-MEDIUM", "selected_qty": 4},
+                    {"item_code": "CHOCO-MEDIUM", "selected_qty": 1},
+                ]
+            },
+        )
+
+        processor.load_bundle()
+
+        assert [
+            (entry["item"].name, entry["qty"], entry["item_group"])
+            for entry in processor.bundle_items
+        ] == [
+            ("BLUEBERRY-MEDIUM", 4, "Medium"),
+            ("CHOCO-MEDIUM", 1, "Medium"),
+        ]
+
+    def test_resolve_delivery_charge_policy_uses_territory_only(self):
+        cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
+
+        decision = order_sync._resolve_delivery_charge_policy(
+            "EG6OCT",
+            has_free_shipping_bundle=False,
+            cache=cache,
+        )
+
+        assert decision == {
+            "amount": 60.0,
+            "description": "Shipping Income (EG6OCT)",
+            "reason": "territory_delivery_income",
+        }
+
+    def test_resolve_delivery_charge_policy_honors_free_shipping_bundle(self):
+        cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
+
+        decision = order_sync._resolve_delivery_charge_policy(
+            "EG6OCT",
+            has_free_shipping_bundle=True,
+            cache=cache,
+        )
+
+        assert decision == {
+            "amount": 0.0,
+            "description": None,
+            "reason": "free_shipping_bundle",
+        }
+
+    def test_apply_delivery_charge_policy_replaces_existing_shipping_with_territory(self):
+        self.monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
+        invoice = DummyInvoice(
+            taxes=[
+                {"charge_type": "Actual", "description": "Shipping Income (WooCommerce)", "tax_amount": 45},
+                {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
+            ]
+        )
+        cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
+
+        decision = order_sync._apply_delivery_charge_policy(
+            invoice,
+            territory_name="EG6OCT",
+            has_free_shipping_bundle=False,
+            cache=cache,
+        )
+
+        assert decision["changed"] is True
+        assert decision["after_rows"] == [
+            {"description": "Shipping Income (EG6OCT)", "tax_amount": 60.0}
+        ]
+        assert invoice.calculate_calls == 1
+        assert invoice.get("taxes") == [
+            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
+            {
+                "charge_type": "Actual",
+                "description": "Shipping Income (EG6OCT)",
+                "tax_amount": 60.0,
+                "account_head": "Freight - TEST",
+            },
+        ]
+
+    def test_apply_delivery_charge_policy_removes_shipping_for_free_bundle(self):
+        self.monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
+        invoice = DummyInvoice(
+            taxes=[
+                {"charge_type": "Actual", "description": "Shipping Income (EG6OCT)", "tax_amount": 60},
+                {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
+            ]
+        )
+        cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
+
+        decision = order_sync._apply_delivery_charge_policy(
+            invoice,
+            territory_name="EG6OCT",
+            has_free_shipping_bundle=True,
+            cache=cache,
+        )
+
+        assert decision["changed"] is True
+        assert decision["after_rows"] == []
+        assert invoice.calculate_calls == 1
+        assert invoice.get("taxes") == [
+            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14}
+        ]
+
+    def test_apply_delivery_charge_policy_honors_delivery_promotion(self):
+        self.monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
+        self.monkeypatch.setattr(order_sync, "frappe", _fake_frappe_for_delivery_rule(_mock_delivery_rule()))
+
+        invoice = DummyInvoice(
+            taxes=[
+                {"charge_type": "Actual", "description": "Shipping Income (EG6OCT)", "tax_amount": 60},
+                {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
             ],
-        }
-    ) is False
+            items=[
+                {"item_code": "ITEM-1", "qty": 2, "price_list_rate": 500},
+            ],
+        )
+        cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
 
+        decision = order_sync._apply_delivery_charge_policy(
+            invoice,
+            territory_name="EG6OCT",
+            has_free_shipping_bundle=False,
+            cache=cache,
+            customer_name="CUST-001",
+            pos_profile_name="Main POS",
+            channel="woo",
+        )
 
-def test_build_invoice_items_tracks_free_shipping_bundle_metadata(monkeypatch):
-    class DummyBundleProcessor:
-        def __init__(self, bundle_code, qty, selected_items=None):
-            self.bundle_code = bundle_code
-            self.qty = qty
-            self.selected_items = selected_items
-
-        def load_bundle(self):
-            return None
-
-        def get_invoice_items(self):
-            return [
-                {
-                    "item_code": "BUNDLE-PARENT",
-                    "qty": 1,
-                    "rate": 0,
-                    "price_list_rate": 100,
-                    "discount_percentage": 100,
-                    "is_bundle_parent": True,
-                }
-            ]
-
-    monkeypatch.setattr(bundle_processing, "BundleProcessor", DummyBundleProcessor)
-    cache = DummyBundleCache(bundle_code="BUNDLE-001", free_shipping=True)
-    order = {
-        "line_items": [
-            {
-                "name": "Bundle Parent",
-                "product_id": 123,
-                "variation_id": 0,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [],
-            }
+        assert decision["reason"] == "delivery_promotion"
+        assert decision["promotion_rule_name"] == "Free Delivery >= 999 EGP"
+        assert decision["after_rows"] == []
+        assert invoice.get("taxes") == [
+            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14}
         ]
-    }
+        assert "[DELIVERY PROMO] Free Delivery >= 999 EGP | merchandise_subtotal=1000.00" in invoice.remarks
 
-    items, missing, bundle_context = order_sync._build_invoice_items(order, cache=cache)
+    def test_apply_delivery_charge_policy_ignores_non_woo_channel_restriction(self):
+        self.monkeypatch.setattr(order_sync, "_get_shipping_income_account", lambda company: "Freight - TEST")
+        self.monkeypatch.setattr(
+            order_sync,
+            "frappe",
+            _fake_frappe_for_delivery_rule(_mock_delivery_rule(channels=["flutter"])),
+        )
 
-    assert missing == []
-    assert items[0]["item_code"] == "BUNDLE-PARENT"
-    assert bundle_context == {
-        "bundle_codes": ["BUNDLE-001"],
-        "free_shipping_bundle_codes": ["BUNDLE-001"],
-        "has_free_shipping_bundle": True,
-    }
+        invoice = DummyInvoice(
+            taxes=[
+                {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
+            ],
+            items=[
+                {"item_code": "ITEM-1", "qty": 2, "price_list_rate": 500},
+            ],
+        )
+        cache = DummyTerritoryCache({"EG6OCT": {"delivery_income": 60}})
 
+        decision = order_sync._apply_delivery_charge_policy(
+            invoice,
+            territory_name="EG6OCT",
+            has_free_shipping_bundle=False,
+            cache=cache,
+            customer_name="CUST-001",
+            pos_profile_name="Main POS",
+            channel="woo",
+        )
 
-def test_build_invoice_items_uses_parent_woosb_ids_per_bundle_instance(monkeypatch):
-    captured_selected_items = []
-
-    class DummyBundleProcessor:
-        def __init__(self, bundle_code, qty, selected_items=None):
-            self.bundle_code = bundle_code
-            self.qty = qty
-            self.selected_items = selected_items
-
-        def load_bundle(self):
-            captured_selected_items.append(self.selected_items)
-
-        def get_invoice_items(self):
-            return [
-                {
-                    "item_code": "BUNDLE-PARENT",
-                    "qty": 1,
-                    "rate": 0,
-                    "price_list_rate": 100,
-                    "discount_percentage": 100,
-                    "is_bundle_parent": True,
-                }
-            ]
-
-    monkeypatch.setattr(bundle_processing, "BundleProcessor", DummyBundleProcessor)
-    cache = DummyBundleCache(
-        bundle_code="BUNDLE-001",
-        free_shipping=False,
-        resolve_map={
-            "13780": "BLUEBERRY-MEDIUM",
-            "13783": "CHOCO-HAZELNUT-MEDIUM",
-            "13802": "MOLTEN-MEDIUM",
-            "13777": "STRAWBERRY-MEDIUM",
-            "13773": "REDVELVET-MEDIUM",
-            "13826": "PISTACHIO-MEDIUM",
-            "13806": "TIRAMISU-MEDIUM",
-        },
-        item_groups={
-            "BLUEBERRY-MEDIUM": "Medium",
-            "CHOCO-HAZELNUT-MEDIUM": "Medium",
-            "MOLTEN-MEDIUM": "Medium",
-            "STRAWBERRY-MEDIUM": "Medium",
-            "REDVELVET-MEDIUM": "Medium",
-            "PISTACHIO-MEDIUM": "Medium",
-            "TIRAMISU-MEDIUM": "Medium",
-        },
-    )
-    order = {
-        "line_items": [
+        assert decision["reason"] == "territory_delivery_income"
+        assert decision["after_rows"] == [
+            {"description": "Shipping Income (EG6OCT)", "tax_amount": 60.0}
+        ]
+        assert invoice.get("taxes") == [
+            {"charge_type": "Actual", "description": "VAT", "tax_amount": 14},
             {
-                "id": 48380,
-                "name": "Jarz Sweet Six",
-                "product_id": 123,
-                "variation_id": 0,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [
-                    {
-                        "key": "_woosb_ids",
-                        "value": '13780/88zq/4/{"attribute_pa_size":"medium"},13783/6mtj/1/{"attribute_pa_size":"medium"},13802/ibpt/1/{"attribute_pa_size":"medium"}',
-                    }
-                ],
-            },
-            {
-                "id": 48381,
-                "name": "Blueberry",
-                "product_id": 369,
-                "variation_id": 13780,
-                "quantity": 4,
-                "sku": "",
-                "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
-            },
-            {
-                "id": 48382,
-                "name": "Chocolate Hazelnut",
-                "product_id": 367,
-                "variation_id": 13783,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
-            },
-            {
-                "id": 48383,
-                "name": "Molten",
-                "product_id": 11162,
-                "variation_id": 13802,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
-            },
-            {
-                "id": 48384,
-                "name": "Jarz Sweet Six",
-                "product_id": 123,
-                "variation_id": 0,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [
-                    {
-                        "key": "_woosb_ids",
-                        "value": '13777/anox/2/{"attribute_pa_size":"medium"},13773/3sh1/1/{"attribute_pa_size":"medium"},13826/g497/1/{"attribute_pa_size":"medium"},13806/ch6o/2/{"attribute_pa_size":"medium"}',
-                    }
-                ],
-            },
-            {
-                "id": 48385,
-                "name": "Strawberry",
-                "product_id": 371,
-                "variation_id": 13777,
-                "quantity": 2,
-                "sku": "",
-                "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
-            },
-            {
-                "id": 48386,
-                "name": "Redvelvet",
-                "product_id": 2251,
-                "variation_id": 13773,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
-            },
-            {
-                "id": 48387,
-                "name": "Pistachio",
-                "product_id": 2286,
-                "variation_id": 13826,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
-            },
-            {
-                "id": 48388,
-                "name": "Tiramisu",
-                "product_id": 11140,
-                "variation_id": 13806,
-                "quantity": 2,
-                "sku": "",
-                "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                "charge_type": "Actual",
+                "description": "Shipping Income (EG6OCT)",
+                "tax_amount": 60.0,
+                "account_head": "Freight - TEST",
             },
         ]
-    }
+        assert invoice.remarks == ""
 
-    items, missing, bundle_context = order_sync._build_invoice_items(order, cache=cache)
-
-    assert missing == []
-    assert len(items) == 2
-    assert bundle_context == {
-        "bundle_codes": ["BUNDLE-001"],
-        "free_shipping_bundle_codes": [],
-        "has_free_shipping_bundle": False,
-    }
-    assert captured_selected_items == [
-        {
-            "Medium": [
-                {"item_code": "BLUEBERRY-MEDIUM", "selected_qty": 4},
-                {"item_code": "CHOCO-HAZELNUT-MEDIUM", "selected_qty": 1},
-                {"item_code": "MOLTEN-MEDIUM", "selected_qty": 1},
-            ]
-        },
-        {
-            "Medium": [
-                {"item_code": "STRAWBERRY-MEDIUM", "selected_qty": 2},
-                {"item_code": "REDVELVET-MEDIUM", "selected_qty": 1},
-                {"item_code": "PISTACHIO-MEDIUM", "selected_qty": 1},
-                {"item_code": "TIRAMISU-MEDIUM", "selected_qty": 2},
-            ]
-        },
-    ]
-
-
-# The Woo 17278 bundle-echo regressions deliberately do NOT live here.
-# This module is pytest-style (bare `def test_*`), and CI runs
-# `bench run-tests`, which is unittest discovery and collects none of it.
-# They are in tests/test_woo_bundle_echo_revert.py as unittest.TestCase so
-# they actually execute. Add new tests for that behaviour there.
-
-
-def test_build_invoice_items_does_not_retry_default_bundle_when_explicit_selection_fails(monkeypatch):
-    constructor_calls = []
-
-    class DummyBundleProcessor:
-        def __init__(self, bundle_code, qty, selected_items=None):
-            constructor_calls.append(selected_items)
-            self.selected_items = selected_items
-
-        def load_bundle(self):
-            raise ValueError("selection validation failed")
-
-        def get_invoice_items(self):
-            return []
-
-    monkeypatch.setattr(bundle_processing, "BundleProcessor", DummyBundleProcessor)
-    cache = DummyBundleCache(
-        bundle_code="BUNDLE-001",
-        free_shipping=False,
-        resolve_map={"13780": "BLUEBERRY-MEDIUM"},
-        item_groups={"BLUEBERRY-MEDIUM": "Medium"},
-    )
-    order = {
-        "line_items": [
+    def test_woo_order_has_free_shipping_when_zero_total_and_free_shipping_method(self):
+        assert order_sync._woo_order_has_free_shipping(
             {
-                "id": 48380,
-                "name": "Jarz Sweet Six",
-                "product_id": 123,
-                "variation_id": 0,
-                "quantity": 1,
-                "sku": "",
-                "meta_data": [
-                    {
-                        "key": "_woosb_ids",
-                        "value": '13780/88zq/1/{"attribute_pa_size":"medium"}',
-                    }
+                "shipping_total": "0.00",
+                "shipping_lines": [
+                    {"method_id": "free_shipping", "method_title": "Free Delivery", "total": "0.00"}
                 ],
             }
+        ) is True
+
+    def test_woo_order_has_free_shipping_rejects_positive_shipping_total(self):
+        assert order_sync._woo_order_has_free_shipping(
+            {
+                "shipping_total": "50.00",
+                "shipping_lines": [
+                    {"method_id": "flat_rate", "method_title": "Shipping", "total": "50.00"}
+                ],
+            }
+        ) is False
+
+    def test_build_invoice_items_tracks_free_shipping_bundle_metadata(self):
+        class DummyBundleProcessor:
+            def __init__(self, bundle_code, qty, selected_items=None):
+                self.bundle_code = bundle_code
+                self.qty = qty
+                self.selected_items = selected_items
+
+            def load_bundle(self):
+                return None
+
+            def get_invoice_items(self):
+                return [
+                    {
+                        "item_code": "BUNDLE-PARENT",
+                        "qty": 1,
+                        "rate": 0,
+                        "price_list_rate": 100,
+                        "discount_percentage": 100,
+                        "is_bundle_parent": True,
+                    }
+                ]
+
+        self.monkeypatch.setattr(bundle_processing, "BundleProcessor", DummyBundleProcessor)
+        cache = DummyBundleCache(bundle_code="BUNDLE-001", free_shipping=True)
+        order = {
+            "line_items": [
+                {
+                    "name": "Bundle Parent",
+                    "product_id": 123,
+                    "variation_id": 0,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [],
+                }
+            ]
+        }
+
+        items, missing, bundle_context = order_sync._build_invoice_items(order, cache=cache)
+
+        assert missing == []
+        assert items[0]["item_code"] == "BUNDLE-PARENT"
+        assert bundle_context == {
+            "bundle_codes": ["BUNDLE-001"],
+            "free_shipping_bundle_codes": ["BUNDLE-001"],
+            "has_free_shipping_bundle": True,
+        }
+
+    def test_build_invoice_items_uses_parent_woosb_ids_per_bundle_instance(self):
+        captured_selected_items = []
+
+        class DummyBundleProcessor:
+            def __init__(self, bundle_code, qty, selected_items=None):
+                self.bundle_code = bundle_code
+                self.qty = qty
+                self.selected_items = selected_items
+
+            def load_bundle(self):
+                captured_selected_items.append(self.selected_items)
+
+            def get_invoice_items(self):
+                return [
+                    {
+                        "item_code": "BUNDLE-PARENT",
+                        "qty": 1,
+                        "rate": 0,
+                        "price_list_rate": 100,
+                        "discount_percentage": 100,
+                        "is_bundle_parent": True,
+                    }
+                ]
+
+        self.monkeypatch.setattr(bundle_processing, "BundleProcessor", DummyBundleProcessor)
+        cache = DummyBundleCache(
+            bundle_code="BUNDLE-001",
+            free_shipping=False,
+            resolve_map={
+                "13780": "BLUEBERRY-MEDIUM",
+                "13783": "CHOCO-HAZELNUT-MEDIUM",
+                "13802": "MOLTEN-MEDIUM",
+                "13777": "STRAWBERRY-MEDIUM",
+                "13773": "REDVELVET-MEDIUM",
+                "13826": "PISTACHIO-MEDIUM",
+                "13806": "TIRAMISU-MEDIUM",
+            },
+            item_groups={
+                "BLUEBERRY-MEDIUM": "Medium",
+                "CHOCO-HAZELNUT-MEDIUM": "Medium",
+                "MOLTEN-MEDIUM": "Medium",
+                "STRAWBERRY-MEDIUM": "Medium",
+                "REDVELVET-MEDIUM": "Medium",
+                "PISTACHIO-MEDIUM": "Medium",
+                "TIRAMISU-MEDIUM": "Medium",
+            },
+        )
+        order = {
+            "line_items": [
+                {
+                    "id": 48380,
+                    "name": "Jarz Sweet Six",
+                    "product_id": 123,
+                    "variation_id": 0,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [
+                        {
+                            "key": "_woosb_ids",
+                            "value": '13780/88zq/4/{"attribute_pa_size":"medium"},13783/6mtj/1/{"attribute_pa_size":"medium"},13802/ibpt/1/{"attribute_pa_size":"medium"}',
+                        }
+                    ],
+                },
+                {
+                    "id": 48381,
+                    "name": "Blueberry",
+                    "product_id": 369,
+                    "variation_id": 13780,
+                    "quantity": 4,
+                    "sku": "",
+                    "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                },
+                {
+                    "id": 48382,
+                    "name": "Chocolate Hazelnut",
+                    "product_id": 367,
+                    "variation_id": 13783,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                },
+                {
+                    "id": 48383,
+                    "name": "Molten",
+                    "product_id": 11162,
+                    "variation_id": 13802,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                },
+                {
+                    "id": 48384,
+                    "name": "Jarz Sweet Six",
+                    "product_id": 123,
+                    "variation_id": 0,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [
+                        {
+                            "key": "_woosb_ids",
+                            "value": '13777/anox/2/{"attribute_pa_size":"medium"},13773/3sh1/1/{"attribute_pa_size":"medium"},13826/g497/1/{"attribute_pa_size":"medium"},13806/ch6o/2/{"attribute_pa_size":"medium"}',
+                        }
+                    ],
+                },
+                {
+                    "id": 48385,
+                    "name": "Strawberry",
+                    "product_id": 371,
+                    "variation_id": 13777,
+                    "quantity": 2,
+                    "sku": "",
+                    "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                },
+                {
+                    "id": 48386,
+                    "name": "Redvelvet",
+                    "product_id": 2251,
+                    "variation_id": 13773,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                },
+                {
+                    "id": 48387,
+                    "name": "Pistachio",
+                    "product_id": 2286,
+                    "variation_id": 13826,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                },
+                {
+                    "id": 48388,
+                    "name": "Tiramisu",
+                    "product_id": 11140,
+                    "variation_id": 13806,
+                    "quantity": 2,
+                    "sku": "",
+                    "meta_data": [{"key": "_woosb_parent_id", "value": "123"}],
+                },
+            ]
+        }
+
+        items, missing, bundle_context = order_sync._build_invoice_items(order, cache=cache)
+
+        assert missing == []
+        assert len(items) == 2
+        assert bundle_context == {
+            "bundle_codes": ["BUNDLE-001"],
+            "free_shipping_bundle_codes": [],
+            "has_free_shipping_bundle": False,
+        }
+        assert captured_selected_items == [
+            {
+                "Medium": [
+                    {"item_code": "BLUEBERRY-MEDIUM", "selected_qty": 4},
+                    {"item_code": "CHOCO-HAZELNUT-MEDIUM", "selected_qty": 1},
+                    {"item_code": "MOLTEN-MEDIUM", "selected_qty": 1},
+                ]
+            },
+            {
+                "Medium": [
+                    {"item_code": "STRAWBERRY-MEDIUM", "selected_qty": 2},
+                    {"item_code": "REDVELVET-MEDIUM", "selected_qty": 1},
+                    {"item_code": "PISTACHIO-MEDIUM", "selected_qty": 1},
+                    {"item_code": "TIRAMISU-MEDIUM", "selected_qty": 2},
+                ]
+            },
         ]
-    }
 
-    items, missing, bundle_context = order_sync._build_invoice_items(order, cache=cache)
+    def test_build_invoice_items_does_not_retry_default_bundle_when_explicit_selection_fails(self):
+        constructor_calls = []
 
-    assert items == []
-    assert missing == [
-        {"name": "Jarz Sweet Six", "sku": "", "product_id": 123, "reason": "bundle_error"}
-    ]
-    assert bundle_context == {
-        "bundle_codes": [],
-        "free_shipping_bundle_codes": [],
-        "has_free_shipping_bundle": False,
-    }
-    assert constructor_calls == [
-        {"Medium": [{"item_code": "BLUEBERRY-MEDIUM", "selected_qty": 1}]}
-    ]
+        class DummyBundleProcessor:
+            def __init__(self, bundle_code, qty, selected_items=None):
+                constructor_calls.append(selected_items)
+                self.selected_items = selected_items
 
+            def load_bundle(self):
+                raise ValueError("selection validation failed")
 
-def test_extract_order_contact_snapshot_prefers_shipping_recipient_and_normalizes_phone():
-    order = {
-        "id": 14504,
-        "customer_id": 991,
-        "customer_email": "billing@example.com",
-        "billing": {
-            "first_name": "Account",
-            "last_name": "Holder",
-            "email": "billing@example.com",
-            "phone": "0100 123 4567",
-        },
-        "shipping": {
-            "first_name": "Delivery",
-            "last_name": "Recipient",
-            "phone": "+20 100 123 4567",
-        },
-    }
+            def get_invoice_items(self):
+                return []
 
-    snapshot = order_sync._extract_order_contact_snapshot(order)
+        self.monkeypatch.setattr(bundle_processing, "BundleProcessor", DummyBundleProcessor)
+        cache = DummyBundleCache(
+            bundle_code="BUNDLE-001",
+            free_shipping=False,
+            resolve_map={"13780": "BLUEBERRY-MEDIUM"},
+            item_groups={"BLUEBERRY-MEDIUM": "Medium"},
+        )
+        order = {
+            "line_items": [
+                {
+                    "id": 48380,
+                    "name": "Jarz Sweet Six",
+                    "product_id": 123,
+                    "variation_id": 0,
+                    "quantity": 1,
+                    "sku": "",
+                    "meta_data": [
+                        {
+                            "key": "_woosb_ids",
+                            "value": '13780/88zq/1/{"attribute_pa_size":"medium"}',
+                        }
+                    ],
+                }
+            ]
+        }
 
-    assert snapshot["customer_name"] == "Delivery Recipient"
-    assert snapshot["woo_order_display_name"] == "Delivery Recipient"
-    assert snapshot["woo_billing_name"] == "Account Holder"
-    assert snapshot["woo_shipping_name"] == "Delivery Recipient"
-    assert snapshot["woo_order_phone"] == "+20 100 123 4567"
-    assert snapshot["woo_order_phone_normalized"] == "+201001234567"
-    assert snapshot["woo_order_email"] == "billing@example.com"
-    assert snapshot["woo_customer_id_snapshot"] == "991"
-    assert len(snapshot["woo_contact_hash"]) == 64
+        items, missing, bundle_context = order_sync._build_invoice_items(order, cache=cache)
 
+        assert items == []
+        assert missing == [
+            {"name": "Jarz Sweet Six", "sku": "", "product_id": 123, "reason": "bundle_error"}
+        ]
+        assert bundle_context == {
+            "bundle_codes": [],
+            "free_shipping_bundle_codes": [],
+            "has_free_shipping_bundle": False,
+        }
+        assert constructor_calls == [
+            {"Medium": [{"item_code": "BLUEBERRY-MEDIUM", "selected_qty": 1}]}
+        ]
 
-def test_apply_contact_snapshot_to_invoice_values_sets_display_fields():
-    order = {
-        "id": 20001,
-        "customer_email": "guest@example.com",
-        "billing": {
-            "email": "Guest@Example.com",
-        },
-        "shipping": {},
-    }
-    values = {
-        "doctype": "Sales Invoice",
-        "customer": "CUST-0001",
-    }
+    def test_extract_order_contact_snapshot_prefers_shipping_recipient_and_normalizes_phone(self):
+        order = {
+            "id": 14504,
+            "customer_id": 991,
+            "customer_email": "billing@example.com",
+            "billing": {
+                "first_name": "Account",
+                "last_name": "Holder",
+                "email": "billing@example.com",
+                "phone": "0100 123 4567",
+            },
+            "shipping": {
+                "first_name": "Delivery",
+                "last_name": "Recipient",
+                "phone": "+20 100 123 4567",
+            },
+        }
 
-    order_sync._apply_contact_snapshot_to_invoice_values(
-        values,
-        order_sync._extract_order_contact_snapshot(order),
-    )
+        snapshot = order_sync._extract_order_contact_snapshot(order)
 
-    assert values["customer_name"] == "guest@example.com"
-    assert values["woo_order_display_name"] == "guest@example.com"
-    assert values["woo_order_email"] == "guest@example.com"
-    assert values["woo_order_phone"] == ""
-    assert values["woo_contact_hash"]
+        assert snapshot["customer_name"] == "Delivery Recipient"
+        assert snapshot["woo_order_display_name"] == "Delivery Recipient"
+        assert snapshot["woo_billing_name"] == "Account Holder"
+        assert snapshot["woo_shipping_name"] == "Delivery Recipient"
+        assert snapshot["woo_order_phone"] == "+20 100 123 4567"
+        assert snapshot["woo_order_phone_normalized"] == "+201001234567"
+        assert snapshot["woo_order_email"] == "billing@example.com"
+        assert snapshot["woo_customer_id_snapshot"] == "991"
+        assert len(snapshot["woo_contact_hash"]) == 64
 
+    def test_apply_contact_snapshot_to_invoice_values_sets_display_fields(self):
+        order = {
+            "id": 20001,
+            "customer_email": "guest@example.com",
+            "billing": {
+                "email": "Guest@Example.com",
+            },
+            "shipping": {},
+        }
+        values = {
+            "doctype": "Sales Invoice",
+            "customer": "CUST-0001",
+        }
 
-def test_enqueue_delivery_charge_repost_uses_delete_cancelled_entries(monkeypatch):
-    captured = {}
+        order_sync._apply_contact_snapshot_to_invoice_values(
+            values,
+            order_sync._extract_order_contact_snapshot(order),
+        )
 
-    class DummyRepostDoc:
-        def insert(self, ignore_permissions=False):
-            captured["insert_ignore_permissions"] = ignore_permissions
+        assert values["customer_name"] == "guest@example.com"
+        assert values["woo_order_display_name"] == "guest@example.com"
+        assert values["woo_order_email"] == "guest@example.com"
+        assert values["woo_order_phone"] == ""
+        assert values["woo_contact_hash"]
 
-        def submit(self):
-            captured["submitted"] = True
+    def test_enqueue_delivery_charge_repost_uses_delete_cancelled_entries(self):
+        captured = {}
 
-    def fake_get_doc(payload):
-        captured["payload"] = payload
-        return DummyRepostDoc()
+        class DummyRepostDoc:
+            def insert(self, ignore_permissions=False):
+                captured["insert_ignore_permissions"] = ignore_permissions
 
-    monkeypatch.setattr(order_sync.frappe, "get_doc", fake_get_doc)
+            def submit(self):
+                captured["submitted"] = True
 
-    invoice = SimpleNamespace(
-        docstatus=1,
-        company="Jarz",
-        doctype="Sales Invoice",
-        name="ACC-SINV-TEST-001",
-    )
+        def fake_get_doc(payload):
+            captured["payload"] = payload
+            return DummyRepostDoc()
 
-    order_sync._enqueue_delivery_charge_repost(invoice)
+        self.monkeypatch.setattr(order_sync.frappe, "get_doc", fake_get_doc)
 
-    assert captured["payload"] == {
-        "doctype": "Repost Accounting Ledger",
-        "company": "Jarz",
-        "delete_cancelled_entries": 1,
-        "vouchers": [
-            {"voucher_type": "Sales Invoice", "voucher_no": "ACC-SINV-TEST-001"}
-        ],
-    }
-    assert captured["insert_ignore_permissions"] is True
-    assert captured["submitted"] is True
+        invoice = SimpleNamespace(
+            docstatus=1,
+            company="Jarz",
+            doctype="Sales Invoice",
+            name="ACC-SINV-TEST-001",
+        )
+
+        order_sync._enqueue_delivery_charge_repost(invoice)
+
+        assert captured["payload"] == {
+            "doctype": "Repost Accounting Ledger",
+            "company": "Jarz",
+            "delete_cancelled_entries": 1,
+            "vouchers": [
+                {"voucher_type": "Sales Invoice", "voucher_no": "ACC-SINV-TEST-001"}
+            ],
+        }
+        assert captured["insert_ignore_permissions"] is True
+        assert captured["submitted"] is True

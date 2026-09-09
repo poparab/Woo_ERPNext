@@ -20,6 +20,8 @@ Coverage:
 """
 from __future__ import annotations
 
+import unittest
+
 import sys
 import types
 from types import SimpleNamespace
@@ -27,6 +29,7 @@ from unittest.mock import MagicMock, patch, call
 
 from jarz_woocommerce_integration.services import order_sync
 from jarz_woocommerce_integration.services.order_sync import _compute_order_hash
+from jarz_woocommerce_integration.tests._monkeypatch import MonkeyPatch
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +210,7 @@ def _setup_submitted_mocks(monkeypatch, *, fake_inv, stored_hash: str = ""):
 # _compute_order_hash
 # ---------------------------------------------------------------------------
 
-class TestComputeOrderHash:
+class TestComputeOrderHash(unittest.TestCase):
     def test_same_order_same_hash(self):
         order = _make_woo_order()
         assert _compute_order_hash(order) == _compute_order_hash(order)
@@ -270,30 +273,34 @@ class TestComputeOrderHash:
 # process_order_phase1 — OFD hard-lock
 # ---------------------------------------------------------------------------
 
-class TestOFDHardLock:
-    def test_was_ofd_flag_blocks(self, monkeypatch):
+class TestOFDHardLock(unittest.TestCase):
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
+
+    def test_was_ofd_flag_blocks(self):
         fake_inv = _make_fake_inv(was_ofd=1, inv_state="Delivered")
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
         result = order_sync.process_order_phase1(
             _make_woo_order(), _make_settings(enable_amendment=1)
         )
         assert result["status"] == "skipped"
         assert result["reason"] == "out_for_delivery_locked"
 
-    def test_live_ofd_state_blocks(self, monkeypatch):
+    def test_live_ofd_state_blocks(self):
         fake_inv = _make_fake_inv(was_ofd=0, inv_state="Out for Delivery")
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
         result = order_sync.process_order_phase1(
             _make_woo_order(), _make_settings(enable_amendment=1)
         )
         assert result["status"] == "skipped"
         assert result["reason"] == "out_for_delivery_locked"
 
-    def test_non_ofd_state_proceeds_to_hash_check(self, monkeypatch):
+    def test_non_ofd_state_proceeds_to_hash_check(self):
         order = _make_woo_order()
         current_hash = _compute_order_hash(order)
         fake_inv = _make_fake_inv(was_ofd=0, inv_state="New")
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash=current_hash)
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash=current_hash)
         result = order_sync.process_order_phase1(order, _make_settings())
         # hash unchanged → submitted_frozen
         assert result["reason"] == "submitted_frozen"
@@ -303,22 +310,26 @@ class TestOFDHardLock:
 # process_order_phase1 — item-edit detection
 # ---------------------------------------------------------------------------
 
-class TestItemEditDetection:
-    def test_amended_from_bypasses_inbound_locks(self, monkeypatch):
+class TestItemEditDetection(unittest.TestCase):
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
+
+    def test_amended_from_bypasses_inbound_locks(self):
         order = _make_woo_order(status="processing")
         fake_inv = _make_fake_inv()
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
 
         fake_redis_conn = MagicMock()
         fake_redis_conn.lock.side_effect = AssertionError("inbound redis lock should be skipped")
-        monkeypatch.setattr(order_sync, "get_redis_conn", lambda: fake_redis_conn)
+        self.monkeypatch.setattr(order_sync, "get_redis_conn", lambda: fake_redis_conn)
 
         def _unexpected_sql(query, values=None, *args, **kwargs):
             if "GET_LOCK" in query:
                 raise AssertionError("inbound db lock should be skipped")
             return [[1]]
 
-        monkeypatch.setattr(order_sync.frappe.db, "sql", _unexpected_sql)
+        self.monkeypatch.setattr(order_sync.frappe.db, "sql", _unexpected_sql)
 
         result = order_sync.process_order_phase1(
             order,
@@ -330,29 +341,29 @@ class TestItemEditDetection:
         assert result["reason"] == "amendment_enqueued"
         order_sync.frappe.enqueue.assert_called_once()
 
-    def test_hash_unchanged_returns_submitted_frozen(self, monkeypatch):
+    def test_hash_unchanged_returns_submitted_frozen(self):
         order = _make_woo_order()
         current_hash = _compute_order_hash(order)
         fake_inv = _make_fake_inv()
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash=current_hash)
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash=current_hash)
         result = order_sync.process_order_phase1(order, _make_settings())
         assert result["status"] == "skipped"
         assert result["reason"] == "submitted_frozen"
 
-    def test_hash_changed_flag_off_returns_needs_manual_review(self, monkeypatch):
+    def test_hash_changed_flag_off_returns_needs_manual_review(self):
         order = _make_woo_order()
         fake_inv = _make_fake_inv()
-        logs = _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+        logs = _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
         result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=0))
         assert result["status"] == "skipped"
         assert result["reason"] == "needs_manual_review"
         logged_ops = [log.get("operation") for log in logs]
         assert "ItemEditDetected" in logged_ops
 
-    def test_hash_changed_flag_on_eligible_status_enqueues(self, monkeypatch):
+    def test_hash_changed_flag_on_eligible_status_enqueues(self):
         order = _make_woo_order(status="processing")
         fake_inv = _make_fake_inv()
-        logs = _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+        logs = _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
         result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
         assert result["status"] == "queued"
         assert result["reason"] == "amendment_enqueued"
@@ -360,10 +371,10 @@ class TestItemEditDetection:
         call_kwargs = order_sync.frappe.enqueue.call_args
         assert "order_amendment.run_woo_amendment_job" in call_kwargs[0][0]
 
-    def test_hash_changed_but_lines_match_refreshes_hash_without_amendment(self, monkeypatch):
+    def test_hash_changed_but_lines_match_refreshes_hash_without_amendment(self):
         order = _make_woo_order(status="processing", date_modified="2026-06-01T12:00:00")
         fake_inv = _make_fake_inv(items=[{"item_code": "ITEM-001", "qty": 2, "rate": 100.0}])
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="legacy-volatile-hash")
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="legacy-volatile-hash")
 
         result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
 
@@ -372,24 +383,23 @@ class TestItemEditDetection:
         order_sync.frappe.enqueue.assert_not_called()
         order_sync.frappe.db.set_value.assert_called()
 
-    def test_hash_changed_flag_on_ineligible_status_flags_manual_review(self, monkeypatch):
+    def test_hash_changed_flag_on_ineligible_status_flags_manual_review(self):
         order = _make_woo_order(status="completed")
         fake_inv = _make_fake_inv()
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
         result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
         assert result["status"] == "skipped"
         assert result["reason"] == "needs_manual_review"
         order_sync._flag_order_map_for_manual_review.assert_called_once()
 
-    # The outbound-echo suppression tests are NOT here. This class is
-    # pytest-style, and CI's `bench run-tests` is unittest discovery, which
-    # collects nothing from it. They live in
-    # tests/test_woo_bundle_echo_revert.py as unittest.TestCase.
+    # The outbound-echo suppression tests live in
+    # tests/test_woo_bundle_echo_revert.py, which imports this module's
+    # helpers. Keep adding tests for that behaviour there.
 
-    def test_on_hold_status_is_skipped_before_amendment(self, monkeypatch):
+    def test_on_hold_status_is_skipped_before_amendment(self):
         order = _make_woo_order(status="on-hold")
         fake_inv = _make_fake_inv()
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
+        _setup_submitted_mocks(self.monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
         result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
         assert result["status"] == "skipped"
         assert result["reason"] == "pending_payment"
@@ -400,20 +410,24 @@ class TestItemEditDetection:
 # run_woo_amendment_job — unit guards (pure mocking, no Frappe DB)
 # ---------------------------------------------------------------------------
 
-class TestPendingPaymentSkips:
-    def test_live_on_hold_order_skips_before_creating_map_or_invoice(self, monkeypatch):
+class TestPendingPaymentSkips(unittest.TestCase):
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
+
+    def test_live_on_hold_order_skips_before_creating_map_or_invoice(self):
         order = _make_woo_order(status="on-hold")
         created_doctypes: list[str] = []
 
         fake_lock = MagicMock()
         fake_lock.acquire.return_value = True
-        monkeypatch.setattr(order_sync, "get_redis_conn", lambda: MagicMock(lock=lambda *a, **kw: fake_lock))
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(order_sync, "get_redis_conn", lambda: MagicMock(lock=lambda *a, **kw: fake_lock))
+        self.monkeypatch.setattr(
             order_sync,
             "ensure_customer_with_addresses",
             lambda *args, **kwargs: ("Test Customer", "Billing-001", "Shipping-001"),
         )
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(
             order_sync,
             "_build_invoice_items",
             lambda *args, **kwargs: ([{"item_code": "ITEM-001", "qty": 1, "rate": 100.0}], [], {}),
@@ -439,7 +453,7 @@ class TestPendingPaymentSkips:
             utils=SimpleNamespace(now_datetime=lambda: "2026-06-01 12:00:00"),
             defaults=SimpleNamespace(get_global_default=lambda fieldname: None),
         )
-        monkeypatch.setattr(order_sync, "frappe", fake_frappe)
+        self.monkeypatch.setattr(order_sync, "frappe", fake_frappe)
 
         result = order_sync.process_order_phase1(order, _make_settings())
 
@@ -450,7 +464,7 @@ class TestPendingPaymentSkips:
         assert "Sales Invoice" not in created_doctypes
 
 
-class TestRunWooAmendmentJobGuards:
+class _RunWooAmendmentJobPatcher:
     """Test the guard logic in run_woo_amendment_job using a monkeypatched frappe."""
 
     def _patch_frappe(self, monkeypatch, *, order_map_row=None, source_si=None,
@@ -518,15 +532,19 @@ class TestRunWooAmendmentJobGuards:
         return oa
 
 
-class TestEvaluatePaidAmendment:
-    def test_unpaid_invoice_skips_paid_lane(self, monkeypatch):
+class TestEvaluatePaidAmendment(_RunWooAmendmentJobPatcher, unittest.TestCase):
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
+
+    def test_unpaid_invoice_skips_paid_lane(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
 
         source_si = _make_fake_inv(outstanding_amount=200.0, grand_total=200.0)
         settings = _make_settings(enable_amendment=1)
 
-        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: [])
-        monkeypatch.setattr(oa, "_get_payment_entry_details", lambda invoice_name, payment_entry_names=None: [])
+        self.monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: [])
+        self.monkeypatch.setattr(oa, "_get_payment_entry_details", lambda invoice_name, payment_entry_names=None: [])
 
         result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="200.00"), settings)
 
@@ -534,14 +552,14 @@ class TestEvaluatePaidAmendment:
         assert result["can_auto_amend"] is True
         assert result["block_code"] is None
 
-    def test_paid_invoice_requires_separate_flag(self, monkeypatch):
+    def test_paid_invoice_requires_separate_flag(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
 
         source_si = _make_fake_inv(outstanding_amount=0.0, grand_total=200.0)
         settings = _make_settings(enable_amendment=1)
 
-        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0001"])
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0001"])
+        self.monkeypatch.setattr(
             oa,
             "_get_payment_entry_details",
             lambda invoice_name, payment_entry_names=None: [
@@ -560,7 +578,7 @@ class TestEvaluatePaidAmendment:
         assert result["can_auto_amend"] is False
         assert result["block_code"] == "paid_amendment_disabled"
 
-    def test_paid_invoice_blocks_on_amount_delta(self, monkeypatch):
+    def test_paid_invoice_blocks_on_amount_delta(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
         from jarz_woocommerce_integration.services import order_sync
 
@@ -568,8 +586,8 @@ class TestEvaluatePaidAmendment:
         settings = _make_settings(enable_amendment=1)
         settings.enable_pre_ofd_paid_amendment = 1
 
-        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0002"])
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0002"])
+        self.monkeypatch.setattr(
             oa,
             "_get_payment_entry_details",
             lambda invoice_name, payment_entry_names=None: [
@@ -581,7 +599,7 @@ class TestEvaluatePaidAmendment:
                 }
             ],
         )
-        monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
+        self.monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
 
         result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="250.00"), settings)
 
@@ -589,7 +607,7 @@ class TestEvaluatePaidAmendment:
         assert result["can_auto_amend"] is False
         assert result["block_code"] == "paid_amendment_amount_delta"
 
-    def test_paid_invoice_same_total_simple_payment_passes(self, monkeypatch):
+    def test_paid_invoice_same_total_simple_payment_passes(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
         from jarz_woocommerce_integration.services import order_sync
 
@@ -597,8 +615,8 @@ class TestEvaluatePaidAmendment:
         settings = _make_settings(enable_amendment=1)
         settings.enable_pre_ofd_paid_amendment = 1
 
-        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0003"])
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0003"])
+        self.monkeypatch.setattr(
             oa,
             "_get_payment_entry_details",
             lambda invoice_name, payment_entry_names=None: [
@@ -610,7 +628,7 @@ class TestEvaluatePaidAmendment:
                 }
             ],
         )
-        monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
+        self.monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
 
         result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="200.00"), settings)
 
@@ -618,7 +636,7 @@ class TestEvaluatePaidAmendment:
         assert result["can_auto_amend"] is True
         assert result["block_code"] is None
 
-    def test_paid_invoice_with_clearance_date_blocks(self, monkeypatch):
+    def test_paid_invoice_with_clearance_date_blocks(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
         from jarz_woocommerce_integration.services import order_sync
 
@@ -626,8 +644,8 @@ class TestEvaluatePaidAmendment:
         settings = _make_settings(enable_amendment=1)
         settings.enable_pre_ofd_paid_amendment = 1
 
-        monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0004"])
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(oa, "_find_submitted_payment_entries", lambda invoice_name: ["ACC-PAY-0004"])
+        self.monkeypatch.setattr(
             oa,
             "_get_payment_entry_details",
             lambda invoice_name, payment_entry_names=None: [
@@ -639,7 +657,7 @@ class TestEvaluatePaidAmendment:
                 }
             ],
         )
-        monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
+        self.monkeypatch.setattr(order_sync, "_payment_entries_are_simple_for_invoice", lambda invoice_name, entries: True)
 
         result = oa._evaluate_paid_amendment(source_si, _make_woo_order(total="200.00"), settings)
 
@@ -647,43 +665,43 @@ class TestEvaluatePaidAmendment:
         assert result["can_auto_amend"] is False
         assert result["block_code"] == "paid_amendment_reconciled_payment"
 
-    def test_advisory_lock_fail_returns_skipped(self, monkeypatch):
+    def test_advisory_lock_fail_returns_skipped(self):
         import jarz_woocommerce_integration.services.order_amendment as oa
 
         def _fail_sql(query, values=None, *a, **kw):
             return [[0]]
 
-        monkeypatch.setattr(oa.frappe.db, "sql", _fail_sql)
-        monkeypatch.setattr(oa, "_write_sync_log", MagicMock())
+        self.monkeypatch.setattr(oa.frappe.db, "sql", _fail_sql)
+        self.monkeypatch.setattr(oa, "_write_sync_log", MagicMock())
         result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
         assert result["status"] == "skipped"
         assert result["reason"] == "locked"
 
-    def test_no_order_map_returns_skipped(self, monkeypatch):
-        oa = self._patch_frappe(monkeypatch, order_map_row=None)
+    def test_no_order_map_returns_skipped(self):
+        oa = self._patch_frappe(self.monkeypatch, order_map_row=None)
         result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
         assert result["status"] == "skipped"
         assert result["reason"] == "no_order_map"
 
-    def test_auto_amendment_disabled_returns_skipped_before_lookup(self, monkeypatch):
-        oa = self._patch_frappe(monkeypatch, order_map_row=None, enable_amendment=0)
+    def test_auto_amendment_disabled_returns_skipped_before_lookup(self):
+        oa = self._patch_frappe(self.monkeypatch, order_map_row=None, enable_amendment=0)
         result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
         assert result["status"] == "skipped"
         assert result["reason"] == "auto_amendment_disabled"
 
-    def test_ofd_hard_lock_blocks(self, monkeypatch):
+    def test_ofd_hard_lock_blocks(self):
         order_map_row = SimpleNamespace(
             name="WOOMAP-00001",
             erpnext_sales_invoice="ACC-SINV-99001",
             hash="oldhash",
         )
         source_si = _make_fake_inv(was_ofd=1, inv_state="Delivered")
-        oa = self._patch_frappe(monkeypatch, order_map_row=order_map_row, source_si=source_si)
+        oa = self._patch_frappe(self.monkeypatch, order_map_row=order_map_row, source_si=source_si)
         result = oa.run_woo_amendment_job(99001, _make_woo_order(), "WooCommerce Settings")
         assert result["status"] == "skipped"
         assert result["reason"] == "out_for_delivery_locked"
 
-    def test_eligibility_block_flags_review(self, monkeypatch):
+    def test_eligibility_block_flags_review(self):
         order_map_row = SimpleNamespace(
             name="WOOMAP-00001",
             erpnext_sales_invoice="ACC-SINV-99001",
@@ -696,7 +714,7 @@ class TestEvaluatePaidAmendment:
             "amendment_block_reason": "Invoice is on a delivery trip",
         }
         oa = self._patch_frappe(
-            monkeypatch,
+            self.monkeypatch,
             order_map_row=order_map_row,
             source_si=source_si,
             eligibility=eligibility,
@@ -709,7 +727,7 @@ class TestEvaluatePaidAmendment:
         assert result["status"] == "skipped"
         assert result["reason"] == "eligibility_blocked"
 
-    def test_ineligible_woo_status_flags_review(self, monkeypatch):
+    def test_ineligible_woo_status_flags_review(self):
         order_map_row = SimpleNamespace(
             name="WOOMAP-00001",
             erpnext_sales_invoice="ACC-SINV-99001",
@@ -718,7 +736,7 @@ class TestEvaluatePaidAmendment:
         source_si = _make_fake_inv()
         eligibility = {"can_amend": True, "amendment_block_code": None, "amendment_block_reason": None}
         oa = self._patch_frappe(
-            monkeypatch,
+            self.monkeypatch,
             order_map_row=order_map_row,
             source_si=source_si,
             eligibility=eligibility,
@@ -733,7 +751,7 @@ class TestEvaluatePaidAmendment:
         assert result["status"] == "skipped"
         assert result["reason"] == "woo_status_not_eligible"
 
-    def test_amend_depth_exceeded_flags_review(self, monkeypatch):
+    def test_amend_depth_exceeded_flags_review(self):
         order_map_row = SimpleNamespace(
             name="WOOMAP-00001",
             erpnext_sales_invoice="ACC-SINV-99001",
@@ -742,7 +760,7 @@ class TestEvaluatePaidAmendment:
         source_si = _make_fake_inv()
         eligibility = {"can_amend": True, "amendment_block_code": None, "amendment_block_reason": None}
         oa = self._patch_frappe(
-            monkeypatch,
+            self.monkeypatch,
             order_map_row=order_map_row,
             source_si=source_si,
             eligibility=eligibility,
@@ -756,7 +774,7 @@ class TestEvaluatePaidAmendment:
         assert result["status"] == "skipped"
         assert result["reason"] == "amend_depth_exceeded"
 
-    def test_period_closed_flags_review(self, monkeypatch):
+    def test_period_closed_flags_review(self):
         order_map_row = SimpleNamespace(
             name="WOOMAP-00001",
             erpnext_sales_invoice="ACC-SINV-99001",
@@ -765,7 +783,7 @@ class TestEvaluatePaidAmendment:
         source_si = _make_fake_inv()
         eligibility = {"can_amend": True, "amendment_block_code": None, "amendment_block_reason": None}
         oa = self._patch_frappe(
-            monkeypatch,
+            self.monkeypatch,
             order_map_row=order_map_row,
             source_si=source_si,
             eligibility=eligibility,
@@ -779,7 +797,7 @@ class TestEvaluatePaidAmendment:
         assert result["status"] == "skipped"
         assert result["reason"] == "period_closed"
 
-    def test_paid_invoice_blocked_when_paid_flag_is_off(self, monkeypatch):
+    def test_paid_invoice_blocked_when_paid_flag_is_off(self):
         order_map_row = SimpleNamespace(
             name="WOOMAP-00001",
             erpnext_sales_invoice="ACC-SINV-99001",
@@ -788,14 +806,14 @@ class TestEvaluatePaidAmendment:
         source_si = _make_fake_inv(outstanding_amount=0.0, grand_total=200.0)
         eligibility = {"can_amend": True, "amendment_block_code": None, "amendment_block_reason": None}
         oa = self._patch_frappe(
-            monkeypatch,
+            self.monkeypatch,
             order_map_row=order_map_row,
             source_si=source_si,
             eligibility=eligibility,
             enable_paid_amendment=0,
         )
-        monkeypatch.setattr(oa, "_find_existing_replacement", lambda *a, **kw: None)
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(oa, "_find_existing_replacement", lambda *a, **kw: None)
+        self.monkeypatch.setattr(
             oa,
             "_evaluate_paid_amendment",
             lambda source_si, order_payload, settings: {
@@ -819,7 +837,7 @@ class TestEvaluatePaidAmendment:
         assert result["status"] == "skipped"
         assert result["reason"] == "paid_amendment_disabled"
 
-    def test_paid_lane_recreates_replacement_payment_before_verify(self, monkeypatch):
+    def test_paid_lane_recreates_replacement_payment_before_verify(self):
         order_map_row = SimpleNamespace(
             name="WOOMAP-00001",
             erpnext_sales_invoice="ACC-SINV-99001",
@@ -841,7 +859,7 @@ class TestEvaluatePaidAmendment:
         eligibility = {"can_amend": True, "amendment_block_code": None, "amendment_block_reason": None}
 
         oa = self._patch_frappe(
-            monkeypatch,
+            self.monkeypatch,
             order_map_row=order_map_row,
             source_si=source_si,
             eligibility=eligibility,
@@ -860,12 +878,12 @@ class TestEvaluatePaidAmendment:
                 return payment_entry_doc
             raise AssertionError(f"unexpected get_doc({doctype!r}, {name!r})")
 
-        monkeypatch.setattr(oa.frappe, "get_doc", _fake_get_doc)
-        monkeypatch.setattr(oa.frappe.db, "savepoint", MagicMock())
-        monkeypatch.setattr(oa.frappe.db, "rollback", MagicMock())
-        monkeypatch.setattr(oa.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))
-        monkeypatch.setattr(oa, "_find_existing_replacement", lambda *a, **kw: None)
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(oa.frappe, "get_doc", _fake_get_doc)
+        self.monkeypatch.setattr(oa.frappe.db, "savepoint", MagicMock())
+        self.monkeypatch.setattr(oa.frappe.db, "rollback", MagicMock())
+        self.monkeypatch.setattr(oa.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))
+        self.monkeypatch.setattr(oa, "_find_existing_replacement", lambda *a, **kw: None)
+        self.monkeypatch.setattr(
             oa,
             "_evaluate_paid_amendment",
             lambda source_si, order_payload, settings: {
@@ -877,11 +895,11 @@ class TestEvaluatePaidAmendment:
                 "incoming_total": 200.0,
             },
         )
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(
             "jarz_woocommerce_integration.services.order_amendment.get_invoice_amendment_eligibility",
             lambda inv: eligibility,
         )
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(
             order_sync,
             "process_order_phase1",
             lambda *a, **kw: {"invoice": "ACC-SINV-99001-1"},
@@ -892,8 +910,8 @@ class TestEvaluatePaidAmendment:
             replacement_si.outstanding_amount = 0.0
             return "ACC-PAY-0002"
 
-        monkeypatch.setattr(order_sync, "_create_payment_entry", _fake_create_payment_entry)
-        monkeypatch.setattr(
+        self.monkeypatch.setattr(order_sync, "_create_payment_entry", _fake_create_payment_entry)
+        self.monkeypatch.setattr(
             oa,
             "_verify_paid_replacement",
             lambda *a, **kw: {"ok": True, "replacement_payment_entries": ["ACC-PAY-0002"]},
@@ -920,7 +938,7 @@ class TestEvaluatePaidAmendment:
 # stamp_out_for_delivery_flag
 # ---------------------------------------------------------------------------
 
-class TestStampOutForDeliveryFlag:
+class TestStampOutForDeliveryFlag(unittest.TestCase):
     def test_stamps_flag_on_first_ofd_transition(self):
         from jarz_pos.events.sales_invoice import stamp_out_for_delivery_flag
 

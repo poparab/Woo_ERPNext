@@ -5,12 +5,11 @@ from unittest.mock import patch
 from jarz_woocommerce_integration.services import customer_bulk_sync
 
 
-def test_sync_all_customers_api_importable():
-    fn = frappe.get_attr("jarz_woocommerce_integration.jarz_woocommerce_integration.api.customers.sync_all")
-    assert callable(fn)
-
-
 class TestCustomerBulkSync(unittest.TestCase):
+    def test_sync_all_customers_api_importable(self):
+        fn = frappe.get_attr("jarz_woocommerce_integration.jarz_woocommerce_integration.api.customers.sync_all")
+        assert callable(fn)
+
     def test_sync_single_customer_passes_woo_customer_id_to_ensure_customer(self):
         payload = {
             "id": 42,

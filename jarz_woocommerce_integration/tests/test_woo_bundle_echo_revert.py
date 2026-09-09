@@ -21,13 +21,14 @@ Three guards now stand between that sequence and a customer:
 Why this module exists
 ----------------------
 The suites these tests would naturally live beside — ``test_order_sync_delivery``
-and ``test_submitted_invoice_amendment`` — are written pytest-style (bare
+and ``test_submitted_invoice_amendment`` — were written pytest-style (bare
 ``def test_*`` / plain ``class Test:`` with a ``monkeypatch`` argument). CI runs
 ``bench run-tests``, which is **unittest discovery**, and pytest is not installed
-in the bench venv: unittest collects nothing from either file, so tests added
-there would never execute. These are ``unittest.TestCase`` so that the guards
-above are actually enforced on every push. The helpers are imported from those
-modules rather than duplicated.
+in the bench venv, so unittest collected nothing from either file and tests added
+there would never have executed. Both have since been converted to
+``unittest.TestCase`` too, but this module stays: it keeps the incident's three
+guards together and readable. The helpers are imported from those modules rather
+than duplicated.
 """
 from __future__ import annotations
 

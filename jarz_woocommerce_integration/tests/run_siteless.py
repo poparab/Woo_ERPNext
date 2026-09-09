@@ -47,11 +47,15 @@ import frappe
 #: canonicalisation, the woo_customer_id guards, the outbound collision handling
 #: and the dedupe tool — plus the regression modules those changes could break.
 #:
-#: All of these are ``unittest.TestCase``-style and therefore actually execute.
-#: Eight other modules in this package are pytest-style (bare ``def test_*`` with
-#: ``monkeypatch``); the unittest loader collects **nothing** from them, so
-#: including them here would report a green run that had executed no assertions.
-#: Pass module names explicitly to run anything else.
+#: Every module in this package is now ``unittest.TestCase``-style, so any of
+#: them can be named here or on the command line and will actually execute.
+#: That was not always true: seven modules were pytest-style (bare ``def test_*``
+#: / plain ``class Test:`` with a ``monkeypatch`` argument) and the unittest
+#: loader collected **nothing** from them, so 93 tests reported a green run that
+#: had executed no assertions. ``tests/_monkeypatch.py`` carries the shim they
+#: were converted onto. If you add a module, keep it TestCase-based —
+#: ``grep -c 'def test' `` disagreeing with the run's ``tests=`` count is the
+#: symptom. Pass module names explicitly to run anything else.
 DEFAULT_MODULES = (
     "test_customer_guest_matching",
     "test_customer_phone_identity",

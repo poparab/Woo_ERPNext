@@ -23,10 +23,12 @@ where blanket silence was worse than acting:
 
 Draft SIs (docstatus=0) keep the current full update behaviour.
 """
+import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from jarz_woocommerce_integration.services import order_sync
+from jarz_woocommerce_integration.tests._monkeypatch import MonkeyPatch
 
 
 # ---------------------------------------------------------------------------
@@ -255,84 +257,12 @@ def _setup_common_mocks(
 # Tests — submitted SI is frozen
 # ---------------------------------------------------------------------------
 
-def test_submitted_si_returns_skipped_submitted_frozen(monkeypatch):
-    """
-    When process_order_phase1 encounters an existing submitted SI (docstatus=1),
-    it must return {status: skipped, reason: submitted_frozen} without touching
-    the invoice's financial content.
-    """
-    sync_log_calls, fake_inv = _setup_common_mocks(monkeypatch, si_docstatus=1)
-    order = _make_woo_order(woo_id=14763, status="completed")
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["status"] == "skipped"
-    assert result["reason"] == "submitted_frozen"
-    assert result["invoice"] == "ACC-SINV-00001"
-    assert result["woo_order_id"] == 14763
-
-    # No accounting mutations. db_set is checked per-field rather than
-    # "never called": the address carve-out uses it, and asserting on the
-    # mechanism instead of the fields is what made this test read as though the
-    # invoice were untouchable when two carve-outs already existed.
-    fake_inv.save.assert_not_called()
-    fake_inv.cancel.assert_not_called()
-    financial_fields = {"items", "taxes", "grand_total", "net_total", "discount_amount",
-                        "selling_price_list", "currency", "customer", "posting_date"}
-    written = {call.args[0] for call in fake_inv.db_set.call_args_list}
-    assert not (written & financial_fields), f"financial fields mutated: {written & financial_fields}"
 
 
-def test_submitted_si_freeze_writes_sync_log_entry(monkeypatch):
-    """
-    The guard must write a WooCommerce Sync Log entry with status=Skipped and
-    a message containing 'submitted_frozen' for finance observability.
-    """
-    sync_log_calls, _ = _setup_common_mocks(monkeypatch, si_docstatus=1)
-    order = _make_woo_order(woo_id=14763, status="completed")
-
-    order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    frozen_entries = [
-        e for e in sync_log_calls
-        if e.get("status") == "Skipped" and "submitted_frozen" in (e.get("message") or "")
-    ]
-    assert frozen_entries, (
-        "Expected at least one WooCommerce Sync Log entry with status='Skipped' "
-        "and 'submitted_frozen' in the message"
-    )
-    assert frozen_entries[0].get("woo_order_id") == 14763
 
 
-def test_woo_cancellation_of_submitted_si_is_applied_not_swallowed(monkeypatch):
-    """
-    Carve-out 1. A customer cancelling on the website must reach ERPNext. The
-    freeze used to swallow it, which left the revenue standing on our books with
-    nothing to reconcile it against. Policy (pre- vs post-dispatch) belongs to
-    the jarz_pos before_cancel hook, so this path just calls the standard
-    cancel() and reports what happened.
-    """
-    sync_log_calls, fake_inv = _setup_common_mocks(monkeypatch, si_docstatus=1)
-    order = _make_woo_order(woo_id=14763, status="cancelled")
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["status"] == "cancelled"
-    assert result["reason"] == "woo_terminal_status"
-    assert result["cancellation_type"] == "WooCommerce Cancelled"
-    fake_inv.cancel.assert_called_once()
 
 
-def test_woo_refund_of_submitted_si_is_applied_not_swallowed(monkeypatch):
-    """Refunded is terminal too, and is labelled distinctly for the audit trail."""
-    _, fake_inv = _setup_common_mocks(monkeypatch, si_docstatus=1)
-    order = _make_woo_order(woo_id=14763, status="refunded")
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["status"] == "cancelled"
-    assert result["cancellation_type"] == "WooCommerce Refunded"
-    fake_inv.cancel.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -358,254 +288,346 @@ def _address_change_mocks(monkeypatch, *, stored_contact_hash, order):
     return fake_inv
 
 
-def test_woo_address_change_repoints_an_undispatched_submitted_si(monkeypatch):
-    """A corrected street address must reach the invoice the rider works from."""
-    order = _make_woo_order(woo_id=14763, status="processing")
-    # Stored hash is from the PREVIOUS address, so Woo genuinely moved.
-    stale = _make_woo_order(woo_id=14763, status="processing")
-    stale["shipping"]["address_1"] = "999 Old Road"
-    fake_inv = _address_change_mocks(
-        monkeypatch,
-        stored_contact_hash=order_sync._extract_order_contact_snapshot(stale)["woo_contact_hash"],
-        order=order,
-    )
-
-    order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    written = {call.args[0]: call.args[1] for call in fake_inv.db_set.call_args_list}
-    assert written.get("shipping_address_name") == "Shipping-001"
-    assert written.get("customer_address") == "Billing-001"
 
 
-def test_unchanged_woo_address_never_overwrites_an_erpnext_side_correction(monkeypatch):
-    """The regression that makes this whole carve-out safe.
-
-    Correcting an address in the POS edits the Address doc in place, which leaves
-    the Woo payload untouched. If inbound repointed on "invoice disagrees with
-    payload" it would resolve the stale Woo text into a fresh Address and undo
-    that correction on the very next poll — fighting the outbound push carrying
-    it to the store. Woo's own hash is unchanged here, so inbound must not act.
-    """
-    order = _make_woo_order(woo_id=14763, status="processing")
-    fake_inv = _address_change_mocks(
-        monkeypatch,
-        stored_contact_hash=order_sync._extract_order_contact_snapshot(order)["woo_contact_hash"],
-        order=order,
-    )
-
-    order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    written = {call.args[0] for call in fake_inv.db_set.call_args_list}
-    assert "shipping_address_name" not in written
-    assert "customer_address" not in written
 
 
-def test_address_is_not_repointed_once_out_for_delivery(monkeypatch):
-    """The rider has already left with the old address; re-addressing is worse."""
-    order = _make_woo_order(woo_id=14763, status="processing")
-    stale = _make_woo_order(woo_id=14763, status="processing")
-    stale["shipping"]["address_1"] = "999 Old Road"
-    fake_inv = _address_change_mocks(
-        monkeypatch,
-        stored_contact_hash=order_sync._extract_order_contact_snapshot(stale)["woo_contact_hash"],
-        order=order,
-    )
-    fake_inv.custom_was_out_for_delivery = 1
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["reason"] == "out_for_delivery_locked"
-    written = {call.args[0] for call in fake_inv.db_set.call_args_list}
-    assert "shipping_address_name" not in written
 
 
 # ---------------------------------------------------------------------------
 # Regression — draft SI still flows through the update path
 # ---------------------------------------------------------------------------
 
-def test_draft_si_is_not_frozen(monkeypatch):
-    """
-    A draft SI (docstatus=0) must NOT be frozen — the guard must be a no-op
-    and the function must NOT return submitted_frozen.
-    """
-    sync_log_calls, fake_inv = _setup_common_mocks(monkeypatch, si_docstatus=0)
-
-    # Stub out deeper frappe operations that run past the guard for drafts
-    monkeypatch.setattr(
-        order_sync,
-        "_apply_delivery_charge_policy",
-        lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
-    )
-    monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
-    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", lambda *a, **kw: None)
-    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
-
-    order = _make_woo_order(woo_id=14763, status="processing")
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result.get("reason") != "submitted_frozen", (
-        "Draft SI must not be frozen — submitted_frozen guard must only fire for docstatus=1"
-    )
-    assert not any(
-        "submitted_frozen" in (e.get("message") or "") for e in sync_log_calls
-    ), "No submitted_frozen sync log entry should be written for a draft SI"
 
 
-def test_matching_hash_draft_si_submits_when_target_is_submitted(monkeypatch):
-    order = _make_woo_order(woo_id=14763, status="completed")
-    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
-    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
-    submit_guard = MagicMock()
-    _, fake_inv = _setup_common_mocks(
-        monkeypatch,
-        si_docstatus=0,
-        map_hash=order_sync._compute_order_hash(order),
-        map_status="preparing",
-        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
-        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
-    )
-
-    monkeypatch.setattr(
-        order_sync,
-        "_apply_delivery_charge_policy",
-        lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
-    )
-    monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
-    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
-    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["status"] == "updated"
-    assert result["woo_order_id"] == 14763
-    assert result.get("reason") != "unchanged"
-    submit_guard.assert_called_once()
-    fake_inv.save.assert_called_once()
 
 
-def test_draft_si_preserves_posting_date_and_clamps_due_date_before_submit(monkeypatch):
-    order = _make_woo_order(woo_id=14763, status="completed")
-    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
-    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
-    submit_guard = MagicMock()
-    _, fake_inv = _setup_common_mocks(
-        monkeypatch,
-        si_docstatus=0,
-        map_hash=order_sync._compute_order_hash(order),
-        map_status="preparing",
-        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
-        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
-    )
-    fake_inv.posting_date = "2026-05-26"
-    fake_inv.due_date = "2026-05-25"
-
-    monkeypatch.setattr(
-        order_sync,
-        "_apply_delivery_charge_policy",
-        lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
-    )
-    monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
-    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
-    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["status"] == "updated"
-    assert fake_inv.posting_date == "2026-05-26"
-    assert fake_inv.due_date == "2026-05-26"
-    assert fake_inv.set_posting_time == 1
-    submit_guard.assert_called_once()
 
 
-def test_draft_si_repoints_customer_before_using_resolved_addresses(monkeypatch):
-    order = _make_woo_order(woo_id=14763, status="completed")
-    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
-    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
-    submit_guard = MagicMock()
-    _, fake_inv = _setup_common_mocks(
-        monkeypatch,
-        si_docstatus=0,
-        map_hash=order_sync._compute_order_hash(order),
-        map_status="preparing",
-        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
-        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
-    )
-
-    monkeypatch.setattr(
-        order_sync,
-        "_apply_delivery_charge_policy",
-        lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
-    )
-    monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
-    monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
-    monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["status"] == "updated"
-    assert fake_inv.customer == "Customer 1"
-    assert fake_inv.contact_person is None
-    submit_guard.assert_called_once()
 
 
-def test_matching_hash_submitted_si_skips_as_unchanged(monkeypatch):
-    order = _make_woo_order(woo_id=14763, status="completed")
-    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
-    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
-    _, fake_inv = _setup_common_mocks(
-        monkeypatch,
-        si_docstatus=1,
-        map_hash=order_sync._compute_order_hash(order),
-        map_status="completed",
-        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
-        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
-    )
-
-    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
-
-    assert result["status"] == "skipped"
-    assert result["reason"] == "unchanged"
-    fake_inv.save.assert_not_called()
-    fake_inv.db_set.assert_not_called()
-    fake_inv.cancel.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
 # pull_single_order_phase1 — submitted_frozen treated as success
 # ---------------------------------------------------------------------------
 
-def test_submitted_frozen_is_success_in_pull_single(monkeypatch):
-    """
-    pull_single_order_phase1 must classify submitted_frozen as a successful skip
-    (success=True) so it does not inflate error counters in cron/reconcile stats.
-    """
-    frozen_result = {
-        "status": "skipped",
-        "reason": "submitted_frozen",
-        "woo_order_id": 14763,
-        "invoice": "ACC-SINV-00001",
-    }
-    monkeypatch.setattr(order_sync, "process_order_phase1", lambda *a, **kw: frozen_result)
 
-    fake_order = _make_woo_order(woo_id=14763)
-    settings = _make_settings()
+class TestSubmittedInvoiceFrozen(unittest.TestCase):
+    """The submitted_frozen contract and its cancellation/address carve-outs."""
 
-    class _DummyClient:
-        def __init__(self, *a, **kw):
-            pass
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
 
-        def get_order(self, order_id):
-            return fake_order
+    def test_submitted_si_returns_skipped_submitted_frozen(self):
+        """
+        When process_order_phase1 encounters an existing submitted SI (docstatus=1),
+        it must return {status: skipped, reason: submitted_frozen} without touching
+        the invoice's financial content.
+        """
+        sync_log_calls, fake_inv = _setup_common_mocks(self.monkeypatch, si_docstatus=1)
+        order = _make_woo_order(woo_id=14763, status="completed")
 
-    monkeypatch.setattr(order_sync, "WooClient", _DummyClient)
-    monkeypatch.setattr(order_sync.frappe, "get_single", lambda doctype: settings)
-    monkeypatch.setattr(order_sync, "ensure_custom_fields", lambda: None)
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
 
-    result = order_sync.pull_single_order_phase1(14763)
+        assert result["status"] == "skipped"
+        assert result["reason"] == "submitted_frozen"
+        assert result["invoice"] == "ACC-SINV-00001"
+        assert result["woo_order_id"] == 14763
 
-    assert result["success"] is True, (
-        "submitted_frozen must be treated as success=True so it does not appear as an error"
-    )
-    assert result["status"] == "skipped"
-    assert result["reason"] == "submitted_frozen"
+        # No accounting mutations. db_set is checked per-field rather than
+        # "never called": the address carve-out uses it, and asserting on the
+        # mechanism instead of the fields is what made this test read as though the
+        # invoice were untouchable when two carve-outs already existed.
+        fake_inv.save.assert_not_called()
+        fake_inv.cancel.assert_not_called()
+        financial_fields = {"items", "taxes", "grand_total", "net_total", "discount_amount",
+                            "selling_price_list", "currency", "customer", "posting_date"}
+        written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+        assert not (written & financial_fields), f"financial fields mutated: {written & financial_fields}"
+
+    def test_submitted_si_freeze_writes_sync_log_entry(self):
+        """
+        The guard must write a WooCommerce Sync Log entry with status=Skipped and
+        a message containing 'submitted_frozen' for finance observability.
+        """
+        sync_log_calls, _ = _setup_common_mocks(self.monkeypatch, si_docstatus=1)
+        order = _make_woo_order(woo_id=14763, status="completed")
+
+        order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        frozen_entries = [
+            e for e in sync_log_calls
+            if e.get("status") == "Skipped" and "submitted_frozen" in (e.get("message") or "")
+        ]
+        assert frozen_entries, (
+            "Expected at least one WooCommerce Sync Log entry with status='Skipped' "
+            "and 'submitted_frozen' in the message"
+        )
+        assert frozen_entries[0].get("woo_order_id") == 14763
+
+    def test_woo_cancellation_of_submitted_si_is_applied_not_swallowed(self):
+        """
+        Carve-out 1. A customer cancelling on the website must reach ERPNext. The
+        freeze used to swallow it, which left the revenue standing on our books with
+        nothing to reconcile it against. Policy (pre- vs post-dispatch) belongs to
+        the jarz_pos before_cancel hook, so this path just calls the standard
+        cancel() and reports what happened.
+        """
+        sync_log_calls, fake_inv = _setup_common_mocks(self.monkeypatch, si_docstatus=1)
+        order = _make_woo_order(woo_id=14763, status="cancelled")
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["status"] == "cancelled"
+        assert result["reason"] == "woo_terminal_status"
+        assert result["cancellation_type"] == "WooCommerce Cancelled"
+        fake_inv.cancel.assert_called_once()
+
+    def test_woo_refund_of_submitted_si_is_applied_not_swallowed(self):
+        """Refunded is terminal too, and is labelled distinctly for the audit trail."""
+        _, fake_inv = _setup_common_mocks(self.monkeypatch, si_docstatus=1)
+        order = _make_woo_order(woo_id=14763, status="refunded")
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["status"] == "cancelled"
+        assert result["cancellation_type"] == "WooCommerce Refunded"
+        fake_inv.cancel.assert_called_once()
+
+    def test_woo_address_change_repoints_an_undispatched_submitted_si(self):
+        """A corrected street address must reach the invoice the rider works from."""
+        order = _make_woo_order(woo_id=14763, status="processing")
+        # Stored hash is from the PREVIOUS address, so Woo genuinely moved.
+        stale = _make_woo_order(woo_id=14763, status="processing")
+        stale["shipping"]["address_1"] = "999 Old Road"
+        fake_inv = _address_change_mocks(
+            self.monkeypatch,
+            stored_contact_hash=order_sync._extract_order_contact_snapshot(stale)["woo_contact_hash"],
+            order=order,
+        )
+
+        order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        written = {call.args[0]: call.args[1] for call in fake_inv.db_set.call_args_list}
+        assert written.get("shipping_address_name") == "Shipping-001"
+        assert written.get("customer_address") == "Billing-001"
+
+    def test_unchanged_woo_address_never_overwrites_an_erpnext_side_correction(self):
+        """The regression that makes this whole carve-out safe.
+
+        Correcting an address in the POS edits the Address doc in place, which leaves
+        the Woo payload untouched. If inbound repointed on "invoice disagrees with
+        payload" it would resolve the stale Woo text into a fresh Address and undo
+        that correction on the very next poll — fighting the outbound push carrying
+        it to the store. Woo's own hash is unchanged here, so inbound must not act.
+        """
+        order = _make_woo_order(woo_id=14763, status="processing")
+        fake_inv = _address_change_mocks(
+            self.monkeypatch,
+            stored_contact_hash=order_sync._extract_order_contact_snapshot(order)["woo_contact_hash"],
+            order=order,
+        )
+
+        order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+        assert "shipping_address_name" not in written
+        assert "customer_address" not in written
+
+    def test_address_is_not_repointed_once_out_for_delivery(self):
+        """The rider has already left with the old address; re-addressing is worse."""
+        order = _make_woo_order(woo_id=14763, status="processing")
+        stale = _make_woo_order(woo_id=14763, status="processing")
+        stale["shipping"]["address_1"] = "999 Old Road"
+        fake_inv = _address_change_mocks(
+            self.monkeypatch,
+            stored_contact_hash=order_sync._extract_order_contact_snapshot(stale)["woo_contact_hash"],
+            order=order,
+        )
+        fake_inv.custom_was_out_for_delivery = 1
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["reason"] == "out_for_delivery_locked"
+        written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+        assert "shipping_address_name" not in written
+
+    def test_draft_si_is_not_frozen(self):
+        """
+        A draft SI (docstatus=0) must NOT be frozen — the guard must be a no-op
+        and the function must NOT return submitted_frozen.
+        """
+        sync_log_calls, fake_inv = _setup_common_mocks(self.monkeypatch, si_docstatus=0)
+
+        # Stub out deeper frappe operations that run past the guard for drafts
+        self.monkeypatch.setattr(
+            order_sync,
+            "_apply_delivery_charge_policy",
+            lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
+        )
+        self.monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
+        self.monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", lambda *a, **kw: None)
+        self.monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
+
+        order = _make_woo_order(woo_id=14763, status="processing")
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result.get("reason") != "submitted_frozen", (
+            "Draft SI must not be frozen — submitted_frozen guard must only fire for docstatus=1"
+        )
+        assert not any(
+            "submitted_frozen" in (e.get("message") or "") for e in sync_log_calls
+        ), "No submitted_frozen sync log entry should be written for a draft SI"
+
+    def test_matching_hash_draft_si_submits_when_target_is_submitted(self):
+        order = _make_woo_order(woo_id=14763, status="completed")
+        contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+        territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+        submit_guard = MagicMock()
+        _, fake_inv = _setup_common_mocks(
+            self.monkeypatch,
+            si_docstatus=0,
+            map_hash=order_sync._compute_order_hash(order),
+            map_status="preparing",
+            map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+            map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+        )
+
+        self.monkeypatch.setattr(
+            order_sync,
+            "_apply_delivery_charge_policy",
+            lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
+        )
+        self.monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
+        self.monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
+        self.monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["status"] == "updated"
+        assert result["woo_order_id"] == 14763
+        assert result.get("reason") != "unchanged"
+        submit_guard.assert_called_once()
+        fake_inv.save.assert_called_once()
+
+    def test_draft_si_preserves_posting_date_and_clamps_due_date_before_submit(self):
+        order = _make_woo_order(woo_id=14763, status="completed")
+        contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+        territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+        submit_guard = MagicMock()
+        _, fake_inv = _setup_common_mocks(
+            self.monkeypatch,
+            si_docstatus=0,
+            map_hash=order_sync._compute_order_hash(order),
+            map_status="preparing",
+            map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+            map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+        )
+        fake_inv.posting_date = "2026-05-26"
+        fake_inv.due_date = "2026-05-25"
+
+        self.monkeypatch.setattr(
+            order_sync,
+            "_apply_delivery_charge_policy",
+            lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
+        )
+        self.monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
+        self.monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
+        self.monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["status"] == "updated"
+        assert fake_inv.posting_date == "2026-05-26"
+        assert fake_inv.due_date == "2026-05-26"
+        assert fake_inv.set_posting_time == 1
+        submit_guard.assert_called_once()
+
+    def test_draft_si_repoints_customer_before_using_resolved_addresses(self):
+        order = _make_woo_order(woo_id=14763, status="completed")
+        contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+        territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+        submit_guard = MagicMock()
+        _, fake_inv = _setup_common_mocks(
+            self.monkeypatch,
+            si_docstatus=0,
+            map_hash=order_sync._compute_order_hash(order),
+            map_status="preparing",
+            map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+            map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+        )
+
+        self.monkeypatch.setattr(
+            order_sync,
+            "_apply_delivery_charge_policy",
+            lambda inv, territory_name=None, has_free_shipping_bundle=False, cache=None: {"changed": False},
+        )
+        self.monkeypatch.setattr(order_sync, "_apply_invoice_pos_profile", lambda *a, **kw: None)
+        self.monkeypatch.setattr(order_sync, "_submit_invoice_with_accounting_guards", submit_guard)
+        self.monkeypatch.setattr(order_sync.frappe.db, "exists", lambda *a, **kw: None)
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["status"] == "updated"
+        assert fake_inv.customer == "Customer 1"
+        assert fake_inv.contact_person is None
+        submit_guard.assert_called_once()
+
+    def test_matching_hash_submitted_si_skips_as_unchanged(self):
+        order = _make_woo_order(woo_id=14763, status="completed")
+        contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+        territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+        _, fake_inv = _setup_common_mocks(
+            self.monkeypatch,
+            si_docstatus=1,
+            map_hash=order_sync._compute_order_hash(order),
+            map_status="completed",
+            map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+            map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+        )
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["status"] == "skipped"
+        assert result["reason"] == "unchanged"
+        fake_inv.save.assert_not_called()
+        fake_inv.db_set.assert_not_called()
+        fake_inv.cancel.assert_not_called()
+
+    def test_submitted_frozen_is_success_in_pull_single(self):
+        """
+        pull_single_order_phase1 must classify submitted_frozen as a successful skip
+        (success=True) so it does not inflate error counters in cron/reconcile stats.
+        """
+        frozen_result = {
+            "status": "skipped",
+            "reason": "submitted_frozen",
+            "woo_order_id": 14763,
+            "invoice": "ACC-SINV-00001",
+        }
+        self.monkeypatch.setattr(order_sync, "process_order_phase1", lambda *a, **kw: frozen_result)
+
+        fake_order = _make_woo_order(woo_id=14763)
+        settings = _make_settings()
+
+        class _DummyClient:
+            def __init__(self, *a, **kw):
+                pass
+
+            def get_order(self, order_id):
+                return fake_order
+
+        self.monkeypatch.setattr(order_sync, "WooClient", _DummyClient)
+        self.monkeypatch.setattr(order_sync.frappe, "get_single", lambda doctype: settings)
+        self.monkeypatch.setattr(order_sync, "ensure_custom_fields", lambda: None)
+
+        result = order_sync.pull_single_order_phase1(14763)
+
+        assert result["success"] is True, (
+            "submitted_frozen must be treated as success=True so it does not appear as an error"
+        )
+        assert result["status"] == "skipped"
+        assert result["reason"] == "submitted_frozen"
