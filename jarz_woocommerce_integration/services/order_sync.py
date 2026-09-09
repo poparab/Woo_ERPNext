@@ -1099,6 +1099,29 @@ def _collect_changed_values(current_values: dict[str, Any] | None, desired_value
     return changed
 
 
+#: Reasons a *skipped* pull still counts as a success. A reason missing from this
+#: set makes `pull_single_order_phase1` report ``success=False``, which
+#: `cancellation_reconcile` then counts as a failed order. Module-level so it can
+#: be asserted on directly instead of through the function's source text.
+SKIPPED_SUCCESS_REASONS = {
+    "already_mapped",
+    "unchanged",
+    "pending_payment",
+    "processing",
+    "submitted_frozen",  # PROD-WOO-001: submitted SI is intentionally frozen
+    # Our own push echoing back. Skipping it is the guard working, not a failed
+    # pull; counting it as one put every outbound write into the failed-order
+    # metrics.
+    "outbound_echo_suppressed",
+    # Another worker holds this order right now. That is the lock doing its job,
+    # not a failure — the other worker will finish it. Counting these as errors
+    # made `cancellation_reconcile` report failures for orders that were being
+    # processed correctly one connection over.
+    "locked",
+    "db_locked",
+}
+
+
 def _compute_order_hash(order: dict) -> str:
     import hashlib
     import json as _json
@@ -1395,17 +1418,28 @@ def _count_bundle_parent_instances(
 ) -> int:
     """How many lines on this order are bundle-parent instances of one product.
 
-    A "parent instance" is a line for the same ``product_id`` that carries a
-    ``_woosb_ids`` of its own. Two of them means the shopper put the same bundle
-    in the cart twice with different contents each time.
+    Two of them means the same bundle is in the order twice, with contents
+    chosen separately each time — and since every WooSB child carries only
+    ``_woosb_parent_id = <product_id>``, identical for both, the children cannot
+    be split between them.
+
+    Counts by ``product_id`` alone, deliberately **not** "lines that carry a
+    ``_woosb_ids``". A parent can legitimately arrive without one: outbound omits
+    the key whenever `_build_woosb_ids_value` renders empty (a child with no
+    product id, or qty <= 0). Requiring the string would then count 1 where there
+    are 2, skip the ambiguity branch, and let the child scan attribute *both*
+    instances' children to *each* parent — an invoice with the bundle's contents
+    doubled. Lines that are themselves children are excluded; only a parent can
+    share the parent's ``product_id`` without being one.
     """
     parent_pid_str = str(parent_product_id)
     count = 0
     for li in line_items or []:
         if str(li.get("product_id")) != parent_pid_str:
             continue
-        if _get_line_meta_value(li.get("meta_data"), "_woosb_ids"):
-            count += 1
+        if _get_line_meta_value(li.get("meta_data"), "_woosb_parent_id"):
+            continue
+        count += 1
     return count
 
 
@@ -1450,35 +1484,46 @@ def _build_bundle_selections(
     parent_woosb_ids = (
         _get_line_meta_value(parent_line.get("meta_data"), "_woosb_ids") if parent_line else None
     )
-    parent_meta_selections = (
-        _build_bundle_selections_from_parent_meta(parent_line, parent_qty, cache=cache)
-        if parent_line
-        else {}
-    )
+    def _from_parent_meta() -> dict:
+        # Built on demand, not up front: without a MigrationCache it costs up to
+        # two DB reads per selection entry, and it warns about a malformed
+        # string. Doing that eagerly meant paying for — and complaining about —
+        # a result the winning path throws away.
+        if not parent_line:
+            return {}
+        return _build_bundle_selections_from_parent_meta(parent_line, parent_qty, cache=cache)
 
-    # Ambiguous-by-construction case: the children of two identical bundles are
-    # indistinguishable, so only the per-line selection string can attribute them.
-    if parent_woosb_ids and _count_bundle_parent_instances(line_items, parent_product_id) > 1:
-        return parent_meta_selections
+    # Ambiguous by construction: two instances of one bundle share a product_id,
+    # and so do their children's `_woosb_parent_id`, so the child scan would give
+    # each parent the union of both selections. Only the per-line string can
+    # attribute them. Gated on the COUNT alone — if this particular parent has no
+    # string we return {} and let the caller expand the bundle's defaults, which
+    # is wrong but bounded, where the child scan would silently double the order.
+    if _count_bundle_parent_instances(line_items, parent_product_id) > 1:
+        return _from_parent_meta()
 
     child_selections = _build_bundle_selections_from_children(
         line_items, parent_product_id, parent_qty, cache=cache
     )
     if child_selections:
-        if parent_woosb_ids and child_selections != parent_meta_selections:
-            # Not an error: this is exactly the drift the rule above exists for.
-            # Logged because it is also the fingerprint of a stale frozen string.
-            frappe.logger().info(
+        if parent_woosb_ids and child_selections != _from_parent_meta():
+            # Not an error: this is the drift the rule above exists for. Logged
+            # at WARNING because it is the only fingerprint of a stale selection
+            # string on the store — and `frappe.logger().info()` is silent on
+            # staging and production, so an info line would never be seen in the
+            # one place it matters.
+            frappe.logger().warning(
                 "Bundle selection: child line items disagree with parent _woosb_ids on "
                 f"product {parent_product_id}; using the children (they are what the "
-                "store bills and ships)"
+                "store bills and ships). The store's own bundle display stays stale "
+                "until an outbound push refreshes it."
             )
         return child_selections
 
     # No usable children (none present, or one of them was unmappable). The
     # selection string is then the best evidence we have — better than silently
     # expanding the bundle's defaults, which would invent a mix nobody chose.
-    return parent_meta_selections
+    return _from_parent_meta()
 
 
 def _build_invoice_items(order: dict, price_list: str | None = None, cache: "MigrationCache | None" = None, is_historical: bool = False) -> Tuple[list[dict], list[dict], dict[str, Any]]:
@@ -5365,21 +5410,8 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
     # events, the cancellation reconcile and the manual API all come through.
     if result.get("invoice"):
         enqueue_woo_order_note_sync(order, result["invoice"], settings=settings)
-    skipped_success_reasons = {
-        "already_mapped",
-        "unchanged",
-        "pending_payment",
-        "processing",
-        "submitted_frozen",  # PROD-WOO-001: submitted SI is intentionally frozen
-        # Another worker holds this order right now. That is the lock doing its
-        # job, not a failure — the other worker will finish it. Counting these as
-        # errors made `cancellation_reconcile` report failures for orders that
-        # were being processed correctly one connection over.
-        "locked",
-        "db_locked",
-    }
     result["success"] = result.get("status") in ("created", "updated") or (
-        result.get("status") == "skipped" and result.get("reason") in skipped_success_reasons
+        result.get("status") == "skipped" and result.get("reason") in SKIPPED_SUCCESS_REASONS
     )
     return result
 

@@ -381,51 +381,10 @@ class TestItemEditDetection:
         assert result["reason"] == "needs_manual_review"
         order_sync._flag_order_map_for_manual_review.assert_called_once()
 
-    def test_outbound_echo_marker_blocks_the_amendment(self, monkeypatch):
-        """Woo 17278: `order.updated` one second after our own PUT is not an edit.
-
-        Same inputs as `test_hash_changed_flag_on_eligible_status_enqueues` — the
-        hash moved and the item lines differ — but the in-flight marker says this
-        app wrote the order moments ago, so the payload is the echo of our own
-        write and amending on it would revert the operator who caused it.
-        """
-        from jarz_woocommerce_integration.services import outbound_sync
-
-        order = _make_woo_order(status="processing")
-        fake_inv = _make_fake_inv()
-        logs = _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
-        monkeypatch.setattr(
-            outbound_sync, "outbound_push_recently_pushed", lambda woo_order_id: True
-        )
-
-        result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
-
-        assert result["status"] == "skipped"
-        assert result["reason"] == "outbound_echo_suppressed"
-        assert result["invoice"] == fake_inv.name
-        order_sync.frappe.enqueue.assert_not_called()
-        # Our own echo is not a customer edit, so nothing is queued for a human.
-        order_sync._flag_order_map_for_manual_review.assert_not_called()
-        assert any(
-            "outbound_echo_suppressed" in str(log.get("message") or "") for log in logs
-        )
-
-    def test_without_the_marker_the_same_payload_still_enqueues(self, monkeypatch):
-        """The guard must be the marker, not a blanket loosening of the gate."""
-        from jarz_woocommerce_integration.services import outbound_sync
-
-        order = _make_woo_order(status="processing")
-        fake_inv = _make_fake_inv()
-        _setup_submitted_mocks(monkeypatch, fake_inv=fake_inv, stored_hash="oldhash")
-        monkeypatch.setattr(
-            outbound_sync, "outbound_push_recently_pushed", lambda woo_order_id: False
-        )
-
-        result = order_sync.process_order_phase1(order, _make_settings(enable_amendment=1))
-
-        assert result["status"] == "queued"
-        assert result["reason"] == "amendment_enqueued"
-        order_sync.frappe.enqueue.assert_called_once()
+    # The outbound-echo suppression tests are NOT here. This class is
+    # pytest-style, and CI's `bench run-tests` is unittest discovery, which
+    # collects nothing from it. They live in
+    # tests/test_woo_bundle_echo_revert.py as unittest.TestCase.
 
     def test_on_hold_status_is_skipped_before_amendment(self, monkeypatch):
         order = _make_woo_order(status="on-hold")

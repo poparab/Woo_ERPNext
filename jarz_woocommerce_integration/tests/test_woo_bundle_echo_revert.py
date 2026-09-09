@@ -196,6 +196,53 @@ class TestSelectionStringRemainsTheFallback(unittest.TestCase):
 
         self.assertEqual(selections, STALE_PARENT_SELECTIONS)
 
+    def test_two_instances_collapse_is_not_possible_when_one_parent_lacks_the_string(self):
+        """The ambiguity test counts parents, not parents-that-carry-a-string.
+
+        Outbound omits `_woosb_ids` whenever `_build_woosb_ids_value` renders
+        empty (a child with no product id, or qty <= 0), so a second instance can
+        legitimately arrive without one. If the count required the string it
+        would read 1 here, skip the ambiguity branch, and run the child scan —
+        which attributes the children of BOTH instances to EACH parent, doubling
+        the bundle's contents on the invoice.
+        """
+        with_string = _parent(STALE_PARENT_WOOSB_IDS, line_id=61001)
+        without_string = {
+            "id": 61010,
+            "name": "Jarz Royal Feast",
+            "product_id": BUNDLE_PRODUCT_ID,
+            "variation_id": 0,
+            "quantity": 1,
+            "sku": "",
+            "meta_data": [],
+        }
+        line_items = [with_string, without_string, _child(61002, 13783, 4), _child(61003, 13826, 3)]
+
+        self.assertEqual(
+            order_sync._count_bundle_parent_instances(line_items, BUNDLE_PRODUCT_ID), 2
+        )
+        # The stringless parent must not be handed the other instance's children.
+        self.assertEqual(
+            order_sync._build_bundle_selections(
+                line_items, BUNDLE_PRODUCT_ID, 1, cache=_cache(), parent_line=without_string
+            ),
+            {},
+        )
+
+    def test_a_child_sharing_the_parents_product_id_is_not_counted_as_an_instance(self):
+        parent = _parent(STALE_PARENT_WOOSB_IDS)
+        odd_child = {
+            "id": 61020,
+            "product_id": BUNDLE_PRODUCT_ID,
+            "variation_id": 13783,
+            "quantity": 4,
+            "meta_data": [{"key": "_woosb_parent_id", "value": str(BUNDLE_PRODUCT_ID)}],
+        }
+
+        self.assertEqual(
+            order_sync._count_bundle_parent_instances([parent, odd_child], BUNDLE_PRODUCT_ID), 1
+        )
+
     def test_two_instances_of_one_bundle_still_use_the_per_line_string(self):
         """The genuinely ambiguous case, which is why the string exists at all.
 
@@ -383,6 +430,29 @@ class TestOutboundEchoIsNeverAnAmendment(unittest.TestCase):
         self.assertEqual(result["status"], "queued")
         self.assertEqual(result["reason"], "amendment_enqueued")
         order_sync.frappe.enqueue.assert_called_once()
+
+
+class TestSuppressedEchoIsNotAnAlarm(unittest.TestCase):
+    """A suppressed echo is the guard working — it must not book a NeedsReview.
+
+    `_classify_text_reason` falls through to "review" for any reason it does not
+    recognise, and that lands a terminal NeedsReview Woo Sync Event. Unregistered,
+    the new skip reason would raise one on *every* outbound push and train staff
+    to ignore the flag that exists to catch real website edits — the exact
+    outcome the suppression branch's own comment says it is avoiding.
+    """
+
+    def test_the_reason_is_registered_as_a_skip_not_a_review(self):
+        from jarz_woocommerce_integration.services import sync_events
+
+        self.assertIn("outbound_echo", sync_events.SKIP_REASON_TOKENS)
+        self.assertEqual(sync_events._classify_text_reason("outbound_echo_suppressed"), "skip")
+
+    def test_a_suppressed_echo_is_not_counted_as_a_failed_pull(self):
+        self.assertIn("outbound_echo_suppressed", order_sync.SKIPPED_SUCCESS_REASONS)
+        # The reasons that were already there must stay there.
+        self.assertIn("submitted_frozen", order_sync.SKIPPED_SUCCESS_REASONS)
+        self.assertIn("locked", order_sync.SKIPPED_SUCCESS_REASONS)
 
 
 class TestEchoMarkerLifecycle(unittest.TestCase):

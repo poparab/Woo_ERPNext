@@ -184,9 +184,12 @@ _DEFAULT_ORDER_ORIGIN_SOURCE = "ERPNext POS"
 #: value can differ from the store's for reasons that have nothing to do with
 #: what was sold — and every bundle order would look dirty forever.
 #:
-#: The parent string still gets corrected: it rides along on any PUT we make for
-#: a real reason, and a changed bundle mix always is one, because the child lines
-#: move with it. It simply may never trigger a push on its own.
+#: On an order WE created the parent string still gets corrected: it rides along
+#: on any PUT we make for a real reason, and a changed bundle mix always is one,
+#: because the child lines move with it. It simply may never trigger a push on
+#: its own. On a **store-created** order `_preserve_native_bundle_selection`
+#: strips it from every payload, so it is never corrected at all — see the
+#: residual noted in that function.
 _ORDER_LINE_META_KEYS_TO_COMPARE = frozenset({
     "erpnext_item_code",
     "discount_percentage",
@@ -195,12 +198,23 @@ _ORDER_LINE_META_KEYS_TO_COMPARE = frozenset({
 
 
 #: How long an outbound write keeps suppressing the inbound echo it causes.
-#: WooCommerce fires ``order.updated`` within a second or two of our PUT, but the
-#: webhook worker, the retry queue and a scheduled poll can all replay it later;
-#: three minutes covers every observed replay while staying far below the order
-#: poll interval, so a genuine customer edit made during the window is picked up
-#: on the very next poll rather than lost.
-_OUTBOUND_ECHO_TTL = 180  # seconds
+#:
+#: WooCommerce fires ``order.updated`` within a second or two of our PUT — the
+#: observed gap on Woo 17278 was 1.1s — so this only has to outlive the webhook
+#: queue, not the sync schedule. It is deliberately set BELOW the live order poll
+#: (``sync_orders_cron_phase1``, ``*/2 * * * *`` in hooks.py = 120s): a marker
+#: that outlived the poll would suppress two consecutive passes over the same
+#: order, and the live poll advances its cursor whatever the outcome, so the
+#: second suppression would hand the order to the hourly reconcile instead of
+#: re-examining it promptly. At 90s every poll after ours sees an expired marker
+#: and re-evaluates on the evidence.
+#:
+#: This is the *race* fix, and only that. It buys ~90 seconds against a 0.6s
+#: commit-ordering window. It is not what makes an operator's edit safe — that is
+#: the child-lines-win rule in `order_sync._build_bundle_selections` plus keeping
+#: `_woosb_ids` fresh below. Do not lengthen this in the belief that it is load
+#: bearing on its own.
+_OUTBOUND_ECHO_TTL = 90  # seconds
 
 
 def _outbound_echo_cache_key(woo_order_id) -> str:
@@ -2702,8 +2716,11 @@ def _collect_line_items(
                 "bundle": bundle_key,
                 "children": len(children),
                 "detail": (
-                    "Parent line pushed without _woosb_ids; the store falls back to the "
-                    "child lines' _woosb_parent_id, which our inbound parser also accepts."
+                    "Parent line pushed without _woosb_ids. On a CREATE the store falls "
+                    "back to the child lines' _woosb_parent_id, which our inbound parser "
+                    "also accepts. On an UPDATE it is not a fallback: WooCommerce merges "
+                    "line meta, so omitting the key leaves whatever string the line "
+                    "already carries — which may now describe the wrong mix."
                 ),
             })
 
@@ -3922,8 +3939,17 @@ def _order_is_jarz_originated(existing_order: dict | None) -> bool:
     * ``_jarz_order_origin`` in the order meta — ``_apply_origin_metadata``
       stamps it on every order we create, and nothing else writes it.
     * ``created_via == "rest-api"`` — WooCommerce sets this itself at creation:
-      ``checkout`` for the storefront, ``admin`` for wp-admin, ``rest-api`` for
-      the REST API. We are the only REST client on this store.
+      ``checkout`` for the storefront, ``store-api`` for Checkout Blocks,
+      ``admin`` for wp-admin, ``rest-api`` for the v3 REST API. This app is the
+      only REST client holding keys to this store today, and it is the only
+      signal that covers orders created before `_apply_origin_metadata` shipped.
+
+      It is the weaker of the two: ``rest-api`` means "some v3 API client", not
+      "us" — the official WooCommerce admin app and any order-importing plugin
+      would report it as well. If keys are ever issued to another integration,
+      **drop this clause** and rely on ``_jarz_order_origin`` alone; leaving it
+      would let us overwrite that client's plugin-written selection string with
+      our approximation.
 
     Deliberately conservative: an order we cannot positively identify as ours is
     treated as the store's, because the cost of being wrong is asymmetric (see
@@ -3942,8 +3968,6 @@ def _order_is_jarz_originated(existing_order: dict | None) -> bool:
 def _preserve_native_bundle_selection(
     payload_line_items: list[dict],
     existing_order: dict | None,
-    *,
-    order_is_ours: bool | None = None,
 ) -> None:
     """Never overwrite a ``_woosb_ids`` **the store** wrote itself.
 
@@ -3960,21 +3984,46 @@ def _preserve_native_bundle_selection(
     order the guard froze the bundle recipe forever: a jar-mix amendment rewrote
     the child lines and left the parent string stating the original mix. Woo order
     17278 (2026-09-09) then had that stale string read back by the inbound gate,
-    which reverted the operator's edit and shipped the wrong jars. ``created_via``
-    is ``rest-api`` and the meta carries ``_jarz_order_origin`` on such an order,
-    so we can tell the two apart and only freeze what is genuinely the store's.
+    which reverted the operator's edit and shipped the wrong jars. That order was
+    created by this app — checked against production, it carries
+    ``created_via = "rest-api"`` and ``_jarz_order_origin = "ERPNext POS"`` — so
+    the ownership test below covers the incident.
+
+    **Residual, deliberately accepted.** A *store-created* order amended from the
+    POS still keeps its original string: we refuse to overwrite it, so the Woo
+    admin screen and any Woo-rendered packing slip go on showing the mix the
+    customer first chose. ERPNext itself is not fooled —
+    `order_sync._build_bundle_selections` reads the child lines, which our push
+    does update — so the invoice, the Delivery Note and the POS kanban are all
+    correct, and that is what the kitchen picks from. Broadening this to "refresh
+    whenever the composition changed" was considered and rejected: it would also
+    fire when we push back an amendment the *website* originated, overwriting the
+    plugin's own string with our approximation (a SHA-1-prefix token, and
+    attributes that render ``{}`` on a cold cache) across 10,000+ web orders. The
+    asymmetry is what decides it. If the Woo screen ever becomes a picking
+    surface, revisit — the honest fix is a per-parent "did WE change these
+    children" test, not a broader ownership claim.
 
     Mutates ``payload_line_items`` in place, dropping only our own key.
     """
-    if order_is_ours is None:
-        order_is_ours = _order_is_jarz_originated(existing_order)
-    if order_is_ours:
+    if _order_is_jarz_originated(existing_order):
         # Our own order: the string on the store is one WE wrote, and the child
-        # lines in this very payload are the current truth. Overwrite it so the
+        # lines in this very payload are the current truth. Keep ours so the
         # store's bundle display stays consistent with what it will ship.
+        #
+        # "Kept", not "refreshed": this only declines to strip the key. If
+        # `_build_woosb_ids_value` rendered empty upstream there is no key to
+        # keep, and WooCommerce merges line meta on a PUT, so the store's stale
+        # string survives. That case logs
+        # `woo_outbound_bundle_selection_string_unavailable` at WARNING; this
+        # line must not be read as proof the store was updated.
         LOGGER.info({
-            "event": "woo_outbound_native_bundle_selection_refreshed",
+            "event": "woo_outbound_native_bundle_selection_kept",
             "woo_order_id": (existing_order or {}).get("id"),
+            "lines_with_our_selection": sum(
+                1 for e in payload_line_items
+                if _extract_meta_value(e, "_woosb_ids")
+            ),
         })
         return
 

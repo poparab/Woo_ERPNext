@@ -74,6 +74,11 @@ SKIP_REASON_TOKENS = (
     "pending_payment",
     "processing",
     "submitted_frozen",
+    # The echo of our own outbound write. Unlisted, it falls through
+    # `_classify_text_reason` to "review" and books a terminal NeedsReview event
+    # for every push we make — training staff to ignore the flag that exists to
+    # catch real website edits.
+    "outbound_echo",
 )
 RETRYABLE_ORDER_REASONS = {"locked", "db_locked"}
 TERMINAL_STATUSES = {"Succeeded", "Skipped", "Superseded", "Failed", "NeedsReview", "DeadLetter"}
