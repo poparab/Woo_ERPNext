@@ -53,6 +53,13 @@ RECONCILE_API_STATUS_FILTER = "any"
 RECONCILE_ORDER_STATUSES = ",".join(RECONCILE_TARGET_WOO_STATUSES)
 KASHIER_AUTO_PAY_METHODS = {"Kashier Card", "Kashier Wallet"}
 NON_PAYABLE_WOO_STATUSES = {"cancelled", "refunded", "failed"}
+#: ``custom_payment_method`` for a B2B order a shop took on account: delivered,
+#: not paid, the receivable left open. jarz_pos owns this value; this app must
+#: never invent it and never overwrite it.
+CREDIT_PAYMENT_METHOD = "Credit"
+#: Permanent stamp jarz_pos writes on a credit invoice at creation. Read
+#: defensively: an un-migrated bench has no such column.
+CREDIT_TERMS_FIELD = "custom_credit_terms_days"
 
 #: Woo statuses that mean "this order is dead" and must reach ERPNext even when
 #: the invoice is already submitted. "failed" is deliberately excluded: it means
@@ -481,6 +488,8 @@ def _map_payment_method(woo_payment_method: str | None, woo_payment_method_title
     - ``card`` / ``kashier_card`` -> Kashier Card
     - ``kashier`` -> title-aware (title contains "wallet" -> Kashier Wallet, else Kashier Card)
     - ``kashier_wallet`` -> Kashier Wallet
+    - ``credit`` / ``on_account`` -> Credit (the id this app now *emits* for a B2B
+      on-account sale, so the round trip is stable instead of echoing back ``cod``)
     - anything else / blank -> ``None`` (caller logs and skips the Payment Entry)
     """
     if not woo_payment_method:
@@ -503,6 +512,179 @@ def _map_payment_method(woo_payment_method: str | None, woo_payment_method_title
     return woo_to_erpnext(method, woo_payment_method_title)
 
 
+def _is_credit_payment_method(value: Any) -> bool:
+    """True when an ERPNext-side spelling means the on-account credit sale."""
+    try:
+        from jarz_woocommerce_integration.services.payment_map import is_credit
+
+        return bool(is_credit(value))
+    except Exception:
+        # Never let a mapping import failure decide that a credit invoice is
+        # safe to overwrite; fall back to the literal comparison.
+        return str(value or "").strip().casefold() == CREDIT_PAYMENT_METHOD.casefold()
+
+
+def _read_invoice_field(inv, fieldname: str) -> Any:
+    """Read a possibly-absent field off an invoice doc (or a test stub)."""
+    try:
+        getter = getattr(inv, "get", None)
+        if callable(getter):
+            value = getter(fieldname)
+            if value is not None:
+                return value
+    except Exception:
+        pass
+    try:
+        return getattr(inv, fieldname, None)
+    except Exception:
+        return None
+
+
+def _invoice_is_on_account(inv) -> tuple[bool, str]:
+    """``(is_on_account, reason)`` for an invoice this app is about to rewrite.
+
+    Two independent signals, either of which is enough:
+
+    * ``custom_payment_method == "Credit"`` -- the value itself;
+    * ``custom_credit_terms_days > 0`` -- the permanent stamp jarz_pos writes at
+      order creation, which survives even if something already clobbered the
+      payment method.
+
+    The terms field is read defensively: it does not exist on an un-migrated
+    bench, and a missing column must not raise inside the inbound lane.
+    """
+    if _is_credit_payment_method(_read_invoice_field(inv, "custom_payment_method")):
+        return True, "custom_payment_method=Credit"
+
+    try:
+        terms = _read_invoice_field(inv, CREDIT_TERMS_FIELD)
+        if terms is not None and float(terms) > 0:
+            return True, f"{CREDIT_TERMS_FIELD}={terms}"
+    except Exception:
+        pass
+
+    return False, ""
+
+
+def _apply_inbound_payment_method(inv, custom_payment_method: str | None, woo_id: Any = None) -> None:
+    """Write the inbound-mapped payment method -- unless that would erase a credit sale.
+
+    The store has no concept of an on-account order. jarz_pos writes
+    ``custom_payment_method = "Credit"`` when a B2B shop takes one, then the Woo
+    order still carries whatever gateway id it was placed with (historically
+    ``cod``), so every later inbound update mapped that back to ``Cash`` and this
+    echo wrote it onto the *submitted* invoice. In jarz_pos the ledger and the
+    credit-limit queries key on that column, so the debt vanished from both while
+    the money was still owed, and a later re-dispatch would charge the courier
+    for a cash collection that never happens.
+
+    So: never downgrade a credit invoice. Anything else behaves exactly as before.
+    Skips are logged -- a real mismatch should be visible, not silent.
+    """
+    incoming = str(custom_payment_method or "").strip()
+    if not incoming:
+        return
+
+    if not _is_credit_payment_method(incoming):
+        on_account, reason = _invoice_is_on_account(inv)
+        if on_account:
+            existing = _read_invoice_field(inv, "custom_payment_method")
+            frappe.logger("jarz_woocommerce.order_sync").warning({
+                "event": "woo_credit_payment_method_preserved",
+                "invoice": getattr(inv, "name", None),
+                "woo_order_id": woo_id,
+                "existing": existing,
+                "rejected_inbound_value": incoming,
+                "reason": reason,
+            })
+            create_sync_log_entry(
+                "CreditPaymentMethodPreserved",
+                "NeedsReview",
+                (
+                    f"woo_credit_payment_method_preserved: invoice "
+                    f"{getattr(inv, 'name', None)} is an on-account sale ({reason}); "
+                    f"kept custom_payment_method={existing!r} instead of writing "
+                    f"{incoming!r} from WooCommerce order {woo_id}. "
+                    "If the shop really paid by another method, change it in ERPNext."
+                ),
+                woo_order_id=woo_id,
+            )
+            return
+
+    try:
+        if inv.docstatus == 1:
+            inv.db_set("custom_payment_method", incoming, commit=False)
+        else:
+            inv.custom_payment_method = incoming
+    except Exception:
+        pass
+
+
+def _carry_credit_terms_from_source(
+    inv_data: dict[str, Any],
+    source_invoice_name: str | None,
+    woo_id: Any = None,
+) -> None:
+    """Preserve an on-account sale across a Woo-initiated amendment.
+
+    The replacement invoice is built from the Woo payload, and the store only
+    ever carried the gateway id the order was placed with -- never the fact that
+    a shop took it on account. Without this, amending a credit order converts an
+    open receivable into a Cash sale on the replacement.
+    """
+    if not source_invoice_name:
+        return
+
+    def _source_value(fieldname: str) -> Any:
+        try:
+            return frappe.db.get_value("Sales Invoice", source_invoice_name, fieldname)
+        except Exception:
+            # Un-migrated bench: the credit-terms column may not exist.
+            return None
+
+    source_method = _source_value("custom_payment_method")
+    terms = _source_value(CREDIT_TERMS_FIELD)
+
+    terms_days = 0.0
+    try:
+        terms_days = float(terms) if terms is not None else 0.0
+    except Exception:
+        terms_days = 0.0
+
+    if not (_is_credit_payment_method(source_method) or terms_days > 0):
+        return
+
+    # A credit sale the shop already settled is no longer an open receivable, and
+    # the amendment's paid lane will rebuild that payment from the source's own
+    # method. Carrying "Credit" onto the replacement there would hand the paid
+    # lane a method with no bank account behind it, so leave that case alone --
+    # the debt this guard exists to protect is the *unsettled* one.
+    try:
+        settled = frappe.db.exists(
+            "Payment Entry Reference",
+            {
+                "reference_doctype": "Sales Invoice",
+                "reference_name": source_invoice_name,
+                "docstatus": 1,
+            },
+        )
+    except Exception:
+        settled = None
+    if settled:
+        return
+
+    inv_data["custom_payment_method"] = CREDIT_PAYMENT_METHOD
+    if terms_days > 0:
+        inv_data[CREDIT_TERMS_FIELD] = terms
+
+    frappe.logger("jarz_woocommerce.order_sync").warning({
+        "event": "woo_credit_carried_to_amendment",
+        "source_invoice": source_invoice_name,
+        "woo_order_id": woo_id,
+        "credit_terms_days": terms,
+    })
+
+
 def _should_treat_inbound_order_as_paid(
     woo_status: str | None,
     custom_payment_method: str | None,
@@ -512,6 +694,14 @@ def _should_treat_inbound_order_as_paid(
     """Return whether inbound processing should settle the invoice with a Payment Entry."""
     status = _normalize_woo_status(woo_status)
     if status in NON_PAYABLE_WOO_STATUSES:
+        return False
+    # An on-account sale is unpaid by definition: the receivable stays open
+    # against the shop until it settles off-store. No store status can settle it.
+    # (Without this a historical re-import of a completed credit order would take
+    # the is_paid branch below; _resolve_paid_to_account has no account for
+    # "Credit", so it only ever produced a Payment Entry Creation Failed error --
+    # but "unpaid on purpose" should be stated here, not discovered downstream.)
+    if _is_credit_payment_method(custom_payment_method):
         return False
     if status_map and status_map.get("is_paid"):
         return True
@@ -4687,13 +4877,9 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 if duration_val is not None:
                     inv.custom_delivery_duration = int(duration_val) * 60  # seconds
                 if custom_payment_method:
-                    try:
-                        if inv.docstatus == 1:
-                            inv.db_set("custom_payment_method", custom_payment_method, commit=False)
-                        else:
-                            inv.custom_payment_method = custom_payment_method
-                    except Exception:
-                        pass
+                    # Guarded: this must never downgrade an on-account (Credit)
+                    # invoice to Cash on a later inbound update.
+                    _apply_inbound_payment_method(inv, custom_payment_method, woo_id=woo_id)
                 # Apply attribution fields (marketing source, UTM, referrer, device, session)
                 if attribution:
                     try:
@@ -4851,6 +5037,10 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 inv_data["selling_price_list"] = price_list
             if custom_payment_method:
                 inv_data["custom_payment_method"] = custom_payment_method
+            if amended_from:
+                # Same downgrade, one path over: the replacement is built from the
+                # Woo payload, which never knew this was an on-account sale.
+                _carry_credit_terms_from_source(inv_data, amended_from, woo_id=woo_id)
 
             if woo_status in ("completed", "out-for-delivery") and not is_historical:
                 # A live order the store already moved on before ERPNext first saw it.

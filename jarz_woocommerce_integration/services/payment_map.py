@@ -1,7 +1,7 @@
 """Bidirectional WooCommerce <-> ERPNext payment-method map.
 
-Single source of truth for the five payment methods this business actually
-uses. Both lanes read it, neither redefines it:
+Single source of truth for the payment methods this business actually uses.
+Both lanes read it, neither redefines it:
 
 * inbound  (``order_sync``)   Woo ``payment_method`` -> ``custom_payment_method``
 * outbound (``outbound_sync``) ``custom_payment_method`` -> Woo ``payment_method``
@@ -23,6 +23,31 @@ The legacy Woo ids (``card``, and bare ``kashier`` with a title-aware
 wallet/card split) are still *accepted* inbound because 10k historical orders
 carry them. They are never *emitted*: outbound only ever writes the canonical
 ids in :data:`ERPNEXT_TO_WOO`.
+
+Why credit gets its own id
+--------------------------
+``Credit`` means a B2B shop took the order on account: delivered, not paid, the
+receivable still open. Before it was in this table it hit the unknown-value
+fallback and shipped to the store as ``cod`` -- a credit order advertised to the
+customer as cash-on-delivery, and (because the inbound lane maps ``cod`` back to
+``Cash``) the round trip then rewrote the live invoice's
+``custom_payment_method`` to ``Cash`` and erased the debt from every jarz_pos
+query that keys on that column.
+
+So it emits ``credit``, an id no gateway on the store is registered under. That
+is a deliberate trade: an unregistered id means WooCommerce cannot resolve a
+gateway object for the order, so anything that asks the *gateway* to describe
+itself falls back to the raw slug or to nothing, and the store's "pay for this
+order" link has no gateway to hand off to. What still works is the part that
+matters: Woo stores ``payment_method_title`` as order meta and that is what
+admin, the order-received page and the customer emails render -- we push
+``Credit (On Account)`` there, always, even when the invoice spells it something
+else, because a bare ``Credit`` on a customer-facing order reads as *credit
+card*. A credit order is already delivered and settled off-store, so it never
+needs the pay link the missing gateway would have provided. The alternative --
+reusing an id the store already knows, e.g. ``cheque`` or ``bacs`` -- would
+render prettier and lie about how the money moves, which is the bug we are
+fixing, one gateway over.
 """
 
 from __future__ import annotations
@@ -39,6 +64,10 @@ ERPNEXT_INSTAPAY = "Instapay"
 ERPNEXT_MOBILE_WALLET = "Mobile Wallet"
 ERPNEXT_KASHIER_CARD = "Kashier Card"
 ERPNEXT_KASHIER_WALLET = "Kashier Wallet"
+#: A B2B shop took the order on account: delivered, not paid, the receivable
+#: stays open against the shop. jarz_pos writes this value at order creation.
+#: It is NOT cash-on-delivery and must never be emitted as ``cod``.
+ERPNEXT_CREDIT = "Credit"
 
 # --- Canonical WooCommerce payment-method ids ------------------------------
 WOO_COD = "cod"
@@ -46,6 +75,9 @@ WOO_INSTAPAY = "instapay"
 WOO_WALLET = "wallet"
 WOO_KASHIER_CARD = "kashier_card"
 WOO_KASHIER_WALLET = "kashier_wallet"
+#: Not a registered gateway on the store -- deliberately so. See the module
+#: docstring section "Why credit gets its own id".
+WOO_CREDIT = "credit"
 
 #: Woo ``payment_method`` (lowercased) -> ERPNext ``custom_payment_method``.
 #: Entries below the divider are legacy spellings accepted inbound only.
@@ -55,8 +87,13 @@ WOO_TO_ERPNEXT: dict[str, str] = {
     WOO_WALLET: ERPNEXT_MOBILE_WALLET,
     WOO_KASHIER_CARD: ERPNEXT_KASHIER_CARD,
     WOO_KASHIER_WALLET: ERPNEXT_KASHIER_WALLET,
+    WOO_CREDIT: ERPNEXT_CREDIT,
     # --- legacy inbound aliases, never emitted ---
     "card": ERPNEXT_KASHIER_CARD,
+    # Accepted so a store-side plugin that spells the on-account method
+    # differently still echoes back as Credit rather than as nothing.
+    "on_account": ERPNEXT_CREDIT,
+    "on-account": ERPNEXT_CREDIT,
 }
 
 #: ERPNext ``custom_payment_method`` -> (woo method id, default title).
@@ -69,11 +106,19 @@ ERPNEXT_TO_WOO: dict[str, tuple[str, str]] = {
     ERPNEXT_MOBILE_WALLET: (WOO_WALLET, "Mobile Wallet"),
     ERPNEXT_KASHIER_CARD: (WOO_KASHIER_CARD, "Kashier Card"),
     ERPNEXT_KASHIER_WALLET: (WOO_KASHIER_WALLET, "Kashier Wallet"),
+    ERPNEXT_CREDIT: (WOO_CREDIT, "Credit (On Account)"),
 }
 
+#: Values whose canonical title always wins over the raw invoice spelling.
+#: The passthrough rule ("push what the operator chose") is right for the five
+#: methods a consumer recognises, but a bare ``Credit`` on a customer-facing
+#: order reads as *credit card*. The one thing worse than an unfamiliar label
+#: is a familiar label that means something else.
+_TITLE_ALWAYS_CANONICAL: frozenset[str] = frozenset({ERPNEXT_CREDIT})
+
 #: ``OutboundConfig`` attribute that overrides the literal Woo id. Only the
-#: three the settings singleton exposes; Kashier has no configurable field, so
-#: it always emits the literal.
+#: three the settings singleton exposes; Kashier and Credit have no configurable
+#: field, so they always emit the literal.
 _CFG_FIELD_BY_ERPNEXT_VALUE: dict[str, str] = {
     ERPNEXT_CASH: "payment_cod",
     ERPNEXT_INSTAPAY: "payment_instapay",
@@ -97,6 +142,12 @@ _ERPNEXT_ALIASES: dict[str, str] = {
     "kashier_card": ERPNEXT_KASHIER_CARD,
     "kashier wallet": ERPNEXT_KASHIER_WALLET,
     "kashier_wallet": ERPNEXT_KASHIER_WALLET,
+    "credit": ERPNEXT_CREDIT,
+    "credit (on account)": ERPNEXT_CREDIT,
+    "on account": ERPNEXT_CREDIT,
+    "on-account": ERPNEXT_CREDIT,
+    "onaccount": ERPNEXT_CREDIT,
+    "on_account": ERPNEXT_CREDIT,
 }
 
 
@@ -158,4 +209,16 @@ def erpnext_to_woo(invoice_value: str | None, cfg: Any = None) -> tuple[str, str
         if override:
             method_id = override
 
+    if canonical in _TITLE_ALWAYS_CANONICAL:
+        return method_id, default_title
+
     return method_id, (raw or default_title)
+
+
+def is_credit(invoice_value: str | None) -> bool:
+    """True when this ERPNext-side spelling means the on-account credit sale.
+
+    The one question the inbound lane has to be able to ask before it overwrites
+    ``custom_payment_method`` on a live invoice.
+    """
+    return canonical_erpnext_value(invoice_value) == ERPNEXT_CREDIT

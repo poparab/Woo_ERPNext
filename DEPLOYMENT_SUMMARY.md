@@ -46,6 +46,11 @@ WooCommerce payment methods are automatically mapped to ERPNext `custom_payment_
 | `cod` | `Cash` |
 | `kashier_card` | `Kashier Card` |
 | `kashier_wallet` | `Kashier Wallet` |
+| `credit` / `on_account` | `Credit` |
+
+`Credit` is an on-account B2B sale (delivered, unpaid, receivable open). Outbound
+emits the id `credit` — never `cod` — and inbound never overwrites `Credit` (or an
+invoice carrying `custom_credit_terms_days > 0`) on a submitted invoice.
 
 ### 3. Kashier Payment Entry Creation
 
