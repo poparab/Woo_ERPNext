@@ -2848,6 +2848,27 @@ def _get_delivery_charge_rows(inv) -> list[dict[str, Any]]:
     return rows
 
 
+def _posted_delivery_charge_account(inv) -> str | None:
+    """The account a SUBMITTED invoice's shipping row is already posted to.
+
+    Rebuilding the row on a submitted invoice must keep that account. An
+    invoice posted before 2026-09 credits Freight; resolving the account afresh
+    would move it to Shipping Income, and ERPNext's on_update_after_submit
+    would then repost that invoice's ledger at its original date — rewriting
+    closed history, splitting it from any credit note already posted against
+    Freight, and failing outright inside a closed accounting period.
+    """
+    if int(getattr(inv, "docstatus", 0) or 0) != 1:
+        return None
+    for tax in inv.get("taxes", []) or []:
+        description = str(_tax_row_value(tax, "description", "") or "")
+        if description.startswith("Shipping Income"):
+            account = _tax_row_value(tax, "account_head", None)
+            if account:
+                return account
+    return None
+
+
 def _clear_delivery_charge_rows(inv) -> None:
     keep_rows = []
     for tax in inv.get("taxes", []) or []:
@@ -2941,12 +2962,14 @@ def _apply_delivery_charge_policy(
         channel=channel,
     )
 
+    posted_account = _posted_delivery_charge_account(inv)
     _clear_delivery_charge_rows(inv)
     if decision["amount"] > 0:
         add_delivery_charges_to_taxes(
             inv,
             decision["amount"],
             delivery_description=decision["description"],
+            account_head=posted_account,
         )
 
     try:

@@ -1723,3 +1723,32 @@ class TestShippingIncomeAccountPreference(unittest.TestCase):
 
     def test_last_resort_is_the_default_income_account(self):
         self.assertEqual(self._resolve(set()), "Sales - J")
+
+
+class TestPostedDeliveryChargeAccount(unittest.TestCase):
+    """A submitted invoice's shipping row keeps the account it was posted to."""
+
+    def _inv(self, docstatus, account):
+        taxes = [SimpleNamespace(description="Shipping Income (EG6OCT)", account_head=account, tax_amount=60)]
+        return SimpleNamespace(docstatus=docstatus, get=lambda f, d=None: taxes if f == "taxes" else d)
+
+    def test_submitted_invoice_keeps_the_legacy_freight_account(self):
+        inv = self._inv(1, "Freight and Forwarding Charges - J")
+        self.assertEqual(order_sync._posted_delivery_charge_account(inv), "Freight and Forwarding Charges - J")
+
+    def test_draft_is_free_to_move_to_shipping_income(self):
+        self.assertIsNone(order_sync._posted_delivery_charge_account(self._inv(0, "Freight and Forwarding Charges - J")))
+
+    def test_policy_rebuild_passes_the_posted_account_through(self):
+        inv = unittest.mock.MagicMock(docstatus=1)
+        inv.get.side_effect = lambda f, d=None: [
+            SimpleNamespace(description="Shipping Income (EG6OCT)", account_head="Freight and Forwarding Charges - J",
+                            tax_amount=60, charge_type="Actual")
+        ] if f == "taxes" else d
+        with unittest.mock.patch.object(
+            order_sync, "_resolve_delivery_charge_policy",
+            return_value={"amount": 60.0, "description": "Shipping Income (EG6OCT)", "reason": "x"},
+        ), unittest.mock.patch.object(order_sync, "add_delivery_charges_to_taxes") as add,                 unittest.mock.patch.object(order_sync.frappe, "logger"):
+            order_sync._apply_delivery_charge_policy(inv, "EG6OCT", False)
+
+        self.assertEqual(add.call_args.kwargs["account_head"], "Freight and Forwarding Charges - J")
