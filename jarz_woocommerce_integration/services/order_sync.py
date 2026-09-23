@@ -2330,25 +2330,43 @@ def _extract_attribution(meta_data_list: "list[dict] | None") -> dict:
     return result
 
 
-def _get_shipping_income_account(company: str) -> str | None:
-    """Return Freight and Forwarding Charges account for the company if it exists."""
+def _company_leaf_account(company: str, account_name: str) -> str | None:
     abbr = frappe.db.get_value("Company", company, "abbr") or ""
-    # Prefer exact account name with company abbreviation suffix
-    candidate_filters = []
-    if abbr:
-        candidate_filters.append({"name": f"Freight and Forwarding Charges - {abbr}"})
-        candidate_filters.append({"account_name": f"Freight and Forwarding Charges - {abbr}"})
-    candidate_filters.append({"account_name": "Freight and Forwarding Charges"})
-    candidate_filters.append({"name": "Freight and Forwarding Charges"})
-
-    for filters in candidate_filters:
+    candidates = [{"name": f"{account_name} - {abbr}"}] if abbr else []
+    candidates.append({"account_name": account_name})
+    for filters in candidates:
         try:
-            account = frappe.db.get_value("Account", {"company": company, **filters}, "name")
+            account = frappe.db.get_value("Account", {"company": company, "is_group": 0, **filters}, "name")
             if account:
                 return account
         except Exception:
             continue
-    return frappe.db.get_value("Company", company, "default_income_account")
+    return None
+
+
+def _legacy_shipping_income_account(company: str) -> str | None:
+    """Freight and Forwarding Charges — where the delivery charge was booked before 2026-09.
+
+    It is the courier *expense* ledger, so crediting the customer's charge to it
+    netted income against cost. Still recognised when READING old invoices'
+    rows; only written on a site that has no ``Shipping Income`` account yet.
+    """
+    return _company_leaf_account(company, "Freight and Forwarding Charges")
+
+
+def _get_shipping_income_account(company: str) -> str | None:
+    """Return the account the customer's delivery charge is credited to.
+
+    ``Shipping Income - <abbr>`` (created by jarz_pos's
+    ``create_expense_classification_accounts`` patch). Falls back to the legacy
+    Freight account, then the company's default income account, so an order
+    never fails to import over a missing ledger.
+    """
+    return (
+        _company_leaf_account(company, "Shipping Income")
+        or _legacy_shipping_income_account(company)
+        or frappe.db.get_value("Company", company, "default_income_account")
+    )
 
 
 def add_delivery_charges_to_taxes(inv, amount: float, delivery_description: str | None = None, account_head: str | None = None) -> None:

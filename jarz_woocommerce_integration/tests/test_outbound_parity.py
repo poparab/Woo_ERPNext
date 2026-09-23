@@ -557,11 +557,36 @@ class TestDiscountFeeLines(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestShippingTotal(unittest.TestCase):
-    def _compute(self, invoice, account="Freight and Forwarding Charges - J"):
+    def _compute(self, invoice, account="Freight and Forwarding Charges - J", legacy=None):
         with unittest.mock.patch.object(
             outbound_sync, "_resolve_shipping_income_account", return_value=account
+        ), unittest.mock.patch.object(
+            outbound_sync, "_resolve_legacy_shipping_income_account", return_value=legacy
         ):
             return outbound_sync._compute_shipping_total(invoice)
+
+    def test_matches_a_row_on_the_new_shipping_income_account(self):
+        invoice = _invoice([], taxes=[
+            SimpleNamespace(charge_type="Actual", account_head="Shipping Income - J",
+                            description="Shipping Income (Nasr City)", tax_amount=45),
+        ])
+
+        self.assertEqual(
+            self._compute(invoice, account="Shipping Income - J", legacy="Freight and Forwarding Charges - J"), 45
+        )
+
+    def test_an_invoice_written_before_the_split_still_matches_by_account(self):
+        """Its row sits on Freight; it must not fall to the description fallback."""
+        invoice = _invoice([], taxes=[
+            SimpleNamespace(charge_type="Actual", account_head="Freight and Forwarding Charges - J",
+                            description="Shipping Income (Nasr City)", tax_amount=40),
+        ])
+
+        with unittest.mock.patch.object(outbound_sync.LOGGER, "warning") as warning:
+            total = self._compute(invoice, account="Shipping Income - J", legacy="Freight and Forwarding Charges - J")
+
+        self.assertEqual(total, 40)
+        warning.assert_not_called()
 
     def test_matches_on_the_shipping_income_account(self):
         invoice = _invoice([], taxes=[
@@ -1666,3 +1691,35 @@ class TestLineItemNaming(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShippingIncomeAccountPreference(unittest.TestCase):
+    """Inbound writes the delivery charge to Shipping Income, not the Freight expense."""
+
+    def _db(self, accounts):
+        def get_value(doctype, filters, fieldname=None, **_):
+            if doctype == "Company":
+                return {"abbr": "J", "default_income_account": "Sales - J"}.get(fieldname)
+            if doctype == "Account":
+                name = filters.get("name")
+                return name if name in accounts else None
+            return None
+
+        db = unittest.mock.MagicMock()
+        db.get_value.side_effect = get_value
+        return db
+
+    def _resolve(self, accounts):
+        with unittest.mock.patch.object(order_sync.frappe, "db", self._db(accounts)):
+            return order_sync._get_shipping_income_account("JARZ")
+
+    def test_prefers_shipping_income(self):
+        self.assertEqual(
+            self._resolve({"Shipping Income - J", "Freight and Forwarding Charges - J"}), "Shipping Income - J"
+        )
+
+    def test_unpatched_site_keeps_the_legacy_freight_account(self):
+        self.assertEqual(self._resolve({"Freight and Forwarding Charges - J"}), "Freight and Forwarding Charges - J")
+
+    def test_last_resort_is_the_default_income_account(self):
+        self.assertEqual(self._resolve(set()), "Sales - J")

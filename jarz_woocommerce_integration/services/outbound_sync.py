@@ -2754,6 +2754,19 @@ def _resolve_shipping_income_account(company: str | None) -> str | None:
         return None
 
 
+def _resolve_legacy_shipping_income_account(company: str | None) -> str | None:
+    """Freight and Forwarding Charges: where shipping rows were booked before 2026-09."""
+    company = str(company or "").strip()
+    if not company:
+        return None
+    try:
+        from jarz_woocommerce_integration.services.order_sync import _legacy_shipping_income_account
+
+        return _legacy_shipping_income_account(company)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _compute_shipping_total(invoice: frappe.model.document.Document) -> float:
     """Sum the invoice's shipping-income charge rows.
 
@@ -2770,8 +2783,14 @@ def _compute_shipping_total(invoice: frappe.model.document.Document) -> float:
     word shipping" fallback is gone — it could only ever double-count a real
     product.
     """
-    shipping_account = _resolve_shipping_income_account(getattr(invoice, "company", None))
-    normalized_account = str(shipping_account or "").strip().casefold()
+    company = getattr(invoice, "company", None)
+    shipping_account = _resolve_shipping_income_account(company)
+    # An invoice written before 2026-09 carries its row on the legacy Freight
+    # account; one written after, on Shipping Income. Both are the same charge.
+    shipping_accounts = {
+        str(acc or "").strip().casefold()
+        for acc in (shipping_account, _resolve_legacy_shipping_income_account(company))
+    } - {""}
 
     shipping_total = 0.0
     fallback_total = 0.0
@@ -2783,7 +2802,7 @@ def _compute_shipping_total(invoice: frappe.model.document.Document) -> float:
         account = str(getattr(tax, "account_head", "") or "").strip()
         amount = flt(getattr(tax, "tax_amount", 0))
 
-        if normalized_account and account.casefold() == normalized_account:
+        if account.casefold() in shipping_accounts:
             shipping_total += amount
             continue
 
