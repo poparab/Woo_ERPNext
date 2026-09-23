@@ -20,6 +20,7 @@ from jarz_woocommerce_integration.services.geo_passthrough import (
     resolve_order_pins as _resolve_order_geo_pins,
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
+    customer_holds_woo_id_as_alias,
     customer_woo_id_holders,
     customer_woo_id_is_claimed_by_other,
     find_customer_by_woo_id,
@@ -557,14 +558,18 @@ def _ensure_customer(email: Optional[str], first_name: str | None, last_name: st
     if woo_customer_id and _field_exists("Customer", "woo_customer_id"):
         name = find_customer_by_woo_id(woo_customer_id)
         if name:
-            _update_customer_identity(
-                name,
-                woo_customer_id=woo_customer_id,
-                username=username,
-                phone_norm=phone_norm,
-                email=email,
-                customer_cache=customer_cache,
-            )
+            # An absorbed Woo account (merged in as a branch) routes here, but its
+            # username/phone/email are the OLD account's and must not be written
+            # onto the survivor, not even into blank fields.
+            if not customer_holds_woo_id_as_alias(name, woo_customer_id):
+                _update_customer_identity(
+                    name,
+                    woo_customer_id=woo_customer_id,
+                    username=username,
+                    phone_norm=phone_norm,
+                    email=email,
+                    customer_cache=customer_cache,
+                )
             _cache_customer(customer_cache, name, woo_customer_id, username, phone_norm, email)
             return name
 
@@ -1727,6 +1732,15 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
         phone=phone,
         woo_customer_id=woo_cust_id,
     )
+    if customer_holds_woo_id_as_alias(customer_name, woo_cust_id):
+        # An absorbed Woo account (merged into this Customer as a branch) still
+        # routes to it, but its profile is the OLD account's: its name, phone,
+        # email, default addresses and territory must never overwrite the
+        # survivor's. Orders from it still land here via the order path.
+        frappe.logger("woo").info(
+            f"customer_profile_sync_skipped_alias woo_customer_id={woo_cust_id} customer={customer_name!r}"
+        )
+        return {"customer": customer_name, "billing": None, "shipping": None, "alias": True}
     _update_customer_identity(
         customer_name,
         woo_customer_id=woo_cust_id,

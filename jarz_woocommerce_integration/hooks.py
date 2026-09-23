@@ -151,6 +151,10 @@ doc_events = {
 	"Customer": {
 		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_customer_sync",
 		"on_update": "jarz_woocommerce_integration.services.outbound_sync.enqueue_customer_sync",
+		# A merge deletes the absorbed Customer and its Woo binding with it; this
+		# carries that binding onto the survivor (primary or alias). See
+		# services/customer_merge_aliases.py.
+		"after_rename": "jarz_woocommerce_integration.services.customer_merge_aliases.carry_source_binding",
 	},
 	"Address": {
 		"after_insert": [

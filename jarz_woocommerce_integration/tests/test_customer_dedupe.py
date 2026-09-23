@@ -155,7 +155,7 @@ class TestBuildPlanClassification(unittest.TestCase):
         """+20… and 0… are the same subscriber, so they must group together."""
         plan = self._plan([
             _cust("Hind Eltayeb", "01558576130", "1"),
-            _cust("Hind Eltayeb - 1", "+201558576130", "2"),
+            _cust("Hind Eltayeb - 1", "+201558576130", ""),
         ])
         self.assertEqual(len(plan["auto"]), 1)
         self.assertEqual(plan["auto"][0]["size"], 2)

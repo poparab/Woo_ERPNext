@@ -64,6 +64,7 @@ DEFAULT_MODULES = (
     "test_outbound_customer_collision",
     "test_outbound_placeholder_email",
     "test_customer_dedupe",
+    "test_customer_merge_aliases",
 )
 
 _PACKAGE = "jarz_woocommerce_integration.tests"

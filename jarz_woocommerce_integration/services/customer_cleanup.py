@@ -19,7 +19,11 @@ from jarz_woocommerce_integration.services.customer_sync import (
     _source_address_signature,
     _stored_address_signature,
 )
-from jarz_woocommerce_integration.utils.customer_woo_id import normalize_woo_customer_id
+from jarz_woocommerce_integration.utils.customer_woo_id import (
+    ALIAS_FIELD,
+    normalize_woo_customer_id,
+    parse_woo_id_aliases,
+)
 from jarz_woocommerce_integration.utils.http_client import WooClient
 
 
@@ -104,7 +108,7 @@ def _load_customer_rows() -> list[dict[str, Any]]:
         "woo_customer_id",
         "mobile_no",
     ]
-    for fieldname in ("custom_woo_customer_id", "phone", "email_id", "woo_username"):
+    for fieldname in ("custom_woo_customer_id", "phone", "email_id", "woo_username", ALIAS_FIELD):
         if _field_exists("Customer", fieldname):
             select_fields.append(fieldname)
         else:
@@ -146,6 +150,7 @@ def _build_customer_indexes(rows: list[dict[str, Any]]) -> dict[str, Any]:
     indexes: dict[str, Any] = {
         "by_name": {},
         "by_canonical_id": defaultdict(list),
+        "by_alias_id": defaultdict(list),
         "by_phone": defaultdict(list),
         "by_email": defaultdict(list),
         "by_username": defaultdict(list),
@@ -157,6 +162,8 @@ def _build_customer_indexes(rows: list[dict[str, Any]]) -> dict[str, Any]:
         canonical_id = normalize_woo_customer_id(row.get("woo_customer_id"))
         if canonical_id:
             indexes["by_canonical_id"][canonical_id].append(row["name"])
+        for alias_id in parse_woo_id_aliases(row.get(ALIAS_FIELD)):
+            indexes["by_alias_id"][alias_id].append(row["name"])
 
         for phone_value in (row.get("mobile_no"), row.get("phone")):
             phone_norm = _normalize_phone(phone_value)
@@ -223,6 +230,12 @@ def _resolve_woo_customer(cust: dict[str, Any], indexes: dict[str, Any]) -> dict
             "reason": "duplicate_canonical_woo_id",
             "customers": list(exact_matches),
         }
+    # A Woo account absorbed by a merge (kept as the survivor's alias). It must
+    # not fall through to phone/create, and its profile is the OLD account's:
+    # never sync it or let its addresses decide the survivor's defaults.
+    alias_matches = (indexes.get("by_alias_id") or {}).get(woo_id, []) if woo_id else []
+    if alias_matches:
+        return {"bucket": "alias_woo_id", "customer": alias_matches[0]}
 
     phone_matches = indexes["by_phone"].get(phone, []) if phone else []
     if len(phone_matches) == 1:
@@ -464,6 +477,7 @@ def run_customer_cleanup(
         "last_page_fetched": last_page_fetched,
         "woo_customers_scanned": len(window_woo_customers),
         "exact_woo_id": 0,
+        "alias_woo_id": 0,
         "phone_merge": 0,
         "safe_create": 0,
         "blocked_duplicate_woo_id": 0,
@@ -517,6 +531,8 @@ def run_customer_cleanup(
 
         if in_window:
             summary[bucket] += 1
+        if bucket == "alias_woo_id":
+            continue
 
         if not dry_run and in_window:
             sync_result = _sync_single_customer(cust)

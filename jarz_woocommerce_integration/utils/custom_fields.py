@@ -346,6 +346,17 @@ REQUIRED_FIELDS = [
         "insert_after": "woo_customer_id",
     },
     {
+        # Absorbed Woo accounts this Customer also answers for (",6540,7011,").
+        # Written only by a Customer merge; read by find_customer_by_woo_id.
+        "dt": "Customer",
+        "fieldname": "woo_customer_id_aliases",
+        "fieldtype": "Small Text",
+        "label": "Woo Customer ID Aliases",
+        "insert_after": "woo_outbound_status",
+        "read_only": 1,
+        "no_copy": 1,
+    },
+    {
         "dt": "Customer",
         "fieldname": "woo_outbound_error",
         "fieldtype": "Small Text",

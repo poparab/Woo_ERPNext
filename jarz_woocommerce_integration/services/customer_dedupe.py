@@ -54,7 +54,10 @@ from jarz_woocommerce_integration.services.customer_sync import (
     _suppress_woo_outbound,
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
+    ALIAS_FIELD,
+    customer_woo_id_alias_column_exists,
     customer_woo_id_column_exists,
+    parse_woo_id_aliases,
 )
 
 LOGGER = frappe.logger("jarz_woocommerce.customer_dedupe")
@@ -226,6 +229,14 @@ def build_plan() -> dict[str, Any]:
 
         bases = {m["base"] for m in members}
         group_woo = [m["woo_customer_id"] for m in members if m["woo_customer_id"]]
+        if len(bases) == 1 and len(set(group_woo)) > 1:
+            # A merge would now keep every binding (the losers' ids become the
+            # survivor's aliases), so _diff no longer stops this. Two different
+            # Woo accounts are two logins -- possibly two people on one phone --
+            # and folding them is a judgement, not a dedupe.
+            entry["reason"] = f"members hold different woo_customer_ids {sorted(set(group_woo))}"
+            review.append(entry)
+            continue
         shared_exclusive = {
             woo for woo in set(group_woo)
             if group_woo.count(woo) > 1 and woo_holders[woo] == group_woo.count(woo)
@@ -303,6 +314,18 @@ def _woo_ids(names: list[str]) -> list[str]:
         value = str((row[0] if row else "") or "").strip()
         if value and value != "0":
             found.add(value)
+    # A binding the survivor keeps as an alias is still held: the merge hook
+    # (services/customer_merge_aliases.py) moves a loser's differing id there.
+    if customer_woo_id_alias_column_exists():
+        try:
+            alias_rows = frappe.db.sql(
+                f"SELECT `{ALIAS_FIELD}` FROM `tabCustomer` WHERE name IN ({placeholders})",
+                tuple(names),
+            ) or []
+        except Exception:  # noqa: BLE001
+            alias_rows = []
+        for row in alias_rows:
+            found.update(parse_woo_id_aliases(row[0] if row else ""))
     return sorted(found)
 
 

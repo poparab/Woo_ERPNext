@@ -27,6 +27,8 @@ from jarz_woocommerce_integration.utils.customer_woo_id import (
     customer_woo_id_holders,
     customer_woo_id_is_claimed_by_other,
     get_customer_woo_id,
+    get_customer_woo_id_aliases,
+    normalize_woo_customer_id,
     get_legacy_customer_woo_id,
     has_unmigrated_legacy_customer_woo_id,
     set_customer_woo_id,
@@ -4329,6 +4331,32 @@ def _order_payload_requires_update(existing_order: dict, payload: dict) -> bool:
     return False
 
 
+def _order_woo_customer_id(invoice, customer_doc, existing_order: Optional[dict]) -> Optional[str]:
+    """The Woo account an order should sit under.
+
+    A Customer merged from two branches answers for several Woo accounts (its
+    own id plus ``woo_customer_id_aliases``). An order that already belongs to
+    one of THOSE accounts stays there: sending the survivor's own id would move
+    the absorbed branch's orders into the other branch's My Account on every
+    status push. Only an order whose account is not one of this Customer's
+    (the invoice was reassigned to another customer) is moved, exactly as
+    before; with no aliases the answer is always the Customer's own id.
+    """
+    own = get_customer_woo_id(customer_doc)
+    customer_name = getattr(customer_doc, "name", None)
+    allowed = {own} if own else set()
+    if customer_name:
+        allowed.update(get_customer_woo_id_aliases(customer_name))
+    for candidate in (
+        invoice.get("woo_customer_id_snapshot") if hasattr(invoice, "get") else None,
+        (existing_order or {}).get("customer_id"),
+    ):
+        normalized = normalize_woo_customer_id(candidate)
+        if normalized and normalized in allowed:
+            return normalized
+    return own
+
+
 def _build_order_payload(
     invoice: frappe.model.document.Document,
     cfg: OutboundConfig,
@@ -4496,7 +4524,7 @@ def _build_order_payload(
     # *stores* these two keys -- all live tracking happens browser -> ERPNext.
     payload["meta_data"].extend(_build_tracking_metadata(invoice))
 
-    woo_customer_id = get_customer_woo_id(customer_doc)
+    woo_customer_id = _order_woo_customer_id(invoice, customer_doc, existing_order)
     if woo_customer_id:
         payload["customer_id"] = cint(woo_customer_id)
 

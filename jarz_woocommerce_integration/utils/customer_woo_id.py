@@ -7,6 +7,17 @@ import frappe
 
 _CUSTOMER_COLUMN_CACHE: dict[str, bool] = {}
 
+# Woo accounts a Customer ALSO answers for, beyond its own woo_customer_id.
+#
+# One shop can reach ERPNext as two Customers, each bound to its own Woo account
+# (two branches of one brand, each once registered on the site). When the two
+# Customers are merged, the absorbed account's id has nowhere to live: the
+# survivor keeps its own woo_customer_id, and the next order or profile event
+# from the absorbed account would find nobody and mint the duplicate again.
+# The absorbed id is kept here instead, stored as ",6540,7011," so a LIKE on
+# ",<id>," can never match a longer id that merely contains it.
+ALIAS_FIELD = "woo_customer_id_aliases"
+
 
 def _customer_has_column(fieldname: str) -> bool:
     cached = _CUSTOMER_COLUMN_CACHE.get(fieldname)
@@ -36,7 +47,11 @@ def _customer_has_column(fieldname: str) -> bool:
         except Exception:
             result = False
 
-    _CUSTOMER_COLUMN_CACHE[fieldname] = result
+    # A "no" for the alias column is not cached: a long-lived worker that asked
+    # before the migrate added it would otherwise ignore aliases until restart,
+    # fall through to phone/email and could mint a customer holding the id.
+    if result or fieldname != ALIAS_FIELD:
+        _CUSTOMER_COLUMN_CACHE[fieldname] = result
     return result
 
 
@@ -102,6 +117,87 @@ def has_unmigrated_legacy_customer_woo_id(customer: Any) -> bool:
     return not get_customer_woo_id(customer) and bool(get_legacy_customer_woo_id(customer))
 
 
+def customer_woo_id_alias_column_exists() -> bool:
+    return _customer_has_column(ALIAS_FIELD)
+
+
+def parse_woo_id_aliases(value: Any) -> list[str]:
+    """``",6540,7011,"`` -> ``["6540", "7011"]`` (normalised, de-duplicated)."""
+    out: list[str] = []
+    for part in str(value or "").replace(";", ",").split(","):
+        normalized = normalize_woo_customer_id(part.strip())
+        if normalized and normalized not in out:
+            out.append(normalized)
+    return out
+
+
+def format_woo_id_aliases(ids: Any) -> str:
+    cleaned = parse_woo_id_aliases(",".join(str(i) for i in (ids or [])))
+    return f",{','.join(cleaned)}," if cleaned else ""
+
+
+def get_customer_woo_id_aliases(customer_name: str) -> list[str]:
+    if not customer_name or not customer_woo_id_alias_column_exists():
+        return []
+    try:
+        value = frappe.db.get_value("Customer", customer_name, ALIAS_FIELD)
+    except Exception:
+        return []
+    return parse_woo_id_aliases(value)
+
+
+def _alias_holders(normalized: str, limit: int = 2) -> list[str]:
+    if not normalized or not customer_woo_id_alias_column_exists():
+        return []
+    try:
+        return frappe.db.get_values(
+            "Customer",
+            {ALIAS_FIELD: ["like", f"%,{normalized},%"]},
+            "name",
+            order_by="creation asc",
+            limit=limit,
+            pluck=True,
+        ) or []
+    except Exception:
+        return []
+
+
+def customer_holds_woo_id_as_alias(customer_name: str, woo_customer_id: Any) -> bool:
+    """Did *customer_name* answer for *woo_customer_id* only through an alias?
+
+    True means the Woo account is an absorbed one: it may route an order to this
+    Customer, but it must never rewrite who this Customer is.
+    """
+    normalized = normalize_woo_customer_id(woo_customer_id)
+    if not normalized or not customer_name:
+        return False
+    if get_customer_woo_id(customer_name) == normalized:
+        return False
+    return normalized in get_customer_woo_id_aliases(customer_name)
+
+
+def record_woo_id_aliases(customer_name: str, ids: Any) -> list[str]:
+    """Add *ids* to the Customer's aliases, never its own primary id.
+
+    Returns the resulting alias list. A no-op (returns ``[]``) when the column is
+    absent, so a site that has not migrated keeps today's behaviour.
+    """
+    if not customer_name or not customer_woo_id_alias_column_exists():
+        return []
+    primary = get_customer_woo_id(customer_name)
+    current = get_customer_woo_id_aliases(customer_name)
+    merged = list(current)
+    for value in parse_woo_id_aliases(",".join(str(i) for i in (ids or []))):
+        if value != primary and value not in merged:
+            merged.append(value)
+    if merged != current:
+        frappe.db.set_value(
+            "Customer", customer_name, ALIAS_FIELD, format_woo_id_aliases(merged),
+            update_modified=False,
+        )
+    return merged
+
+
 def find_customer_by_woo_id(woo_customer_id: Any) -> str | None:
     """Resolve the single Customer bound to *woo_customer_id*.
 
@@ -134,7 +230,16 @@ def find_customer_by_woo_id(woo_customer_id: Any) -> str | None:
         pluck=True,
     ) or []
     if not matches:
-        return None
+        # A primary holder always wins; only when nobody holds the id as their
+        # own does an absorbed-account alias answer for it.
+        aliased = _alias_holders(normalized)
+        if len(aliased) > 1:
+            frappe.logger("woo").warning(
+                f"ambiguous_woo_customer_id_alias id={normalized} "
+                f"(e.g. {aliased[0]!r}, {aliased[1]!r}); falling back to phone identity"
+            )
+            return None
+        return aliased[0] if aliased else None
     if len(matches) > 1:
         frappe.logger("woo").warning(
             f"ambiguous_woo_customer_id id={normalized} claimed_by_multiple_customers "
@@ -184,6 +289,11 @@ def customer_woo_id_holders(
         ) or []
     except Exception:
         return []
+    # A Customer answering for the id through an alias holds it just as much:
+    # stamping it on anyone else would split one Woo account across two records.
+    for holder in _alias_holders(normalized, limit=limit):
+        if holder not in holders:
+            holders.append(holder)
     return [holder for holder in holders if holder and holder != exclude]
 
 
