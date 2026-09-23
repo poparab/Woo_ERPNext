@@ -44,9 +44,13 @@ class TestFindCustomerByWooId(unittest.TestCase):
         captured = {}
 
         def _get_values(_doctype, filters, fieldname, **kwargs):
-            captured["filters"] = filters
-            captured.update(kwargs)
-            return ["CUST-0001"]
+            # The primary-id query comes first; the alias probe that follows
+            # (woo_customer_id_aliases) must not overwrite what is pinned here.
+            if "filters" not in captured:
+                captured["filters"] = filters
+                captured.update(kwargs)
+                return ["CUST-0001"]
+            return []
 
         with patch.object(customer_woo_id, "_customer_has_column", return_value=True), \
              patch.object(customer_woo_id.frappe.db, "get_values", side_effect=_get_values):

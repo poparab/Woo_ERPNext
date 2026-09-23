@@ -6,8 +6,8 @@ survivor keeps 7000; 6540 would otherwise vanish with the deleted record, and
 the next order, order update or profile event from it would find nobody and
 mint the duplicate again. These tests pin:
 
-* ``find_customer_by_woo_id`` answers for an alias only when no Customer holds
-  the id as its own, and refuses to guess between two alias holders;
+* ``find_customer_by_woo_id`` answers for an alias only when it is the id's
+  sole holder, and refuses to guess when anyone else holds it (own or alias);
 * the "already claimed" guard counts alias holders, so the id is never stamped
   on a stranger;
 * the after_rename hook carries the source's binding to the survivor -- as its primary
@@ -98,9 +98,12 @@ class TestAliasResolution(_Patched):
         self.assertIsNone(cwi.find_customer_by_woo_id(654))
         self.assertEqual(cwi.find_customer_by_woo_id(65400), "Someone")
 
-    def test_primary_holder_beats_an_alias(self):
-        self.table.rows["New holder"] = {"woo_customer_id": "6540"}
-        self.assertEqual(cwi.find_customer_by_woo_id(6540), "New holder")
+    def test_an_id_also_held_as_someone_elses_own_is_ambiguous(self):
+        # Staging 2026-09-23: 5274 was a stranger's own id AND the merged
+        # survivor's alias. Resolving to the stranger would hand them the
+        # absorbed branch's orders; the only safe answer is "ambiguous".
+        self.table.rows["Stranger"] = {"woo_customer_id": "6540"}
+        self.assertIsNone(cwi.find_customer_by_woo_id(6540))
 
     def test_two_alias_holders_are_ambiguous(self):
         self.table.rows["Other"] = {"woo_customer_id_aliases": ",6540,"}

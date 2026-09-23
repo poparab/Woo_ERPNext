@@ -229,24 +229,29 @@ def find_customer_by_woo_id(woo_customer_id: Any) -> str | None:
         limit=2,
         pluck=True,
     ) or []
-    if not matches:
-        # A primary holder always wins; only when nobody holds the id as their
-        # own does an absorbed-account alias answer for it.
-        aliased = _alias_holders(normalized)
-        if len(aliased) > 1:
-            frappe.logger("woo").warning(
-                f"ambiguous_woo_customer_id_alias id={normalized} "
-                f"(e.g. {aliased[0]!r}, {aliased[1]!r}); falling back to phone identity"
-            )
-            return None
-        return aliased[0] if aliased else None
     if len(matches) > 1:
         frappe.logger("woo").warning(
             f"ambiguous_woo_customer_id id={normalized} claimed_by_multiple_customers "
             f"(e.g. {matches[0]!r}, {matches[1]!r}); falling back to phone identity"
         )
         return None
-    return matches[0]
+    # Aliases (Woo accounts absorbed by a Customer merge) count as holders too.
+    # An id held by more than one Customer -- as own id or as alias -- stays
+    # ambiguous. A merge must never turn an already-shared id into a clean
+    # answer: on staging a merge absorbed 5274 while a stranger also held 5274
+    # as their own, and "own id wins" would have routed the absorbed account's
+    # orders and profile to that stranger instead of falling back to phone.
+    holders = list(matches)
+    for holder in _alias_holders(normalized):
+        if holder not in holders:
+            holders.append(holder)
+    if len(holders) > 1:
+        frappe.logger("woo").warning(
+            f"ambiguous_woo_customer_id id={normalized} held_by_multiple_customers_incl_aliases "
+            f"(e.g. {holders[0]!r}, {holders[1]!r}); falling back to phone identity"
+        )
+        return None
+    return holders[0] if holders else None
 
 
 def customer_woo_id_column_exists() -> bool:
