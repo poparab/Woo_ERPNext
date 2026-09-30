@@ -4346,6 +4346,10 @@ def _protected_existing_line_ids(
     Two independent signals mark a parent, and we honour either one:
     the line is referenced by a sibling's ``_woosb_parent_id``, or its
     ``product_id`` is registered in Woo Jarz Bundle.
+
+    Protection only keeps a line off the removal list. When the invoice no
+    longer holds that bundle at all, `_abandoned_bundle_parent_updates` zeroes
+    the parent line's price instead.
     """
     existing_lines = existing_order.get("line_items") or []
     if not existing_lines:
@@ -4364,13 +4368,7 @@ def _protected_existing_line_ids(
             if line_id and str(_extract_item_code(entry) or "") in protected_item_codes:
                 protected.add(line_id)
 
-    parent_product_ids: set[str] = set()
-    for entry in existing_lines:
-        raw = _extract_meta_value(entry, "_woosb_parent_id")
-        if raw:
-            parent_product_ids.add(str(raw).strip())
-    parent_product_ids |= _get_registered_bundle_product_ids(invoice)
-
+    parent_product_ids = _existing_bundle_parent_product_ids(invoice, existing_lines)
     if not parent_product_ids:
         return protected
 
@@ -4380,6 +4378,178 @@ def _protected_existing_line_ids(
         if product_id and line_id and str(product_id) in parent_product_ids:
             protected.add(line_id)
     return protected
+
+
+def _existing_bundle_parent_product_ids(
+    invoice: frappe.model.document.Document,
+    existing_lines: list[dict],
+) -> set[str]:
+    """Woo product ids that are a WooSB bundle parent on this order.
+
+    Either signal is enough: a sibling line names the product in
+    ``_woosb_parent_id``, or the product is registered in Woo Jarz Bundle.
+    """
+    parent_product_ids: set[str] = set()
+    for entry in existing_lines:
+        raw = _extract_meta_value(entry, "_woosb_parent_id")
+        if raw:
+            parent_product_ids.add(str(raw).strip())
+    parent_product_ids |= _get_registered_bundle_product_ids(invoice)
+    return parent_product_ids
+
+
+def _invoice_row_product_ids(invoice: frappe.model.document.Document) -> Optional[set[str]]:
+    """The Woo product id of every invoice row, or ``None`` when a bundle cannot be placed.
+
+    ``None`` means "cannot tell whether a bundle is still on this invoice", and
+    it is returned for any row we cannot tie to a Woo product: a row with no
+    Woo mapping at all (an unmapped bundle parent is exactly that, and on a
+    legacy flag-free invoice nothing else marks it), an explicit parent whose
+    Item is not a plain product, and an explicit child whose parent is not on
+    the invoice with a mapping. Returned rows (qty <= 0) count too — being
+    present is what keeps a store line protected.
+    """
+    item_product_rows: dict[str, dict[str, Any]] = {}
+    explicit_parents = _collect_explicit_bundle_parent_product_ids(
+        invoice,
+        item_product_rows=item_product_rows,
+    )
+    present: set[str] = set()
+    for item in getattr(invoice, "items", []) or []:
+        item_code = str(getattr(item, "item_code", "") or "").strip()
+        if not item_code:
+            continue
+        product_id, variation_id = _resolve_item_product_identity(
+            _get_item_product_row(item_code, cache=item_product_rows)
+        )
+        if product_id is None and variation_id is None:
+            return None
+        if product_id is not None:
+            present.add(str(product_id))
+        if _is_explicit_bundle_parent_item(item) and (product_id is None or variation_id is not None):
+            return None
+        if _is_explicit_bundle_child_item(item) and _get_bundle_link_key(item) not in explicit_parents:
+            return None
+    return present
+
+
+def _abandoned_bundle_parent_updates(
+    invoice: frappe.model.document.Document,
+    existing_order: dict,
+    orphaned: list[dict],
+    *,
+    protected_ids: set[int],
+    protected_item_codes: set[str] | None = None,
+) -> list[dict]:
+    """Zero the store's bundle parent line when the invoice no longer holds that bundle.
+
+    `_protected_existing_line_ids` keeps a WooSB parent line off the removal
+    list, which is right while the invoice still carries the bundle. It is
+    wrong once an amendment has turned the bundle into plain lines: the
+    parent line keeps its full bundle price while the jars are now pushed
+    priced as well, so the store bills the bundle twice. Woo 17751 /
+    ``ACC-SINV-2026-18618-1``, 2026-09-30: parent line 62812 "Jarz Royal Feast"
+    stayed at 960, the store total became 2,000 against an invoice of 1,040,
+    and `_check_response_total` marked the invoice Error.
+
+    Such a line is sent back with ``subtotal`` and ``total`` of ``"0.00"``
+    rather than removed. WooSB may cascade a parent's deletion to its child
+    lines, and those children are now the invoice's own priced jars. Zeroing
+    moves the money and leaves every line in place.
+
+    A line is zeroed only when every one of these holds:
+
+    * it is an orphan the protection kept, protected as a bundle parent
+      (a sibling's ``_woosb_parent_id``, or a registered Woo Jarz Bundle), and
+      not as an unmapped item (``protected_item_codes``);
+    * the invoice has no row whose Woo product is that line's product. A legacy
+      flag-free invoice still carries its 100%-off parent row, which the
+      inference drops from the payload, so its line stays protected and
+      untouched;
+    * every invoice row maps to a Woo product (`_invoice_row_product_ids`). An
+      unmapped bundle is flattened with nothing tying it to a store product,
+      so no line is zeroed while one is on the invoice.
+
+    The entry repeats the line's product, variation, quantity and compared meta,
+    so once the line is zero it matches the store and does not keep the order
+    dirty in `_order_payload_requires_update`. Quantity is never sent as 0,
+    because Woo reads a 0 quantity as a deletion.
+    """
+    existing_lines = existing_order.get("line_items") or []
+    if not orphaned or not existing_lines:
+        return []
+    parent_product_ids = _existing_bundle_parent_product_ids(invoice, existing_lines)
+    if not parent_product_ids:
+        return []
+
+    protected_item_codes = {code for code in (protected_item_codes or set()) if code}
+    candidates: list[dict] = []
+    for entry in orphaned:
+        entry = entry or {}
+        line_id = cint(entry.get("id") or 0)
+        product_id = cint(entry.get("product_id") or 0)
+        if not line_id or line_id not in protected_ids or not product_id:
+            continue
+        if str(product_id) not in parent_product_ids:
+            continue
+        if str(_extract_item_code(entry) or "") in protected_item_codes:
+            continue
+        candidates.append(entry)
+    if not candidates:
+        return []
+
+    present = _invoice_row_product_ids(invoice)
+    if present is None:
+        LOGGER.warning({
+            "event": "woo_outbound_bundle_parent_kept_unplaceable_invoice",
+            "invoice": getattr(invoice, "name", None),
+            "woo_order_id": existing_order.get("id"),
+            "line_ids": [cint(entry.get("id") or 0) for entry in candidates],
+            "detail": (
+                "A bundle parent line is not in the payload, but an invoice row has no "
+                "plain Woo product mapping, so we cannot tell whether that bundle is "
+                "still on the invoice. The line is left as it is."
+            ),
+        })
+        return []
+
+    updates: list[dict] = []
+    for entry in candidates:
+        product_id = cint(entry.get("product_id") or 0)
+        if str(product_id) in present:
+            continue
+        update: dict[str, Any] = {
+            "id": cint(entry.get("id") or 0),
+            "product_id": product_id,
+            "subtotal": _format_money(0),
+            "total": _format_money(0),
+        }
+        variation_id = cint(entry.get("variation_id") or 0)
+        if variation_id:
+            update["variation_id"] = variation_id
+        quantity = int(flt(entry.get("quantity") or 0))
+        if quantity > 0:
+            update["quantity"] = quantity
+        meta = [
+            {"key": str(meta_entry.get("key")), "value": meta_entry.get("value")}
+            for meta_entry in entry.get("meta_data") or []
+            if str(meta_entry.get("key") or "") in _ORDER_LINE_META_KEYS_TO_COMPARE
+        ]
+        if meta:
+            update["meta_data"] = meta
+        if flt(entry.get("total") or 0) or flt(entry.get("subtotal") or 0):
+            # WARNING, not info: `logger().info()` is silent on the servers.
+            LOGGER.warning({
+                "event": "woo_outbound_abandoned_bundle_parent_zeroed",
+                "invoice": getattr(invoice, "name", None),
+                "woo_order_id": existing_order.get("id"),
+                "line_id": update["id"],
+                "product_id": product_id,
+                "store_subtotal": entry.get("subtotal"),
+                "store_total": entry.get("total"),
+            })
+        updates.append(update)
+    return updates
 
 
 def _build_line_item_removals(
@@ -4647,16 +4817,21 @@ def _build_order_payload(
         matched, added_line_items, orphaned = _attach_existing_line_ids(
             line_items, existing_order.get("line_items") or []
         )
-        removed_line_items = _build_line_item_removals(
+        protected_ids = _protected_existing_line_ids(
+            invoice,
+            existing_order,
+            protected_item_codes=set(missing_products),
+        )
+        removed_line_items = _build_line_item_removals(orphaned, protected_ids=protected_ids)
+        zeroed_line_items = _abandoned_bundle_parent_updates(
+            invoice,
+            existing_order,
             orphaned,
-            protected_ids=_protected_existing_line_ids(
-                invoice,
-                existing_order,
-                protected_item_codes=set(missing_products),
-            ),
+            protected_ids=protected_ids,
+            protected_item_codes=set(missing_products),
         )
         # Order matters only for readability; Woo applies each entry by id.
-        payload_line_items = matched + added_line_items + removed_line_items
+        payload_line_items = matched + added_line_items + zeroed_line_items + removed_line_items
         _preserve_native_bundle_selection(payload_line_items, existing_order)
 
     if not payload_line_items and not existing_order:
