@@ -190,8 +190,12 @@ _DEFAULT_ORDER_ORIGIN_SOURCE = "ERPNext POS"
 #: on any PUT we make for a real reason, and a changed bundle mix always is one,
 #: because the child lines move with it. It simply may never trigger a push on
 #: its own. On a **store-created** order `_preserve_native_bundle_selection`
-#: strips it from every payload, so it is never corrected at all — see the
-#: residual noted in that function.
+#: strips it from the payload, so it is not corrected — except on a parent line
+#: of a bundle the order holds 2+ times whose store string disagrees with the
+#: children we push (see that function). That exception must not move this
+#: key into the set either: once our string is on the store the two agree and
+#: the next push strips it again, and the comparison stays one-directional
+#: over the keys below.
 _ORDER_LINE_META_KEYS_TO_COMPARE = frozenset({
     "erpnext_item_code",
     "discount_percentage",
@@ -2227,6 +2231,23 @@ def _get_bundle_link_key(item: frappe.model.document.Document) -> str:
     return ""
 
 
+def _bundle_instance_key(link_key: str, occurrence: int) -> str:
+    """Identify ONE copy of a bundle on an invoice.
+
+    The link key (``parent_bundle`` / ``bundle_code``) names the *bundle*, not
+    the copy: an order holding the same bundle twice has two parent rows with
+    the same key, and their children all point at it. Keyed on the link key
+    alone, the second parent overwrote the first and both copies' children were
+    merged under it (Woo 17748, two "Jarz Royal Feast", 2026-09-30).
+
+    The first copy keeps the bare link key, so a single-bundle invoice is keyed
+    exactly as it always was; later copies get ``<key>#2``, ``<key>#3``, ...
+    """
+    if occurrence <= 0:
+        return link_key
+    return f"{link_key}#{occurrence + 1}"
+
+
 def _is_explicit_bundle_parent_item(item: frappe.model.document.Document) -> bool:
     return _is_truthy_flag(getattr(item, "is_bundle_parent", 0))
 
@@ -2497,6 +2518,16 @@ def _collect_line_items(
 
     ``client`` is optional only so the payload can still be built without a
     session; without it the ``_woosb_ids`` attributes degrade to ``{}``.
+
+    **Several copies of one bundle.** Everything below is keyed per bundle
+    *instance* (see `_bundle_instance_key`), not per link key: an order holding
+    the same bundle twice has two parent rows sharing one ``bundle_code``, and
+    each child belongs to the nearest preceding parent row with its link key
+    (both builders write a parent immediately followed by its own children).
+    Each copy therefore gets its own priced parent line, its own child lines and
+    its own ``_woosb_ids``, and the same-product merge above never crosses from
+    one copy into another. The Woo product id of the parent is still resolved by
+    the plain link key — every copy is the same product.
     """
     line_items: list[dict] = []
     missing_products: list[str] = []
@@ -2508,12 +2539,16 @@ def _collect_line_items(
     )
     allow_bundle_parent_inference = _allow_bundle_parent_inference(invoice)
 
-    #: bundle link key -> the emitted parent entry, priced once every child is known
+    #: bundle INSTANCE key -> the emitted parent entry, priced once every child is known
     parent_entries: dict[str, dict] = {}
-    #: bundle link key -> child records in emission order (drives ``_woosb_ids``)
+    #: bundle instance key -> child records in emission order (drives ``_woosb_ids``)
     parent_children: dict[str, list[dict[str, Any]]] = {}
-    #: (bundle key, product, variation) -> the child record that owns that line
+    #: (bundle instance key, product, variation) -> the child record that owns that line
     child_slots: dict[tuple[str, str, str], dict[str, Any]] = {}
+    #: bundle link key -> how many parent rows carrying it have been emitted so far
+    bundle_occurrences: dict[str, int] = {}
+    #: bundle link key -> instance key of the nearest preceding parent row
+    current_bundle_instance: dict[str, str] = {}
 
     for item in getattr(invoice, "items", []) or []:
         qty = flt(item.qty)
@@ -2581,8 +2616,12 @@ def _collect_line_items(
             line_items.append(entry)
             bundle_key = _get_bundle_link_key(item)
             if bundle_key:
-                parent_entries[bundle_key] = entry
-                parent_children.setdefault(bundle_key, [])
+                occurrence = bundle_occurrences.get(bundle_key, 0)
+                bundle_occurrences[bundle_key] = occurrence + 1
+                instance_key = _bundle_instance_key(bundle_key, occurrence)
+                current_bundle_instance[bundle_key] = instance_key
+                parent_entries[instance_key] = entry
+                parent_children.setdefault(instance_key, [])
             else:
                 LOGGER.warning({
                     "event": "woo_outbound_bundle_parent_without_link_key",
@@ -2622,10 +2661,15 @@ def _collect_line_items(
         parent_product_id = explicit_bundle_parent_product_ids.get(bundle_key) if bundle_key else None
 
         if bundle_key and parent_product_id:
-            slot_key = (bundle_key, str(product_id or ""), str(variation_id or ""))
+            # The copy this child belongs to: the nearest preceding parent row
+            # with its link key. A child seen before any such parent falls back
+            # to the first copy, which is exactly how it was keyed before
+            # instances existed.
+            instance_key = current_bundle_instance.get(bundle_key, bundle_key)
+            slot_key = (instance_key, str(product_id or ""), str(variation_id or ""))
             record = child_slots.get(slot_key)
             if record is not None:
-                # Same product, same bundle: one native line, combined quantity.
+                # Same product, same bundle COPY: one native line, combined quantity.
                 record["qty"] += qty
                 record["amount"] += amount
                 record["entry"]["quantity"] = int(record["qty"])
@@ -2663,7 +2707,7 @@ def _collect_line_items(
                 "attributes": _variation_attributes_json(client, product_id, variation_id),
             }
             child_slots[slot_key] = record
-            parent_children.setdefault(bundle_key, []).append(record)
+            parent_children.setdefault(instance_key, []).append(record)
             continue
 
         if bundle_key and not parent_product_id:
@@ -2703,6 +2747,7 @@ def _collect_line_items(
         line_items.append(entry)
 
     for bundle_key, entry in parent_entries.items():
+        # ``bundle_key`` is the instance key here: one priced parent per copy.
         children = parent_children.get(bundle_key) or []
         bundle_total = sum(flt(child.get("amount") or 0) for child in children)
         entry["subtotal"] = _format_money(bundle_total)
@@ -3880,6 +3925,53 @@ def _consume_matching_existing_line(
     return None
 
 
+def _bundle_instance_tags(
+    lines: list[dict] | None,
+) -> tuple[list[Optional[tuple[str, int]]], dict[str, int]]:
+    """Attribute each WooSB line to one COPY of its bundle, by position.
+
+    Returns ``(tags, parent_counts)``. ``tags[i]`` is ``(parent_product_id,
+    occurrence)`` for a bundle parent or child line and ``None`` for anything
+    else; ``parent_counts`` is ``{parent_product_id: number of parent lines}``.
+
+    A child carries only ``_woosb_parent_id = <bundle product id>``, which is
+    identical for every copy of that bundle on the order, so identity alone
+    cannot say which copy a child belongs to. Position can: WooSB writes a
+    parent immediately followed by its own children, and so does
+    `_collect_line_items`. A child is therefore attributed to the nearest
+    preceding parent line of its product (the first copy if none precedes it).
+    A parent is a line whose ``product_id`` some child names and which is not
+    itself a child — the same test `order_sync._count_bundle_parent_instances`
+    applies inbound.
+    """
+    lines = list(lines or [])
+    referenced: set[str] = set()
+    for line in lines:
+        parent_ref = str(_extract_meta_value(line or {}, "_woosb_parent_id") or "").strip()
+        if parent_ref:
+            referenced.add(parent_ref)
+
+    tags: list[Optional[tuple[str, int]]] = []
+    parent_counts: dict[str, int] = {}
+    current: dict[str, int] = {}
+    for line in lines:
+        line = line or {}
+        parent_ref = str(_extract_meta_value(line, "_woosb_parent_id") or "").strip()
+        if parent_ref:
+            tags.append((parent_ref, current.get(parent_ref, 0)))
+            continue
+        product_id = cint(line.get("product_id") or 0)
+        product_key = str(product_id) if product_id else ""
+        if product_key and product_key in referenced:
+            occurrence = parent_counts.get(product_key, 0)
+            parent_counts[product_key] = occurrence + 1
+            current[product_key] = occurrence
+            tags.append((product_key, occurrence))
+            continue
+        tags.append(None)
+    return tags, parent_counts
+
+
 def _attach_existing_line_ids(
     line_items: list[dict],
     existing_line_items: list[dict],
@@ -3896,30 +3988,61 @@ def _attach_existing_line_ids(
       appeared on the store (Woo order 15808).
     * ``orphaned``  — existing Woo lines nothing desired maps onto, i.e. items
       removed in ERPNext. The caller decides which are safe to delete.
+
+    **Two or more copies of one bundle** (Woo 17748). Both parents share a
+    ``product_id`` and every child of both shares ``_woosb_parent_id``, so a
+    greedy first-match across the whole order paired a child of copy A with
+    the same jar in copy B, and the jar the operator actually changed in A
+    was then appended at the end of the order while A's old slot was deleted.
+    When some bundle product appears twice (on the store or in the payload),
+    lines of that product are matched in two rounds:
+
+    1. **same copy** — a desired line only considers existing lines attributed
+       to the same copy by `_bundle_instance_tags`; lines outside any repeated
+       bundle only consider lines outside them;
+    2. **leftovers of the same bundle** — a repeated-bundle line still unmatched
+       may take a line of another copy of the same bundle that no desired line
+       of that copy wanted. That is not a cross-pairing: a child we appended on
+       an earlier push sits after the last copy, so position mis-attributes it,
+       and without this round it would be deleted and re-appended on every sync.
+
+    With no repeated bundle every line is in one scope and round 2 never runs,
+    so the result is exactly the old single-pass greedy match.
     """
     if not existing_line_items:
         return line_items, [], []
 
+    existing_tags, existing_parent_counts = _bundle_instance_tags(existing_line_items)
+    desired_tags, desired_parent_counts = _bundle_instance_tags(line_items)
+    repeated_bundles = {
+        product
+        for counts in (existing_parent_counts, desired_parent_counts)
+        for product, count in counts.items()
+        if count > 1
+    }
+
+    def _scope(tag: Optional[tuple[str, int]]) -> Optional[tuple[str, int]]:
+        return tag if tag is not None and tag[0] in repeated_bundles else None
+
     remaining: list[dict] = []
-    for existing in existing_line_items:
+    for existing, tag in zip(existing_line_items, existing_tags):
         remaining.append({
             "entry": existing,
             "item_code": _extract_item_code(existing),
             "product_key": _line_product_key(existing),
             "bundle_parent_id": _extract_meta_value(existing, "_woosb_parent_id"),
             "quantity": flt(existing.get("quantity") or 0),
+            "scope": _scope(tag),
         })
 
-    mapped: list[dict] = []
-    unmapped: list[dict] = []
-    for entry in line_items:
+    def _match(entry: dict, eligible) -> Optional[dict]:
         match: Optional[dict] = None
         code = _extract_item_code(entry)
         if code:
             match = _consume_matching_existing_line(
                 entry,
                 remaining,
-                lambda candidate: candidate.get("item_code") == code,
+                lambda candidate: eligible(candidate) and candidate.get("item_code") == code,
             )
 
         if not match:
@@ -3927,7 +4050,9 @@ def _attach_existing_line_ids(
             match = _consume_matching_existing_line(
                 entry,
                 remaining,
-                lambda candidate: candidate.get("product_key") == desired_product_key,
+                lambda candidate: (
+                    eligible(candidate) and candidate.get("product_key") == desired_product_key
+                ),
             )
 
         if not match:
@@ -3938,11 +4063,32 @@ def _attach_existing_line_ids(
                     entry,
                     remaining,
                     lambda candidate: (
-                        candidate.get("bundle_parent_id") == desired_bundle_parent_id
+                        eligible(candidate)
+                        and candidate.get("bundle_parent_id") == desired_bundle_parent_id
                         and candidate.get("quantity") == desired_quantity
                     ),
                 )
+        return match
 
+    desired_scopes = [_scope(tag) for tag in desired_tags]
+    matches: list[Optional[dict]] = []
+    for entry, scope in zip(line_items, desired_scopes):
+        matches.append(_match(entry, lambda candidate, _s=scope: candidate.get("scope") == _s))
+
+    if repeated_bundles:
+        for index, (entry, scope) in enumerate(zip(line_items, desired_scopes)):
+            if matches[index] is not None or scope is None:
+                continue
+            matches[index] = _match(
+                entry,
+                lambda candidate, _p=scope[0]: (
+                    candidate.get("scope") is not None and candidate["scope"][0] == _p
+                ),
+            )
+
+    mapped: list[dict] = []
+    unmapped: list[dict] = []
+    for entry, match in zip(line_items, matches):
         if match and match.get("entry", {}).get("id"):
             entry["id"] = match["entry"]["id"]
             mapped.append(entry)
@@ -3986,6 +4132,72 @@ def _order_is_jarz_originated(existing_order: dict | None) -> bool:
     return str(existing_order.get("created_via") or "").strip().lower() == "rest-api"
 
 
+def _woosb_selection_totals(raw_value: Any) -> Optional[dict[str, int]]:
+    """``{child identifier: total quantity}`` for one ``_woosb_ids`` string.
+
+    Only parts 0 and 2 are read — the same two `order_sync` reads — so a
+    WooSB token or attributes object that differs from ours cannot make two
+    strings describing the same jars look different. Returns ``None`` when the
+    string is empty or any entry is unreadable: "cannot tell" must never be
+    mistaken for "disagrees".
+    """
+    if raw_value in (None, ""):
+        return None
+    from jarz_woocommerce_integration.services.order_sync import _split_woosb_ids
+
+    totals: dict[str, int] = {}
+    for entry in _split_woosb_ids(raw_value):
+        parts = entry.split("/", 3)
+        if len(parts) < 3:
+            return None
+        identifier = str(parts[0] or "").strip()
+        try:
+            quantity = int(float(parts[2] or 0))
+        except (TypeError, ValueError):
+            return None
+        if not identifier or quantity <= 0:
+            return None
+        totals[identifier] = totals.get(identifier, 0) + quantity
+    return totals or None
+
+
+def _native_selection_needs_refresh(
+    entry: dict,
+    existing: dict,
+    *,
+    payload_line_items: list[dict],
+    existing_line_items: list[dict],
+) -> bool:
+    """Whether a store-written ``_woosb_ids`` must give way to ours on this line.
+
+    True only for a parent line of a bundle product the order holds 2+ times
+    (counted exactly as the inbound gate counts it, on the store's lines or in
+    this payload) whose store string disagrees with the children we are
+    pushing for that copy. See `_preserve_native_bundle_selection`.
+    """
+    ours = _extract_meta_value(entry, "_woosb_ids")
+    if not ours:
+        return False
+    product_id = cint(entry.get("product_id") or 0) or cint(existing.get("product_id") or 0)
+    if not product_id:
+        return False
+
+    from jarz_woocommerce_integration.services.order_sync import _count_bundle_parent_instances
+
+    instances = max(
+        _count_bundle_parent_instances(existing_line_items, product_id),
+        _count_bundle_parent_instances(payload_line_items, product_id),
+    )
+    if instances < 2:
+        return False
+
+    our_totals = _woosb_selection_totals(ours)
+    store_totals = _woosb_selection_totals(_extract_meta_value(existing, "_woosb_ids"))
+    if our_totals is None or store_totals is None:
+        return False
+    return our_totals != store_totals
+
+
 def _preserve_native_bundle_selection(
     payload_line_items: list[dict],
     existing_order: dict | None,
@@ -4010,10 +4222,11 @@ def _preserve_native_bundle_selection(
     ``created_via = "rest-api"`` and ``_jarz_order_origin = "ERPNext POS"`` — so
     the ownership test below covers the incident.
 
-    **Residual, deliberately accepted.** A *store-created* order amended from the
-    POS still keeps its original string: we refuse to overwrite it, so the Woo
-    admin screen and any Woo-rendered packing slip go on showing the mix the
-    customer first chose. ERPNext itself is not fooled —
+    **Residual, deliberately accepted — with one narrow exception.** A
+    *store-created* order amended from the POS normally keeps its original
+    string: we refuse to overwrite it, so the Woo admin screen and any
+    Woo-rendered packing slip go on showing the mix the customer first chose.
+    ERPNext itself is not fooled when the bundle appears ONCE —
     `order_sync._build_bundle_selections` reads the child lines, which our push
     does update — so the invoice, the Delivery Note and the POS kanban are all
     correct, and that is what the kitchen picks from. Broadening this to "refresh
@@ -4021,9 +4234,28 @@ def _preserve_native_bundle_selection(
     fire when we push back an amendment the *website* originated, overwriting the
     plugin's own string with our approximation (a SHA-1-prefix token, and
     attributes that render ``{}`` on a cold cache) across 10,000+ web orders. The
-    asymmetry is what decides it. If the Woo screen ever becomes a picking
-    surface, revisit — the honest fix is a per-parent "did WE change these
-    children" test, not a broader ownership claim.
+    asymmetry is what decides it.
+
+    The exception is the case where that reasoning fails: **two or more copies
+    of the same bundle product** on the order (Woo 17748, 2026-09-30). Every
+    child then carries the same ``_woosb_parent_id``, so inbound cannot attribute
+    children to a copy and deliberately trusts each parent's ``_woosb_ids``
+    instead (`order_sync._count_bundle_parent_instances` >= 2). A stale store
+    string is then not cosmetic: the next inbound re-evaluation would rebuild
+    that copy from it and auto-amend the operator's jar-mix edit away — the Woo
+    17278 revert again. So on a store-created order our string is kept for a
+    parent line only when BOTH hold (`_native_selection_needs_refresh`):
+
+    * the order holds 2+ parent lines of that bundle product, on the store or
+      in this payload; and
+    * the store's string for that very line, parsed, disagrees with ours on
+      (child identifier, total quantity) — i.e. WE changed those children.
+
+    Tokens and the attributes object are not compared, so a copy nobody changed
+    keeps the plugin's own string byte for byte; and once our string is on the
+    store the two agree, so the next push preserves it again and nothing
+    ping-pongs. ``_woosb_ids`` stays out of `_ORDER_LINE_META_KEYS_TO_COMPARE`,
+    so this can never mark an order dirty on its own either.
 
     Mutates ``payload_line_items`` in place, dropping only our own key.
     """
@@ -4056,10 +4288,30 @@ def _preserve_native_bundle_selection(
     if not existing_by_id:
         return
 
+    existing_lines = list(existing_by_id.values())
     for entry in payload_line_items:
         line_id = cint(entry.get("id") or 0)
         existing = existing_by_id.get(line_id) if line_id else None
         if not existing or not _extract_meta_value(existing, "_woosb_ids"):
+            continue
+        if _native_selection_needs_refresh(
+            entry,
+            existing,
+            payload_line_items=payload_line_items,
+            existing_line_items=existing_lines,
+        ):
+            # The narrow exception in the docstring: a repeated bundle whose
+            # children WE changed. WARNING, not info — `logger().info()` is
+            # silent on the servers, and this is the one trace that we wrote
+            # over a plugin-written string.
+            LOGGER.warning({
+                "event": "woo_outbound_native_bundle_selection_refreshed",
+                "woo_order_id": (existing_order or {}).get("id"),
+                "line_id": line_id,
+                "item_code": _extract_item_code(entry),
+                "store_value": _extract_meta_value(existing, "_woosb_ids"),
+                "our_value": _extract_meta_value(entry, "_woosb_ids"),
+            })
             continue
         meta = entry.get("meta_data") or []
         kept = [meta_entry for meta_entry in meta if str(meta_entry.get("key") or "") != "_woosb_ids"]
