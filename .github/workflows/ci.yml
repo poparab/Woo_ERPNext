@@ -88,7 +88,12 @@ jobs:
         # Versioned package names (mariadb-client-10.6) were dropped from the
         # runner image; apt itself points at the unversioned one. The service
         # container above still pins the server to 10.6.
-        run: sudo apt-get install -y mariadb-client
+        # Refresh the index first: the image's cached one goes stale as the
+        # mirror drops superseded point releases, and the install then 404s
+        # on a dependency (libdbi-perl, runs 36768620599 / 36770038268).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mariadb-client
 
       - name: Setup
         run: |
