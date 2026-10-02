@@ -916,8 +916,6 @@ class TestAmendmentJobRecheck(_RunWooAmendmentJobPatcher, unittest.TestCase):
         oa._flag_needs_review.assert_not_called()
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class TestHeaderDiscountRebuildWouldLose(unittest.TestCase):
@@ -962,9 +960,70 @@ class TestHeaderDiscountRebuildWouldLose(unittest.TestCase):
             [],
         )
 
+    def test_pos_promo_code_without_coupon_lines_is_reported(self):
+        """Outbound pushes an ERPNext promo as a fee line, never as a coupon: the
+        rebuild would keep the old fixed amount and drop the code."""
+        diff = self._lose(_pos_origin_order(fee=-50.0), discount_amount=50.0, custom_promo_codes='["SUMMER10"]')
+        self.assertEqual(len(diff), 1)
+
+    def test_different_coupon_codes_are_reported(self):
+        diff = self._lose(
+            _pos_origin_order(fee=-50.0, coupons=["XYZ"]), discount_amount=50.0, custom_promo_codes='["SUMMER10"]'
+        )
+        self.assertEqual(len(diff), 1)
+
+    def test_same_codes_ignoring_case_are_left_to_the_promo_engine(self):
+        self.assertEqual(
+            self._lose(_pos_origin_order(coupons=["save"]), discount_amount=50.0, custom_promo_codes='["SAVE"]'),
+            [],
+        )
+
+    def test_header_plus_line_discount_is_reported_never_safe(self):
+        """Line discounts are pushed as subtotal > total and inflate discount_total:
+        a false review is acceptable, a false 'safe' is not."""
+        order = _pos_origin_order(fee=-50.0)
+        order["discount_total"] = "30.00"
+        self.assertEqual(len(self._lose(order, discount_amount=50.0)), 1)
+
     def test_describe_renders_header_entries(self):
         text = order_sync._describe_repriced_lines([
             {"item_code": "Header discount", "kind": "header_discount", "invoice_rate": 50.0, "rebuild_rate": None},
         ])
         self.assertEqual(text, "header discount: invoice 50.00 -> rebuild unknown")
 
+
+class TestJobRecheckHeaderDiscount(unittest.TestCase):
+    """The amendment job's re-check applies the header-discount guard too."""
+
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
+
+    def _recheck(self, order):
+        import jarz_woocommerce_integration.services.order_amendment as oa
+
+        self.monkeypatch.setattr(
+            order_sync, "_rebuild_target_lines_for_invoice",
+            lambda order, invoice, woo_id=None: [_jar_row(LIST_RATE), _cookie_row()],
+        )
+        self.monkeypatch.setattr(oa, "_flag_needs_review", MagicMock())
+        self.monkeypatch.setattr(oa, "_write_sync_log", MagicMock())
+        source_si = _make_fake_inv(items=[_jar_row(LIST_RATE)])
+        source_si.discount_amount = 50.0
+        source_si.apply_discount_on = "Grand Total"
+        return oa, oa._recheck_items_against_source(source_si, order, 99001)
+
+    def test_missing_fee_line_sends_the_job_to_review(self):
+        oa, result = self._recheck(_pos_origin_order())
+        self.assertEqual(result["reason"], "needs_manual_review", result)
+        self.assertEqual([d.get("kind") for d in result["repriced_lines"]], ["header_discount"])
+        oa._flag_needs_review.assert_called_once()
+
+    def test_fee_line_carrying_the_discount_lets_the_job_proceed(self):
+        oa, result = self._recheck(_pos_origin_order(fee=-50.0))
+        self.assertIsNone(result)
+        oa._flag_needs_review.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

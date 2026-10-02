@@ -1972,11 +1972,17 @@ def _header_discount_rebuild_would_lose(inv: Any, order: dict | None) -> list[di
     if not isinstance(order, dict):
         return []
     try:
-        from jarz_woocommerce_integration.services.outbound_sync import _order_is_jarz_originated
+        from jarz_woocommerce_integration.services.outbound_sync import (
+            _invoice_promo_codes,
+            _order_is_jarz_originated,
+        )
 
         if not _order_is_jarz_originated(order):
             return []
     except Exception:
+        frappe.logger("jarz_woocommerce.order_sync").warning(
+            {"event": "woo_header_discount_check_skipped", "woo_order_id": order.get("id")}
+        )
         return []
 
     def _money(fieldname: str) -> float:
@@ -1998,10 +2004,20 @@ def _header_discount_rebuild_would_lose(inv: Any, order: dict | None) -> list[di
     if _money("additional_discount_percentage") > 0:
         return [entry]
 
-    coupon_codes = [c for c in (order.get("coupon_lines") or []) if isinstance(c, dict) and c.get("code")]
-    if coupon_codes:
-        invoice_codes = str(_row_value(inv, "custom_promo_codes", "") or "").strip()
-        return [] if invoice_codes not in ("", "[]") else [entry]
+    # Promo codes: the rebuild hands Woo's coupon_lines to jarz_pos's promo engine,
+    # which re-evaluates them (percentage, caps, minimum basket) for the edited
+    # basket. That only reproduces the invoice's discount when the codes are the
+    # same. Outbound never pushes coupons (an ERPNext promo is a fee line), so a POS
+    # promo order arrives with NO coupon_lines: the rebuild would keep the old fixed
+    # fee and drop the code — a percentage promo frozen at the old basket, and the
+    # redemption gone from usage limits and promo reporting. Both cases -> review.
+    def _codes(values) -> set[str]:
+        return {str(code).strip().upper() for code in values if str(code or "").strip()}
+
+    woo_codes = _codes(c.get("code") for c in (order.get("coupon_lines") or []) if isinstance(c, dict))
+    invoice_codes = _codes(_invoice_promo_codes(inv))
+    if woo_codes or invoice_codes:
+        return [] if woo_codes == invoice_codes else [entry]
 
     rebuild_discount = _woo_noncoupon_discount_total(order)
     if abs(_to_cents(invoice_discount) - _to_cents(rebuild_discount)) > 1:
