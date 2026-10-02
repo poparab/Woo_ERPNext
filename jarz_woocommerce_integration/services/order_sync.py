@@ -303,7 +303,8 @@ class MigrationCache:
     def _load_prices(self):
         rows = frappe.db.sql(
             "SELECT price_list, item_code, price_list_rate FROM `tabItem Price` "
-            "WHERE selling = 1 AND IFNULL(price_list_rate, 0) > 0",
+            "WHERE selling = 1 AND IFNULL(price_list_rate, 0) > 0 "
+            "AND IFNULL(customer, '') = ''",
             as_dict=True,
         )
         for r in rows:
@@ -1999,7 +2000,21 @@ def _build_invoice_items(order: dict, price_list: str | None = None, cache: "Mig
         else:
             try:
                 if price_list:
-                    erp_price = frappe.db.get_value("Item Price", {"item_code": item_code, "price_list": price_list}, "price_list_rate")
+                    # Generic selling rows only. Once an invoiced order is priced
+                    # from its own list (B2B Selling, see
+                    # `_resolve_invoice_bound_price_list`), a customer-scoped
+                    # negotiated row on that list must not be picked up for some
+                    # other shop's order — get_value returns whichever row is first.
+                    erp_price = frappe.db.get_value(
+                        "Item Price",
+                        {
+                            "item_code": item_code,
+                            "price_list": price_list,
+                            "selling": 1,
+                            "customer": ["is", "not set"],
+                        },
+                        "price_list_rate",
+                    )
             except Exception:
                 erp_price = None
 

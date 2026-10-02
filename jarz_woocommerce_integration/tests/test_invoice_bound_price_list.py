@@ -46,6 +46,8 @@ B2B_LIST = "B2B Selling"
 JAR_ITEM = "JAR-MEDIUM"
 JAR_QTY = 4
 ITEM_PRICES = {PROFILE_LIST: 120.0, B2B_LIST: 77.0}
+# A customer-scoped negotiated row for some other shop; only an unscoped lookup sees it.
+OTHER_CUSTOMER_RATE = 55.0
 ENABLED_SELLING = {"selling": 1, "enabled": 1}
 
 
@@ -233,9 +235,13 @@ def _install(
             row = price_lists.get(name)
             return _pick(row, fieldname) if row is not None else None
         if doctype == "Item Price" and isinstance(name, dict):
-            if name.get("item_code") == JAR_ITEM:
-                return ITEM_PRICES.get(name.get("price_list"))
-            return None
+            if name.get("item_code") != JAR_ITEM:
+                return None
+            # The table also holds another shop's negotiated row on every list;
+            # a lookup that does not ask for generic selling rows gets it first.
+            if name.get("customer") != ["is", "not set"] or name.get("selling") != 1:
+                return OTHER_CUSTOMER_RATE
+            return ITEM_PRICES.get(name.get("price_list"))
         return None
 
     def fake_exists(doctype, name=None, *args, **kwargs):
