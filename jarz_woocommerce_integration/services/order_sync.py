@@ -567,6 +567,44 @@ def _invoice_is_on_account(inv) -> tuple[bool, str]:
     return False, ""
 
 
+# jarz_pos's dispatch moves an unpaid COD receivable onto this ledger with a
+# Payment Entry against the invoice. That entry is a transfer, not the customer
+# paying, so it must never count as "already paid" here.
+COURIER_OUTSTANDING_ACCOUNT_PREFIX = "Courier Outstanding"
+CASH_PAYMENT_METHOD = "Cash"
+
+
+def _invoice_customer_payment_entries(invoice_name: str | None) -> list[str]:
+    """Submitted customer Payment Entries against a Sales Invoice.
+
+    Excludes the Courier Outstanding transfer dispatch posts (see above). Any
+    lookup failure returns ``[]`` so the caller falls back to the old behaviour
+    rather than raising inside the inbound lane.
+    """
+    if not invoice_name:
+        return []
+    try:
+        parents = frappe.get_all(
+            "Payment Entry Reference",
+            filters={"reference_doctype": "Sales Invoice", "reference_name": invoice_name},
+            pluck="parent",
+        )
+        if not parents:
+            return []
+        rows = frappe.get_all(
+            "Payment Entry",
+            filters={"name": ["in", list(set(parents))], "docstatus": 1, "payment_type": "Receive"},
+            fields=["name", "paid_to"],
+        )
+    except Exception:
+        return []
+    return [
+        r.get("name")
+        for r in rows or []
+        if not str(r.get("paid_to") or "").startswith(COURIER_OUTSTANDING_ACCOUNT_PREFIX)
+    ]
+
+
 def _apply_inbound_payment_method(inv, custom_payment_method: str | None, woo_id: Any = None) -> None:
     """Write the inbound-mapped payment method -- unless that would erase a credit sale.
 
@@ -579,8 +617,17 @@ def _apply_inbound_payment_method(inv, custom_payment_method: str | None, woo_id
     the money was still owed, and a later re-dispatch would charge the courier
     for a cash collection that never happens.
 
-    So: never downgrade a credit invoice. Anything else behaves exactly as before.
-    Skips are logged -- a real mismatch should be visible, not silent.
+    So: never downgrade a credit invoice.
+
+    Nor a paid one. A COD order a line manager settles in the POS (e.g. Kashier,
+    Woo 17783) is re-stamped ``Kashier Card`` with a real Payment Entry, but the
+    store still says ``cod``; the next Woo webhook mapped that to ``Cash`` and
+    the badge and receipt promised cash collection again. So a submitted invoice
+    that already holds a customer Payment Entry keeps its non-cash method when
+    the inbound value is ``Cash``.
+
+    Anything else behaves exactly as before. Skips are logged -- a real
+    mismatch should be visible, not silent.
     """
     incoming = str(custom_payment_method or "").strip()
     if not incoming:
@@ -611,6 +658,32 @@ def _apply_inbound_payment_method(inv, custom_payment_method: str | None, woo_id
                 woo_order_id=woo_id,
             )
             return
+
+    if incoming.casefold() == CASH_PAYMENT_METHOD.casefold() and getattr(inv, "docstatus", 0) == 1:
+        existing = str(_read_invoice_field(inv, "custom_payment_method") or "").strip()
+        if existing and existing.casefold() != CASH_PAYMENT_METHOD.casefold():
+            payments = _invoice_customer_payment_entries(getattr(inv, "name", None))
+            if payments:
+                frappe.logger("jarz_woocommerce.order_sync").warning({
+                    "event": "woo_paid_payment_method_preserved",
+                    "invoice": getattr(inv, "name", None),
+                    "woo_order_id": woo_id,
+                    "existing": existing,
+                    "rejected_inbound_value": incoming,
+                    "payment_entries": payments,
+                })
+                create_sync_log_entry(
+                    "PaidPaymentMethodPreserved",
+                    "NeedsReview",
+                    (
+                        f"woo_paid_payment_method_preserved: invoice "
+                        f"{getattr(inv, 'name', None)} is already paid "
+                        f"({', '.join(payments)}); kept custom_payment_method={existing!r} "
+                        f"instead of writing {incoming!r} from WooCommerce order {woo_id}."
+                    ),
+                    woo_order_id=woo_id,
+                )
+                return
 
     try:
         if inv.docstatus == 1:
@@ -5770,7 +5843,7 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                     inv.custom_delivery_duration = int(duration_val) * 60  # seconds
                 if custom_payment_method:
                     # Guarded: this must never downgrade an on-account (Credit)
-                    # invoice to Cash on a later inbound update.
+                    # invoice, or one already paid by a non-cash method, to Cash.
                     _apply_inbound_payment_method(inv, custom_payment_method, woo_id=woo_id)
                 # Apply attribution fields (marketing source, UTM, referrer, device, session)
                 if attribution:
