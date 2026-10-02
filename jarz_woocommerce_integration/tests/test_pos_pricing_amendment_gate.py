@@ -397,6 +397,35 @@ class TestLineIdentity(unittest.TestCase):
         self.assertTrue(order_sync._submitted_invoice_matches_target_lines(_Inv(rows), [dict(r) for r in rows]))
         self.assertFalse(order_sync._submitted_invoice_matches_target_lines(_Inv(rows), moved))
 
+    def test_bundle_record_name_is_not_identity(self):
+        """POS links a bundle by its Jarz Bundle name, the Woo rebuild by its Woo Jarz
+        Bundle name: same bundle item, same jars -> the same order (18442/18627/18624)."""
+        pos_rows = _bundle_rows(MIX_AB, link_key="jdu98tulvs")
+        woo_rows = _bundle_rows(MIX_AB, link_key="cdi9cu8jaf", parent_rate=480.0)
+        self.assertTrue(order_sync._submitted_invoice_matches_target_lines(_Inv(pos_rows), woo_rows))
+
+    def test_a_different_bundle_item_is_still_a_change(self):
+        pos_rows = _bundle_rows(MIX_AB, link_key="jdu98tulvs")
+        woo_rows = _bundle_rows(MIX_AB, link_key="cdi9cu8jaf")
+        woo_rows[0]["item_code"] = "Jarz Other Box"
+        self.assertFalse(order_sync._submitted_invoice_matches_target_lines(_Inv(pos_rows), woo_rows))
+
+    def test_a_bundle_mix_change_is_still_a_change_across_record_names(self):
+        pos_rows = _bundle_rows(MIX_AB, link_key="jdu98tulvs")
+        woo_rows = _bundle_rows(MIX_AC, link_key="cdi9cu8jaf")
+        self.assertFalse(order_sync._submitted_invoice_matches_target_lines(_Inv(pos_rows), woo_rows))
+
+    def test_a_qty_split_across_rows_is_the_same_order(self):
+        """Woo 17748: Lotus Medium as 1 + 1 on the invoice, 2 on the rebuild."""
+        split = _bundle_rows([("CHILD-A", 120.0, 150.0), ("CHILD-A", 120.0, 150.0)], child_qty=1)
+        merged = _bundle_rows([("CHILD-A", 120.0, 150.0)], child_qty=2)
+        self.assertTrue(order_sync._submitted_invoice_matches_target_lines(_Inv(split), merged))
+
+    def test_a_split_that_changes_the_total_qty_is_still_a_change(self):
+        split = _bundle_rows([("CHILD-A", 120.0, 150.0), ("CHILD-A", 120.0, 150.0)], child_qty=1)
+        merged = _bundle_rows([("CHILD-A", 120.0, 150.0)], child_qty=3)
+        self.assertFalse(order_sync._submitted_invoice_matches_target_lines(_Inv(split), merged))
+
     def test_bool_and_int_flags_compare_equal(self):
         invoice_rows = _bundle_rows([("CHILD-A", 120.0, 150.0)])
         target_rows = [dict(row) for row in invoice_rows]

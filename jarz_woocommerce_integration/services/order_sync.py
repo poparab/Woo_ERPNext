@@ -1664,7 +1664,7 @@ def _row_flag(row: Any, fieldname: str) -> int:
         return 0
 
 
-def _invoice_line_identity(row: Any) -> tuple[Any, ...]:
+def _invoice_line_identity(row: Any, bundle_items: dict[str, str] | None = None) -> tuple[Any, ...]:
     """What a Woo edit can change on a line: which item, how many, which bundle.
 
     Deliberately carries NO price field (rate, price_list_rate,
@@ -1679,30 +1679,80 @@ def _invoice_line_identity(row: Any) -> tuple[Any, ...]:
     those. Comparing rates here made every hash change on such an order — our
     own outbound echo, a status or meta change — read as "items changed" and
     rebuild the order at list price (Woo 17756, 2026-10-01).
+
+    ``bundle_items`` maps a bundle link key to its parent row's ERPNext item
+    (``_bundle_link_items``). With it, a bundle is named by WHICH bundle it is,
+    not by the record that recorded it: the POS links a bundle's rows by its
+    ``Jarz Bundle`` name (``jdu98tulvs``), the Woo BundleProcessor by its ``Woo
+    Jarz Bundle`` name (``cdi9cu8jaf``) — same item, same jars, different key. Keyed
+    on the record name, every POS bundle order mirrored to Woo looked edited on
+    any hash change, and our own echo cancelled and re-issued it with identical
+    lines (ACC-SINV-2026-18442-1, 18627-1, 18624-1).
     """
+    bundle_code = str(_row_value(row, "bundle_code", "") or "")
+    parent_bundle = str(_row_value(row, "parent_bundle", "") or "")
+    if bundle_items is not None:
+        bundle_code = bundle_items.get(bundle_code, bundle_code) if bundle_code else ""
+        parent_bundle = bundle_items.get(parent_bundle, parent_bundle) if parent_bundle else ""
     return (
         str(_row_value(row, "item_code", "") or ""),
         _stable_line_value(_row_value(row, "qty", 0) or 0),
         _row_flag(row, "is_bundle_parent"),
         _row_flag(row, "is_bundle_child"),
-        str(_row_value(row, "bundle_code", "") or ""),
-        str(_row_value(row, "parent_bundle", "") or ""),
+        bundle_code,
+        parent_bundle,
     )
+
+
+def _bundle_link_items(rows: list[Any]) -> dict[str, str]:
+    """Bundle link key -> the ERPNext item of the bundle's parent row, on one side.
+
+    Parent rows carry the key in ``bundle_code`` (falling back to
+    ``parent_bundle``); a key with no parent row on this side is left as-is.
+    """
+    mapping: dict[str, str] = {}
+    for row in rows or []:
+        if not _row_flag(row, "is_bundle_parent"):
+            continue
+        item_code = str(_row_value(row, "item_code", "") or "").strip()
+        for fieldname in ("bundle_code", "parent_bundle"):
+            key = str(_row_value(row, fieldname, "") or "").strip()
+            if key and item_code:
+                mapping.setdefault(key, item_code)
+    return mapping
 
 
 def _submitted_invoice_matches_target_lines(inv: Any, target_lines: list[dict]) -> bool:
     """True when the submitted invoice holds the same lines Woo now describes.
 
-    Identity only (see ``_invoice_line_identity``): same row count and the same
-    sorted multiset of (item_code, qty, bundle flags, bundle_code,
-    parent_bundle). Prices are out on purpose.
+    Identity only (see ``_invoice_line_identity``): the same total qty per (item,
+    bundle flags, bundle item of the row's bundle) — ``_aggregate_line_identity``.
+    Prices are out on purpose, and so are the bundle record names and how a
+    quantity happens to be split across rows.
     """
     invoice_lines = list(inv.get("items", []) or [])
-    if len(invoice_lines) != len(target_lines):
-        return False
-    invoice_identity = sorted(_invoice_line_identity(row) for row in invoice_lines)
-    target_identity = sorted(_invoice_line_identity(row) for row in target_lines)
-    return invoice_identity == target_identity
+    target_lines = list(target_lines or [])
+    return _aggregate_line_identity(invoice_lines) == _aggregate_line_identity(target_lines)
+
+
+def _aggregate_line_identity(rows: list[Any]) -> dict[tuple[Any, ...], float]:
+    """Total qty per (item, bundle flags, bundle item) on one side.
+
+    Summed rather than compared row by row: the same jars can be split over two
+    rows on one side and merged into one on the other (Woo 17748: Lotus Medium as
+    1 + 1 on the invoice, 2 on the rebuild) without anything having been edited.
+    """
+    bundle_items = _bundle_link_items(rows)
+    totals: dict[tuple[Any, ...], float] = {}
+    for row in rows:
+        identity = _invoice_line_identity(row, bundle_items)
+        key = identity[:1] + identity[2:]
+        try:
+            qty = float(identity[1] or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        totals[key] = round(totals.get(key, 0.0) + qty, 6)
+    return {key: qty for key, qty in totals.items() if qty}
 
 
 def _effective_line_amount(row: Any) -> tuple[float, float] | None:
