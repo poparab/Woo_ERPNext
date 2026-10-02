@@ -686,6 +686,172 @@ def _carry_credit_terms_from_source(
     })
 
 
+def _sales_invoice_has_field(fieldname: str) -> bool:
+    try:
+        return bool(frappe.get_meta("Sales Invoice").has_field(fieldname))
+    except Exception:
+        return False
+
+
+def _is_checked(value: Any) -> bool:
+    """Strict Check-field truthiness (a MagicMock or arbitrary object is NOT checked)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
+
+
+def _invoice_is_pickup(inv: Any) -> bool:
+    """True when the invoice is flagged ``custom_is_pickup`` (no delivery fee)."""
+    if inv is None:
+        return False
+    try:
+        return _is_checked(_row_value(inv, "custom_is_pickup", 0))
+    except Exception:
+        return False
+
+
+#: jarz_pos-owned Sales Invoice fields a Woo amendment replacement inherits from
+#: its source (the same set jarz_pos's own amendment carries).
+_CARRIED_CONTEXT_TEXT_FIELDS = (
+    "custom_order_purpose",
+    "custom_commercial_policy",
+    "custom_policy_reason",
+)
+_CARRIED_CONTEXT_CHECK_FIELDS = (
+    "custom_is_pickup",
+    "custom_no_courier",
+)
+
+
+def _source_invoice_had_shipping_row(source_invoice_name: str | None, company: str | None = None) -> bool | None:
+    """Did the source invoice charge the customer a delivery fee?
+
+    ``True`` / ``False`` when the source's ``Sales Taxes and Charges`` rows could
+    be read; ``None`` when they could not (callers must then keep their default
+    behaviour). A row counts as the delivery charge when it has a positive
+    amount and is identified the way the app identifies its own row:
+
+    * booked to the company's Shipping Income account, or to the legacy
+      Freight account (``_get_shipping_income_account`` /
+      ``_legacy_shipping_income_account`` — the accounts this app writes), or
+    * described ``Shipping Income ...`` (``_get_delivery_charge_rows``), or
+    * described with "ship" / "delivery" — the same fallback outbound uses for
+      rows booked elsewhere (``outbound_sync._compute_shipping_total``), so a
+      POS-written delivery row under another description is not missed.
+
+    Deliberately wide: a false "had shipping" only keeps today's behaviour,
+    while a false "no shipping" would drop a charge the customer owes.
+    """
+    if not source_invoice_name:
+        return None
+    try:
+        rows = frappe.get_all(
+            "Sales Taxes and Charges",
+            filters={"parent": source_invoice_name, "parenttype": "Sales Invoice"},
+            fields=["charge_type", "account_head", "description", "tax_amount"],
+        ) or []
+    except Exception:
+        return None
+
+    shipping_accounts: set[str] = set()
+    if company:
+        for resolver in (_get_shipping_income_account, _legacy_shipping_income_account):
+            try:
+                account = str(resolver(company) or "").strip().casefold()
+            except Exception:
+                account = ""
+            if account:
+                shipping_accounts.add(account)
+
+    for row in rows:
+        try:
+            amount = float(_row_value(row, "tax_amount", 0) or 0)
+        except Exception:
+            amount = 0.0
+        if amount <= 0:
+            continue
+        account = str(_row_value(row, "account_head", "") or "").strip().casefold()
+        description = str(_row_value(row, "description", "") or "").strip()
+        if account and account in shipping_accounts:
+            return True
+        if description.startswith("Shipping Income"):
+            return True
+        folded = description.casefold()
+        if "ship" in folded or "delivery" in folded:
+            return True
+    return False
+
+
+def _carry_order_context_from_source(
+    inv_data: dict[str, Any],
+    source_invoice_name: str | None,
+    woo_id: Any = None,
+) -> None:
+    """Keep the source invoice's order context on a Woo amendment.
+
+    The replacement is built from the Woo payload, which knows nothing of the
+    POS-side context of the order: its purpose ("B2B Supply", "Employee",
+    "Sample - No Courier", ...), the commercial policy that purpose resolved to
+    (and its reason), whether it needs no courier, or that the customer collects
+    it. Woo 17756's replacement -2 came back as purpose "Standard", lost
+    ``custom_is_pickup`` and gained a 60 EGP territory shipping charge. These
+    are the same fields jarz_pos's own amendment carries over. They are owned by
+    jarz_pos, so they are read and written as plain Sales Invoice columns, and
+    only when the site's meta has them.
+
+    Text fields are carried when the source has a non-blank value; Check fields
+    only when the source has them ticked (an unticked source leaves the
+    replacement on its default).
+
+    ``custom_is_pickup`` is set on ``inv_data`` BEFORE the doc is built, so
+    ``_apply_delivery_charge_policy`` on the create path sees it and adds no
+    shipping row (see ``_resolve_delivery_charge_policy``).
+    """
+    if not source_invoice_name:
+        return
+
+    fields = [
+        fieldname
+        for fieldname in (*_CARRIED_CONTEXT_TEXT_FIELDS, *_CARRIED_CONTEXT_CHECK_FIELDS)
+        if _sales_invoice_has_field(fieldname)
+    ]
+    if not fields:
+        return
+
+    try:
+        source = frappe.db.get_value("Sales Invoice", source_invoice_name, fields, as_dict=True) or {}
+    except Exception:
+        return
+
+    carried: dict[str, Any] = {}
+    for fieldname in _CARRIED_CONTEXT_TEXT_FIELDS:
+        if fieldname not in fields:
+            continue
+        value = str(source.get(fieldname) or "").strip()
+        if value:
+            inv_data[fieldname] = value
+            carried[fieldname] = value
+    for fieldname in _CARRIED_CONTEXT_CHECK_FIELDS:
+        if fieldname in fields and _is_checked(source.get(fieldname)):
+            inv_data[fieldname] = 1
+            carried[fieldname] = 1
+
+    if carried:
+        try:
+            frappe.logger("jarz_woocommerce.order_sync").warning({
+                "event": "woo_order_context_carried_to_amendment",
+                "source_invoice": source_invoice_name,
+                "woo_order_id": woo_id,
+                **carried,
+            })
+        except Exception:
+            pass
+
+
 def _resolve_invoice_bound_price_list(
     resolved_price_list: str | None,
     *,
@@ -703,8 +869,9 @@ def _resolve_invoice_bound_price_list(
     was sold on "B2B Selling" (Medium jar 77) and amended in the POS to
     ACC-SINV-2026-18624-1. The outbound push fired ``order.updated``; the payload
     held exactly the same four lines at 77.00, but inbound rebuilt them from the
-    profile's "Standard Selling" list at 120. The line signature carries rate and
-    price_list_rate, so ``_submitted_invoice_matches_target_lines`` said "items
+    profile's "Standard Selling" list at 120. The line signature then carried rate
+    and price_list_rate (it compares identity only since — see
+    ``_invoice_line_identity``), so ``_submitted_invoice_matches_target_lines`` said "items
     changed", the item-edit gate enqueued a Woo amendment, and the replacement
     ACC-SINV-2026-18624-2 billed the shop 540 instead of 308. The echo guard
     cannot save this: it leaves the stored hash stale on purpose, so the next
@@ -1403,6 +1570,10 @@ SKIPPED_SUCCESS_REASONS = {
     # pull; counting it as one put every outbound write into the failed-order
     # metrics.
     "outbound_echo_suppressed",
+    # The amendment job re-checked the edit under the invoice lock and the
+    # current invoice already holds exactly the lines Woo describes — nothing to
+    # amend. A correct no-op, not a failed pull.
+    "items_already_match",
     # Another worker holds this order right now. That is the lock doing its job,
     # not a failure — the other worker will finish it. Counting these as errors
     # made `cancellation_reconcile` report failures for orders that were being
@@ -1454,32 +1625,322 @@ def _stable_line_value(value: Any, *, places: int = 6) -> Any:
         return str(value).strip()
 
 
-def _invoice_line_signature(row: Any) -> tuple[Any, ...]:
-    rate = _row_value(row, "rate", 0) or 0
-    price_list_rate = _row_value(row, "price_list_rate", None)
-    if price_list_rate in (None, ""):
-        price_list_rate = rate
+def _row_flag(row: Any, fieldname: str) -> int:
+    try:
+        return int(float(_row_value(row, fieldname, 0) or 0))
+    except Exception:
+        return 0
+
+
+def _invoice_line_identity(row: Any) -> tuple[Any, ...]:
+    """What a Woo edit can change on a line: which item, how many, which bundle.
+
+    Deliberately carries NO price field (rate, price_list_rate,
+    discount_percentage, discount_amount). WooCommerce never supplies prices to
+    ERPNext — ``_build_invoice_items`` rebuilds every target line from the
+    ERPNext price list (standalone) or BundleProcessor (bundles), and Woo
+    coupons / coupon-less discounts land on the invoice HEADER, never in a line
+    discount field. So a rate gap between the submitted invoice and the rebuilt
+    target can only be an ERPNext-side pricing decision: a POS line discount, a
+    ``custom_rate_override``, a 100%-discount Sample/Employee line, or a price
+    list that moved since the sale. A Woo amendment must not "correct" any of
+    those. Comparing rates here made every hash change on such an order — our
+    own outbound echo, a status or meta change — read as "items changed" and
+    rebuild the order at list price (Woo 17756, 2026-10-01).
+    """
     return (
         str(_row_value(row, "item_code", "") or ""),
         _stable_line_value(_row_value(row, "qty", 0) or 0),
-        _stable_line_value(rate, places=4),
-        _stable_line_value(price_list_rate, places=4),
-        _stable_line_value(_row_value(row, "discount_percentage", 0) or 0, places=4),
-        _stable_line_value(_row_value(row, "discount_amount", 0) or 0, places=4),
-        int(float(_row_value(row, "is_bundle_parent", 0) or 0)),
-        int(float(_row_value(row, "is_bundle_child", 0) or 0)),
+        _row_flag(row, "is_bundle_parent"),
+        _row_flag(row, "is_bundle_child"),
         str(_row_value(row, "bundle_code", "") or ""),
         str(_row_value(row, "parent_bundle", "") or ""),
     )
 
 
 def _submitted_invoice_matches_target_lines(inv: Any, target_lines: list[dict]) -> bool:
+    """True when the submitted invoice holds the same lines Woo now describes.
+
+    Identity only (see ``_invoice_line_identity``): same row count and the same
+    sorted multiset of (item_code, qty, bundle flags, bundle_code,
+    parent_bundle). Prices are out on purpose.
+    """
     invoice_lines = list(inv.get("items", []) or [])
     if len(invoice_lines) != len(target_lines):
         return False
-    invoice_signature = sorted(_invoice_line_signature(row) for row in invoice_lines)
-    target_signature = sorted(_invoice_line_signature(row) for row in target_lines)
-    return invoice_signature == target_signature
+    invoice_identity = sorted(_invoice_line_identity(row) for row in invoice_lines)
+    target_identity = sorted(_invoice_line_identity(row) for row in target_lines)
+    return invoice_identity == target_identity
+
+
+def _effective_line_amount(row: Any) -> tuple[float, float] | None:
+    """(qty, amount) for one row, the amount at the row's own selling rate.
+
+    ``rate`` is what the line actually sells at (after any line discount or
+    override); a missing rate falls back to ``amount``. A row at 100% discount
+    sells at 0 whatever its ``rate`` says: an unsaved BundleProcessor parent row
+    carries ``rate = price_list_rate`` with ``discount_percentage = 100`` and only
+    becomes 0 when ERPNext computes it on save. ``None`` for a row with no
+    usable qty.
+    """
+    try:
+        qty = float(_row_value(row, "qty", 0) or 0)
+    except Exception:
+        return None
+    if qty <= 0:
+        return None
+    try:
+        if float(_row_value(row, "discount_percentage", 0) or 0) >= 100:
+            return qty, 0.0
+    except Exception:
+        pass
+    rate = _row_value(row, "rate", None)
+    if rate in (None, ""):
+        amount = _row_value(row, "amount", None)
+        if amount in (None, ""):
+            return None
+        try:
+            return qty, float(amount)
+        except Exception:
+            return None
+    try:
+        return qty, float(rate) * qty
+    except Exception:
+        return None
+
+
+def _standalone_unit_rates(rows: list[Any]) -> dict[str, float]:
+    """Weighted unit selling rate per item_code over NON-bundle rows only."""
+    totals: dict[str, list[float]] = {}
+    for row in rows or []:
+        if _row_flag(row, "is_bundle_parent") or _row_flag(row, "is_bundle_child"):
+            continue
+        item_code = str(_row_value(row, "item_code", "") or "").strip()
+        if not item_code:
+            continue
+        qty_amount = _effective_line_amount(row)
+        if not qty_amount:
+            continue
+        bucket = totals.setdefault(item_code, [0.0, 0.0])
+        bucket[0] += qty_amount[0]
+        bucket[1] += qty_amount[1]
+    return {code: amount / qty for code, (qty, amount) in totals.items() if qty > 0}
+
+
+def _to_cents(value: float) -> int:
+    """Money as integer piastres/cents, half-up, so a 0.01 boundary is exact."""
+    from decimal import ROUND_HALF_UP, Decimal
+
+    return int((Decimal(str(value)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _bundle_row_link_key(row: Any) -> str:
+    """Same precedence as outbound_sync._get_bundle_link_key: parent_bundle, then bundle_code."""
+    for fieldname in ("parent_bundle", "bundle_code"):
+        value = str(_row_value(row, fieldname, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _row_carries_discount(row: Any) -> bool:
+    try:
+        if float(_row_value(row, "discount_percentage", 0) or 0) > 0:
+            return True
+        price_list_rate = float(_row_value(row, "price_list_rate", 0) or 0)
+        rate = _row_value(row, "rate", None)
+        return price_list_rate > 0 and rate not in (None, "") and float(rate) < price_list_rate - 0.005
+    except Exception:
+        return False
+
+
+def _bundle_instance_totals(rows: list[Any]) -> dict[str, dict[str, Any]]:
+    """Billed total of each bundle COPY on one side (parent + its children).
+
+    Rows are walked in order. A parent row opens a new copy of its link key
+    (``parent_bundle`` / ``bundle_code``); children join the most recent copy of
+    their key — the same instance rule as ``outbound_sync._bundle_instance_key``
+    (Woo 17748: the same bundle twice). Each copy is then labelled by its parent
+    row's item_code (``<item>``, ``<item>#2``, ...), falling back to the link key
+    when the side has no parent row, so an invoice and a rebuild that name the
+    bundle link differently still pair up by the bundle's ERPNext item.
+    """
+    occurrence_by_key: dict[str, int] = {}
+    current_instance: dict[str, str] = {}
+    instances: dict[str, dict[str, Any]] = {}
+    for row in rows or []:
+        is_parent = _row_flag(row, "is_bundle_parent")
+        is_child = _row_flag(row, "is_bundle_child")
+        if not (is_parent or is_child):
+            continue
+        key = _bundle_row_link_key(row)
+        if not key:
+            continue
+        if is_parent:
+            occurrence = occurrence_by_key.get(key, 0)
+            occurrence_by_key[key] = occurrence + 1
+            instance = key if occurrence == 0 else f"{key}#{occurrence + 1}"
+            current_instance[key] = instance
+        else:
+            instance = current_instance.get(key, key)
+        data = instances.setdefault(instance, {
+            "link_key": key,
+            "parent_item": "",
+            "amount": 0.0,
+            "children": 0,
+            "child_units": 0.0,
+            "discounted_children": 0,
+        })
+        if is_parent and not data["parent_item"]:
+            data["parent_item"] = str(_row_value(row, "item_code", "") or "").strip()
+        qty_amount = _effective_line_amount(row)
+        if qty_amount:
+            data["amount"] += qty_amount[1]
+        if is_child and not is_parent:
+            data["children"] += 1
+            data["child_units"] += qty_amount[0] if qty_amount else 0.0
+            if _row_carries_discount(row):
+                data["discounted_children"] += 1
+
+    labelled: dict[str, dict[str, Any]] = {}
+    seen: dict[str, int] = {}
+    for data in instances.values():
+        base = data["parent_item"] or data["link_key"]
+        occurrence = seen.get(base, 0)
+        seen[base] = occurrence + 1
+        labelled[base if occurrence == 0 else f"{base}#{occurrence + 1}"] = data
+    return labelled
+
+
+def _bundle_totals_that_would_change(inv_rows: list[Any], target_rows: list[Any]) -> list[dict]:
+    """Bundle copies whose billed total the rebuild would change.
+
+    A bundle's total is its configured price, NOT a function of its mix:
+    BundleProcessor spreads ``bundle_price`` over whichever children were picked
+    with one uniform discount, and puts the rounding residual on the last child.
+    So a pure mix edit leaves the total where it was, while a POS-side bundle
+    discount or override shows up as an invoice total below the rebuild's.
+
+    Two cases where the total DOES follow the mix, so no comparison is made:
+
+    * the children carry no discount on either side. BundleProcessor then bills
+      the children at full price because the bundle price exceeds the picked
+      children's list sum (``calculate_child_discount_percentage``), and the
+      total is that sum — it moves with every mix change;
+    * rounding: each child rate is rounded to the rate precision, so the total
+      can drift by up to half a piastre per child unit. Tolerance is therefore
+      1 piastre plus half a piastre per child unit (larger side), rounded up.
+    """
+    import math
+
+    invoice_bundles = _bundle_instance_totals(inv_rows)
+    target_bundles = _bundle_instance_totals(target_rows)
+    differences: list[dict] = []
+    for label in sorted(set(invoice_bundles) & set(target_bundles)):
+        inv_data = invoice_bundles[label]
+        tgt_data = target_bundles[label]
+        if not inv_data["discounted_children"] or not tgt_data["discounted_children"]:
+            continue
+        tolerance = 1 + math.ceil(0.5 * max(inv_data["child_units"], tgt_data["child_units"]))
+        if abs(_to_cents(inv_data["amount"]) - _to_cents(tgt_data["amount"])) > tolerance:
+            differences.append({
+                "item_code": label,
+                "kind": "bundle",
+                "invoice_rate": round(inv_data["amount"], 2),
+                "rebuild_rate": round(tgt_data["amount"], 2),
+            })
+    return differences
+
+
+def _amendment_would_reprice_unchanged_lines(inv: Any, target_lines: list[dict]) -> list[dict]:
+    """Lines a Woo amendment rebuild would silently re-price.
+
+    A genuine Woo item edit rebuilds the WHOLE order from the ERPNext price list
+    and BundleProcessor, so anything the POS priced by hand would come back at
+    list price. Two checks, both over what is present on BOTH sides:
+
+    * standalone lines (neither bundle flag): one entry per item_code whose
+      weighted unit selling rate differs by MORE than 0.01 (compared in integer
+      piastres, so exactly 0.01 does not count) — line discount, rate override,
+      100%-discount Sample/Employee line:
+      ``{"item_code", "invoice_rate", "rebuild_rate"}``;
+    * bundle copies: one entry per copy whose billed total (parent + children)
+      would change — ``{"item_code": <bundle item>, "kind": "bundle",
+      "invoice_rate": <invoice total>, "rebuild_rate": <rebuild total>}``. See
+      ``_bundle_totals_that_would_change``: a pure mix edit keeps the total, so
+      it still auto-amends.
+
+    Empty list = safe to auto-amend.
+    """
+    invoice_rows = list(inv.get("items", []) or [])
+    target_rows = list(target_lines or [])
+    invoice_rates = _standalone_unit_rates(invoice_rows)
+    target_rates = _standalone_unit_rates(target_rows)
+    differences: list[dict] = []
+    for item_code in sorted(set(invoice_rates) & set(target_rates)):
+        invoice_rate = round(invoice_rates[item_code], 4)
+        rebuild_rate = round(target_rates[item_code], 4)
+        if abs(_to_cents(invoice_rate) - _to_cents(rebuild_rate)) > 1:
+            differences.append({
+                "item_code": item_code,
+                "invoice_rate": invoice_rate,
+                "rebuild_rate": rebuild_rate,
+            })
+    differences.extend(_bundle_totals_that_would_change(invoice_rows, target_rows))
+    return differences
+
+
+def _describe_repriced_lines(differences: list[dict], limit: int = 10) -> str:
+    parts = [
+        (
+            f"{d['item_code']} (bundle total): invoice {d['invoice_rate']:.2f} -> rebuild {d['rebuild_rate']:.2f}"
+            if d.get("kind") == "bundle"
+            else f"{d['item_code']}: invoice rate {d['invoice_rate']:.2f} -> rebuild rate {d['rebuild_rate']:.2f}"
+        )
+        for d in differences[:limit]
+    ]
+    if len(differences) > limit:
+        parts.append(f"... and {len(differences) - limit} more")
+    return ", ".join(parts)
+
+
+def _rebuild_target_lines_for_invoice(order: dict, invoice: Any, *, woo_id: Any = None) -> list[dict]:
+    """The lines a Woo amendment would bill for ``order``, priced as the gate prices them.
+
+    Used by ``order_amendment.run_woo_amendment_job`` to re-check, under the
+    invoice lock, that the edit the gate saw is still real against the CURRENT
+    source. Pricing follows ``_process_order_phase1``: the submitted invoice's own
+    ``selling_price_list`` wins (``_resolve_invoice_bound_price_list``); the
+    fallback when that list is unusable is the source's POS Profile list, then
+    the company default (the gate's fallback is the territory's POS Profile,
+    which for a POS order is the same profile).
+
+    Raises instead of returning a partial list (unmapped items, no lines), so the
+    caller can refuse to amend rather than compare against half an order.
+    """
+    resolved_price_list = None
+    try:
+        pos_profile = _row_value(invoice, "pos_profile", None)
+        if pos_profile:
+            resolved_price_list = frappe.db.get_value("POS Profile", pos_profile, "selling_price_list")
+        if not resolved_price_list:
+            company = _row_value(invoice, "company", None)
+            if company:
+                resolved_price_list = frappe.db.get_value("Company", company, "default_selling_price_list")
+    except Exception:
+        resolved_price_list = None
+
+    price_list = _resolve_invoice_bound_price_list(
+        resolved_price_list,
+        woo_id=woo_id,
+        linked_invoice_name=getattr(invoice, "name", None) or _row_value(invoice, "name", None),
+    )
+    lines, missing, _bundle_context = _build_invoice_items(order, price_list=price_list)
+    if missing:
+        raise ValueError(f"unmapped_items: {missing}")
+    if not lines:
+        raise ValueError("no_lines")
+    return lines
 
 
 def _get_line_meta_value(meta_data_list: list[dict] | None, target_key: str) -> Any | None:
@@ -3001,12 +3462,36 @@ def _resolve_delivery_charge_policy(
     customer_name: str | None = None,
     pos_profile_name: str | None = None,
     channel: str = "woo",
+    source_had_no_shipping: bool = False,
 ) -> dict[str, Any]:
     if has_free_shipping_bundle:
         return {
             "amount": 0.0,
             "description": None,
             "reason": "free_shipping_bundle",
+        }
+
+    # A pickup order carries no delivery fee (that is what the jarz_pos-owned
+    # ``custom_is_pickup`` Check means). Without this, a Woo amendment of a POS
+    # pickup order re-added the territory's shipping income (Woo 17756 -2: +60).
+    if _invoice_is_pickup(inv):
+        return {
+            "amount": 0.0,
+            "description": None,
+            "reason": "pickup",
+        }
+
+    # Woo amendment replacement only (the create path sets this when
+    # ``amended_from`` is set and the source carried no delivery charge). The
+    # source's zero shipping was an ERPNext decision — pickup, or a commercial
+    # policy (B2B Supply, Sample - No Courier, Free Shipping Waiver, ...) that
+    # suppresses shipping income — which the Woo payload cannot express, so the
+    # replacement must not invent a territory charge.
+    if source_had_no_shipping:
+        return {
+            "amount": 0.0,
+            "description": None,
+            "reason": "source_had_no_shipping",
         }
 
     promotion = None
@@ -3064,6 +3549,7 @@ def _apply_delivery_charge_policy(
     customer_name: str | None = None,
     pos_profile_name: str | None = None,
     channel: str = "woo",
+    source_had_no_shipping: bool = False,
 ) -> dict[str, Any]:
     before_rows = _get_delivery_charge_rows(inv)
     decision = _resolve_delivery_charge_policy(
@@ -3074,6 +3560,7 @@ def _apply_delivery_charge_policy(
         customer_name=customer_name,
         pos_profile_name=pos_profile_name,
         channel=channel,
+        source_had_no_shipping=source_had_no_shipping,
     )
 
     posted_account = _posted_delivery_charge_account(inv)
@@ -4795,6 +5282,12 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 new_hash = _compute_order_hash(order)
                 stored_hash = (existing_map or {}).get("hash") or ""
                 hash_changed = new_hash != stored_hash
+                # Identity only — item, qty, bundle structure — never price. Woo
+                # does not supply prices, so a rate gap is an ERPNext pricing
+                # decision (POS discount, rate override, Sample/Employee line, a
+                # moved price list) that an amendment must not overwrite. Such an
+                # order with a hash change (our echo, a status/meta edit) lands in
+                # the branch below: map hash refreshed, submitted_frozen, no rebuild.
                 item_lines_changed = not _submitted_invoice_matches_target_lines(inv, lines)
 
                 if hash_changed and not item_lines_changed:
@@ -4887,7 +5380,46 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                     and bool(int(getattr(settings, "enable_inbound_amendment", None) or 0))
                 )
 
+                # A genuine Woo edit rebuilds the WHOLE order at list price. If a
+                # standalone line the edit leaves in place carries a POS pricing
+                # decision (line discount, rate override, 100%-discount
+                # Sample/Employee line) or a bundle copy is billed off its bundle
+                # price, the rebuild would silently drop it — so that order goes
+                # to a human instead of the amendment job. Bundles are compared
+                # by total, not per child: a pure bundle mix edit keeps its total
+                # and must keep auto-amending.
+                repriced_lines: list[dict] = []
+                if can_auto_amend:
+                    repriced_lines = _amendment_would_reprice_unchanged_lines(inv, lines)
+
                 if hash_changed:
+                    if can_auto_amend and repriced_lines:
+                        repriced_summary = _describe_repriced_lines(repriced_lines)
+                        _flag_order_map_for_manual_review(
+                            woo_id=woo_id,
+                            invoice_name=inv.name,
+                            reason=(
+                                "Item edit on an order with POS pricing the rebuild "
+                                f"would lose: {repriced_summary}. Auto-amendment "
+                                "blocked; apply the Woo edit in the POS."
+                            ),
+                        )
+                        create_sync_log_entry(
+                            "ItemEditDetected",
+                            "NeedsReview",
+                            f"hash mismatch on submitted invoice {inv.name}; "
+                            f"item edit on an order with POS pricing the rebuild would "
+                            f"lose: {repriced_summary}; flagged for manual review "
+                            f"(woo_status={woo_status!r})",
+                            woo_order_id=woo_id,
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "needs_manual_review",
+                            "woo_order_id": woo_id,
+                            "invoice": inv.name,
+                            "repriced_lines": repriced_lines,
+                        }
                     if can_auto_amend:
                         # Enqueue the amendment job and return immediately.  The job
                         # itself will relink the Order Map and create the new invoice.
@@ -5213,6 +5745,22 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 # Same downgrade, one path over: the replacement is built from the
                 # Woo payload, which never knew this was an on-account sale.
                 _carry_credit_terms_from_source(inv_data, amended_from, woo_id=woo_id)
+                # Nor did it know the order's purpose / commercial policy / pickup;
+                # set here, before get_doc, so the delivery-charge policy below
+                # sees the pickup flag and adds no shipping row.
+                _carry_order_context_from_source(inv_data, amended_from, woo_id=woo_id)
+
+            # Replacement only: if the source charged no delivery fee (pickup, or a
+            # commercial policy that suppresses shipping income), neither does the
+            # replacement. Unknown (tax rows unreadable) keeps the normal policy.
+            # New orders and the draft-update path never set this.
+            delivery_policy_overrides: dict[str, Any] = {}
+            if amended_from:
+                source_had_shipping = _source_invoice_had_shipping_row(
+                    amended_from, company=inv_data.get("company")
+                )
+                if source_had_shipping is False:
+                    delivery_policy_overrides["source_had_no_shipping"] = True
 
             if woo_status in ("completed", "out-for-delivery") and not is_historical:
                 # A live order the store already moved on before ERPNext first saw it.
@@ -5273,6 +5821,7 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                     customer_name=customer,
                     pos_profile_name=pos_profile,
                     channel="woo",
+                    **delivery_policy_overrides,
                 )
             except Exception:
                 pass

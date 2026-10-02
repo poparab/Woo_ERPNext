@@ -904,6 +904,9 @@ class TestEvaluatePaidAmendment(_RunWooAmendmentJobPatcher, unittest.TestCase):
             "process_order_phase1",
             lambda *a, **kw: {"invoice": "ACC-SINV-99001-1"},
         )
+        # Step 10b (the job's item re-check) rebuilds the Woo lines from the DB;
+        # this test is about the paid lane, so let the re-check pass through.
+        self.monkeypatch.setattr(oa, "_recheck_items_against_source", lambda *a, **kw: None)
 
         def _fake_create_payment_entry(invoice_name, payment_method, posting_date=None, cache=None):
             created_payment_entries.append((invoice_name, payment_method, posting_date))

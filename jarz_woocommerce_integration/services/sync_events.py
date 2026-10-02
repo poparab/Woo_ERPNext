@@ -79,6 +79,10 @@ SKIP_REASON_TOKENS = (
     # for every push we make — training staff to ignore the flag that exists to
     # catch real website edits.
     "outbound_echo",
+    # The Woo amendment job's re-check found the current invoice already matches
+    # the Woo lines (order_amendment). A correct no-op; unlisted it would fall
+    # through to "review" and raise a NeedsReview for nothing.
+    "items_already_match",
 )
 RETRYABLE_ORDER_REASONS = {"locked", "db_locked"}
 TERMINAL_STATUSES = {"Succeeded", "Skipped", "Superseded", "Failed", "NeedsReview", "DeadLetter"}

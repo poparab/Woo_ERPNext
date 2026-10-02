@@ -16,6 +16,9 @@ Flow (mirrors _run_invoice_amendment_job in jarz_pos.api.manager, but Woo-native
     8.  Amend-depth cap  (≤ 3 cancelled predecessors for same woo_order_id).
     9.  Period-close guard.
     10. Idempotency:  if replacement already exists with matching hash → skip.
+    10b. Re-check the edit against the CURRENT source (identity match → skip;
+         POS pricing the rebuild would lose → manual review; rebuild fails →
+         manual review). See _recheck_items_against_source.
     11. DB savepoint.
     12. Suppress outbound Woo push.
     13. Cancel Payment Entries (simple only).
@@ -546,6 +549,17 @@ def run_woo_amendment_job(
                 "invoice": source_si_name,
             }
 
+        # ── 10b. Re-check the edit against the CURRENT source ─────────────────
+        # The gate decided "items changed, safe to rebuild" against the invoice
+        # as it stood when the webhook ran. Between then and now the POS may have
+        # applied the same edit, or re-priced a line; re-run both checks under
+        # the invoice lock (held since step 3) before cancelling anything.
+        # Placed after the cheap guards so a blocked order never pays for the
+        # rebuild, and before step 11 so nothing has been touched yet.
+        recheck_block = _recheck_items_against_source(source_si, order_payload, woo_order_id)
+        if recheck_block:
+            return recheck_block
+
         # ── 11-19. Execute amendment ──────────────────────────────────────────
         request_id = _build_request_id(woo_order_id, new_hash)
         save_point = _build_savepoint_name(request_id)
@@ -894,6 +908,102 @@ def _check_period_closed(source_si: Any) -> str | None:
             return f"Accounting Period '{closed}' is closed for {posting_date}"
     except Exception:
         pass
+    return None
+
+
+def _recheck_items_against_source(
+    source_si: Any,
+    order_payload: dict,
+    woo_order_id: int,
+) -> dict | None:
+    """Re-run the gate's two item checks against the current source invoice.
+
+    Returns ``None`` when the amendment should go ahead, else the job's skip
+    result (already logged / flagged):
+
+    * the rebuilt Woo lines now match the invoice (identity: item, qty, bundle
+      structure) -> ``items_already_match``, a successful no-op;
+    * the rebuild would re-price a line or bundle the POS priced by hand ->
+      ``needs_manual_review``, Order Map flagged exactly as the gate does;
+    * the lines cannot be rebuilt at all -> ``amendment_recheck_failed``,
+      flagged. Fail-safe on purpose: an amendment cancels a submitted invoice,
+      and we will not do that on an edit we can no longer verify.
+    """
+    from jarz_woocommerce_integration.services.order_sync import (
+        _amendment_would_reprice_unchanged_lines,
+        _describe_repriced_lines,
+        _rebuild_target_lines_for_invoice,
+        _submitted_invoice_matches_target_lines,
+    )
+
+    source_si_name = str(getattr(source_si, "name", "") or "")
+    try:
+        target_lines = _rebuild_target_lines_for_invoice(order_payload, source_si, woo_id=woo_order_id)
+    except Exception as exc:  # noqa: BLE001
+        _flag_needs_review(
+            woo_order_id=woo_order_id,
+            invoice_name=source_si_name,
+            reason=(
+                f"amendment_recheck_failed: could not rebuild the Woo lines to re-check "
+                f"the edit against {source_si_name} ({exc}); amendment not applied"
+            ),
+        )
+        _write_sync_log(
+            "WooAmendment",
+            "Blocked",
+            f"amendment_recheck_failed on {source_si_name}: {exc}",
+            woo_order_id,
+        )
+        return {
+            "status": "skipped",
+            "reason": "amendment_recheck_failed",
+            "woo_order_id": woo_order_id,
+            "invoice": source_si_name,
+        }
+
+    if _submitted_invoice_matches_target_lines(source_si, target_lines):
+        _write_sync_log(
+            "WooAmendment",
+            "Skipped",
+            f"items_already_match: {source_si_name} already holds the lines WooCommerce "
+            "describes; nothing to amend",
+            woo_order_id,
+        )
+        return {
+            "status": "skipped",
+            "reason": "items_already_match",
+            "woo_order_id": woo_order_id,
+            "invoice": source_si_name,
+        }
+
+    repriced_lines = _amendment_would_reprice_unchanged_lines(source_si, target_lines)
+    if repriced_lines:
+        repriced_summary = _describe_repriced_lines(repriced_lines)
+        _flag_needs_review(
+            woo_order_id=woo_order_id,
+            invoice_name=source_si_name,
+            reason=(
+                "Item edit on an order with POS pricing the rebuild "
+                f"would lose: {repriced_summary}. Auto-amendment "
+                "blocked; apply the Woo edit in the POS."
+            ),
+        )
+        _write_sync_log(
+            "ItemEditDetected",
+            "NeedsReview",
+            f"amendment job re-check on {source_si_name}: item edit on an order with "
+            f"POS pricing the rebuild would lose: {repriced_summary}; flagged for "
+            "manual review",
+            woo_order_id,
+        )
+        return {
+            "status": "skipped",
+            "reason": "needs_manual_review",
+            "woo_order_id": woo_order_id,
+            "invoice": source_si_name,
+            "repriced_lines": repriced_lines,
+        }
+
     return None
 
 
