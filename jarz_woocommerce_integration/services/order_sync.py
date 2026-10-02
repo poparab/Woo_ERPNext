@@ -727,6 +727,38 @@ _CARRIED_CONTEXT_CHECK_FIELDS = (
 )
 
 
+_STANDARD_ORDER_PURPOSES = {"", "standard"}
+
+
+def _source_zero_shipping_was_a_policy_decision(source_invoice_name: str | None) -> bool:
+    """True when the amendment source carried a commercial context that suppresses delivery.
+
+    A non-Standard ``custom_order_purpose`` / ``custom_commercial_policy`` (B2B
+    Supply, Sample - No Courier, Free Shipping Waiver, ...) or ``custom_no_courier``.
+    Only then is "the source billed no Shipping Income" a decision the
+    replacement must keep; a Standard order's zero came from its basket or
+    address and must be re-derived. Fields missing from meta or unreadable
+    source -> False (keep the normal policy).
+    """
+    if not source_invoice_name:
+        return False
+    try:
+        fields = [
+            f for f in ("custom_order_purpose", "custom_commercial_policy", "custom_no_courier")
+            if _sales_invoice_has_field(f)
+        ]
+        if not fields:
+            return False
+        row = frappe.db.get_value("Sales Invoice", source_invoice_name, fields, as_dict=True) or {}
+    except Exception:
+        return False
+    for fieldname in ("custom_order_purpose", "custom_commercial_policy"):
+        value = str(row.get(fieldname) or "").strip().lower()
+        if fieldname in row and value not in _STANDARD_ORDER_PURPOSES:
+            return True
+    return _is_checked(row.get("custom_no_courier"))
+
+
 def _source_invoice_had_shipping_row(source_invoice_name: str | None, company: str | None = None) -> bool | None:
     """Did the source invoice charge the customer a delivery fee?
 
@@ -1790,6 +1822,7 @@ def _bundle_instance_totals(rows: list[Any]) -> dict[str, dict[str, Any]]:
             "children": 0,
             "child_units": 0.0,
             "discounted_children": 0,
+            "child_list_rates": {},
         })
         if is_parent and not data["parent_item"]:
             data["parent_item"] = str(_row_value(row, "item_code", "") or "").strip()
@@ -1801,6 +1834,13 @@ def _bundle_instance_totals(rows: list[Any]) -> dict[str, dict[str, Any]]:
             data["child_units"] += qty_amount[0] if qty_amount else 0.0
             if _row_carries_discount(row):
                 data["discounted_children"] += 1
+            child_code = str(_row_value(row, "item_code", "") or "").strip()
+            child_plr = _row_value(row, "price_list_rate", None)
+            if child_code and child_plr not in (None, ""):
+                try:
+                    data["child_list_rates"].setdefault(child_code, float(child_plr))
+                except (TypeError, ValueError):
+                    pass
 
     labelled: dict[str, dict[str, Any]] = {}
     seen: dict[str, int] = {}
@@ -1826,7 +1866,12 @@ def _bundle_totals_that_would_change(inv_rows: list[Any], target_rows: list[Any]
     * the children carry no discount on either side. BundleProcessor then bills
       the children at full price because the bundle price exceeds the picked
       children's list sum (``calculate_child_discount_percentage``), and the
-      total is that sum — it moves with every mix change;
+      total is that sum — it moves with every mix change. That only holds while
+      both sides price the children on the SAME basis: jarz_pos prices a POS
+      bundle's children from the order's list (B2B Selling 77), the Woo
+      BundleProcessor from ``Item.standard_rate`` (retail 120). So when a child
+      present in both copies carries a different list rate, the rebuild would
+      re-bill the bundle on another basis and the copy IS reported;
     * rounding: each child rate is rounded to the rate precision, so the total
       can drift by up to half a piastre per child unit. Tolerance is therefore
       1 piastre plus half a piastre per child unit (larger side), rounded up.
@@ -1840,6 +1885,18 @@ def _bundle_totals_that_would_change(inv_rows: list[Any], target_rows: list[Any]
         inv_data = invoice_bundles[label]
         tgt_data = target_bundles[label]
         if not inv_data["discounted_children"] or not tgt_data["discounted_children"]:
+            common_children = set(inv_data["child_list_rates"]) & set(tgt_data["child_list_rates"])
+            basis_changed = any(
+                abs(_to_cents(inv_data["child_list_rates"][code]) - _to_cents(tgt_data["child_list_rates"][code])) > 1
+                for code in common_children
+            )
+            if basis_changed and abs(_to_cents(inv_data["amount"]) - _to_cents(tgt_data["amount"])) > 1:
+                differences.append({
+                    "item_code": label,
+                    "kind": "bundle",
+                    "invoice_rate": round(inv_data["amount"], 2),
+                    "rebuild_rate": round(tgt_data["amount"], 2),
+                })
             continue
         tolerance = 1 + math.ceil(0.5 * max(inv_data["child_units"], tgt_data["child_units"]))
         if abs(_to_cents(inv_data["amount"]) - _to_cents(tgt_data["amount"])) > tolerance:
@@ -5750,12 +5807,17 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 # sees the pickup flag and adds no shipping row.
                 _carry_order_context_from_source(inv_data, amended_from, woo_id=woo_id)
 
-            # Replacement only: if the source charged no delivery fee (pickup, or a
-            # commercial policy that suppresses shipping income), neither does the
-            # replacement. Unknown (tax rows unreadable) keeps the normal policy.
-            # New orders and the draft-update path never set this.
+            # Replacement only: if the source charged no delivery fee BECAUSE of a
+            # commercial decision (a non-Standard order purpose / policy, or no
+            # courier), neither does the replacement. A zero that came from the
+            # basket or the address (free-shipping bundle, delivery promotion,
+            # a free territory) is re-derived by the normal policy below, the way
+            # jarz_pos's own amendment re-derives a source that charged its
+            # territory default. Pickup is handled by the carried pickup flag.
+            # Unknown (tax rows unreadable) keeps the normal policy. New orders
+            # and the draft-update path never set this.
             delivery_policy_overrides: dict[str, Any] = {}
-            if amended_from:
+            if amended_from and _source_zero_shipping_was_a_policy_decision(amended_from):
                 source_had_shipping = _source_invoice_had_shipping_row(
                     amended_from, company=inv_data.get("company")
                 )

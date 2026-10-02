@@ -410,6 +410,24 @@ class TestAmendmentWouldRepriceUnchangedLines(unittest.TestCase):
         target = _bundle_rows([("CHILD-A", 100.0, 100.0), ("CHILD-C", 110.0, 110.0)], parent_rate=480.0)
         self.assertEqual(self._diff(invoice, target), [])
 
+    def test_undiscounted_children_on_another_price_basis_are_reported(self):
+        """W2-a: a POS bundle on B2B Selling bills its children at 77 (bundle price 400
+        is above their 308 sum, so no discount); the Woo rebuild prices the same
+        children from retail 120 and discounts them down to 400. The undiscounted
+        skip must not let that through."""
+        invoice = _bundle_rows([("CHILD-A", 77.0, 77.0), ("CHILD-B", 77.0, 77.0)])  # 308
+        target = _bundle_rows([("CHILD-A", 100.0, 120.0), ("CHILD-B", 100.0, 120.0)], parent_rate=480.0)  # 400
+        diff = self._diff(invoice, target)
+        self.assertEqual(len(diff), 1, diff)
+        self.assertEqual(diff[0]["kind"], "bundle")
+        self.assertEqual((diff[0]["invoice_rate"], diff[0]["rebuild_rate"]), (308.0, 400.0))
+
+    def test_undiscounted_mix_edit_on_the_same_basis_is_still_skipped(self):
+        """Same children list rates on both sides: the total follows the mix, no report."""
+        invoice = _bundle_rows([("CHILD-A", 100.0, 100.0), ("CHILD-B", 100.0, 100.0)])
+        target = _bundle_rows([("CHILD-A", 100.0, 100.0), ("CHILD-C", 110.0, 110.0)], parent_rate=480.0)
+        self.assertEqual(self._diff(invoice, target), [])
+
     def test_copies_of_the_same_bundle_are_compared_per_copy(self):
         """Woo 17748 shape: the same bundle twice; only the second copy was discounted."""
         invoice = _bundle_rows(MIX_AB) + _bundle_rows([("CHILD-A", 100.0, 150.0), ("CHILD-B", 100.0, 150.0)])
@@ -612,6 +630,16 @@ class TestReplacementKeepsSourceContext(unittest.TestCase):
         self.assertEqual(replacement.values.get("custom_no_courier"), 1)
         self.assertNotIn("custom_is_pickup", replacement.values)
         self.assertEqual(self._shipping(replacement), [])
+
+    def test_b2b_supply_purpose_alone_keeps_zero_shipping(self):
+        replacement = self._run({"custom_order_purpose": "B2B Supply", "custom_is_pickup": 0})
+        self.assertEqual(self._shipping(replacement), [])
+
+    def test_standard_source_without_shipping_is_re_derived(self):
+        """W1-a: a Standard order's zero came from its basket or address (free-shipping
+        bundle, delivery promotion, free territory) — the replacement re-derives it."""
+        replacement = self._run({"custom_order_purpose": "Standard", "custom_is_pickup": 0})
+        self.assertEqual(self._shipping(replacement), [self.TERRITORY_DELIVERY_INCOME])
 
     def test_control_source_with_shipping_row_keeps_territory_shipping(self):
         """Proves the harness charges 60 — so the suppression tests are meaningful."""
