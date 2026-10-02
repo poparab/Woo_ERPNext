@@ -685,6 +685,105 @@ def _carry_credit_terms_from_source(
     })
 
 
+def _resolve_invoice_bound_price_list(
+    resolved_price_list: str | None,
+    *,
+    woo_id: Any = None,
+    amended_from: str | None = None,
+    linked_invoice_name: str | None = None,
+) -> str | None:
+    """Price an already-invoiced Woo order from the list its invoice was sold on.
+
+    The territory / POS Profile lookup only knows the branch's DEFAULT list. That
+    is right for an order born on the website, but not for one the POS created
+    and mirrored to Woo on another list (B2B Selling, Employee, Sample, ...).
+
+    Woo order 17756 (2026-10-01): a B2B order for "Cloud nine specialty coffee"
+    was sold on "B2B Selling" (Medium jar 77) and amended in the POS to
+    ACC-SINV-2026-18624-1. The outbound push fired ``order.updated``; the payload
+    held exactly the same four lines at 77.00, but inbound rebuilt them from the
+    profile's "Standard Selling" list at 120. The line signature carries rate and
+    price_list_rate, so ``_submitted_invoice_matches_target_lines`` said "items
+    changed", the item-edit gate enqueued a Woo amendment, and the replacement
+    ACC-SINV-2026-18624-2 billed the shop 540 instead of 308. The echo guard
+    cannot save this: it leaves the stored hash stale on purpose, so the next
+    poll re-runs the same wrong comparison. Any hash change on an order priced
+    from a non-default list was being read as a customer item edit and re-priced
+    at retail.
+
+    So, when this Woo order already belongs to an ERPNext invoice, that invoice's
+    ``selling_price_list`` wins:
+
+    1. ``amended_from`` (the cancelled source of a Woo amendment), else
+    2. the linked invoice, but only while it is submitted (docstatus 1) — that is
+       the document the item-edit gate compares against. Drafts keep the old
+       behaviour: their items are rebuilt from the payload anyway.
+
+    The list is only adopted when it is non-empty, differs from the resolved one,
+    and names an enabled selling Price List. Anything else — including any DB
+    error — returns ``resolved_price_list`` unchanged, so website orders (whose
+    invoice list IS the profile list) behave exactly as before.
+    """
+    if not amended_from and not linked_invoice_name:
+        return resolved_price_list
+
+    source_invoice = amended_from or linked_invoice_name
+    source_kind = "amended_from" if amended_from else "linked_invoice"
+    try:
+        if amended_from:
+            # The source is already cancelled (docstatus 2) by the amendment job
+            # when this runs; its header still records what it was sold on.
+            bound_list = frappe.db.get_value("Sales Invoice", amended_from, "selling_price_list")
+        else:
+            row = frappe.db.get_value(
+                "Sales Invoice",
+                linked_invoice_name,
+                ["docstatus", "selling_price_list"],
+                as_dict=True,
+            )
+            if not row or int(row.get("docstatus") or 0) != 1:
+                return resolved_price_list
+            bound_list = row.get("selling_price_list")
+
+        bound_list = str(bound_list or "").strip()
+        if not bound_list or bound_list == str(resolved_price_list or "").strip():
+            return resolved_price_list
+
+        pl_row = frappe.db.get_value(
+            "Price List",
+            bound_list,
+            ["selling", "enabled"],
+            as_dict=True,
+        )
+        if not pl_row or not int(pl_row.get("selling") or 0) or not int(pl_row.get("enabled") or 0):
+            frappe.logger("jarz_woocommerce.order_sync").warning({
+                "event": "woo_invoice_price_list_not_usable",
+                "woo_order_id": woo_id,
+                "source_invoice": source_invoice,
+                "source_kind": source_kind,
+                "invoice_price_list": bound_list,
+                "kept_price_list": resolved_price_list,
+                "reason": "missing" if not pl_row else "disabled_or_not_selling",
+            })
+            return resolved_price_list
+    except Exception:
+        # A DB hiccup must never block the order; fall back to the profile list.
+        return resolved_price_list
+
+    try:
+        frappe.logger("jarz_woocommerce.order_sync").warning({
+            "event": "woo_invoice_price_list_preserved",
+            "woo_order_id": woo_id,
+            "source_invoice": source_invoice,
+            "source_kind": source_kind,
+            "invoice_price_list": bound_list,
+            "profile_price_list": resolved_price_list,
+        })
+    except Exception:
+        pass
+    return bound_list
+
+
 def _should_treat_inbound_order_as_paid(
     woo_status: str | None,
     custom_payment_method: str | None,
@@ -4426,6 +4525,23 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 price_list = frappe.db.get_value("Company", default_company, "default_selling_price_list")
     except Exception:
         price_list = None
+
+    # An order that already has an ERPNext invoice is priced from THAT invoice's
+    # list, not the branch default — otherwise a POS order sold on "B2B Selling"
+    # rebuilds at "Standard Selling", the item-edit gate below reads the price gap
+    # as a customer edit, and the amendment re-bills the shop at retail (Woo order
+    # 17756, 2026-10-01: 308 -> 540 EGP). The same `price_list` then reaches the
+    # replacement header (inv_data["selling_price_list"]), so its rows and header
+    # never disagree. Drafts are not substituted (see the helper). Off for the
+    # cached historical migration: MigrationCache only preloads prices for the
+    # lists it resolved itself.
+    if not cache:
+        price_list = _resolve_invoice_bound_price_list(
+            price_list,
+            woo_id=woo_id,
+            amended_from=amended_from,
+            linked_invoice_name=(existing_map or {}).get(LINK_FIELD) or linked_invoice_name,
+        )
 
     lines, missing, bundle_context = _build_invoice_items(
         order,
