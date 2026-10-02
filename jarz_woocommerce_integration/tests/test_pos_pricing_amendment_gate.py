@@ -129,9 +129,19 @@ class _GateCase(unittest.TestCase):
         self.monkeypatch = MonkeyPatch()
         self.addCleanup(self.monkeypatch.undo)
 
-    def _run(self, invoice_items: list[dict], *, target_lines: list[dict] | None = None, enable_amendment: int = 1):
+    def _run(
+        self,
+        invoice_items: list[dict],
+        *,
+        target_lines: list[dict] | None = None,
+        enable_amendment: int = 1,
+        invoice_fields: dict | None = None,
+        order: dict | None = None,
+    ):
         live = _invoice_doc(LIVE_INVOICE, docstatus=1, unit_rate=LIST_RATE, selling_price_list=PROFILE_LIST)
         live.items = [dict(row) for row in invoice_items]
+        for fieldname, value in (invoice_fields or {}).items():
+            setattr(live, fieldname, value)
         rec = _install(
             self.monkeypatch,
             map_link=LIVE_INVOICE,
@@ -151,7 +161,7 @@ class _GateCase(unittest.TestCase):
         self.sync_log = MagicMock()
         self.monkeypatch.setattr(order_sync, "create_sync_log_entry", self.sync_log)
 
-        result = order_sync.process_order_phase1(_woo_order(), _settings(enable_amendment=enable_amendment))
+        result = order_sync.process_order_phase1(order or _woo_order(), _settings(enable_amendment=enable_amendment))
         return result, live, rec
 
     def _log_messages(self, operation: str | None = None) -> list[str]:
@@ -282,6 +292,32 @@ class TestGenuineEditOnPosPricedOrder(_GateCase):
         self.assertIn(f"{BUNDLE_ITEM} (bundle total): invoice 432.00 -> rebuild 480.00", reason)
         order_sync.frappe.enqueue.assert_not_called()
 
+    def test_g_pos_header_discount_missing_from_woo_needs_review(self):
+        """A POS order with a 50 header discount whose fee line never reached Woo:
+        the rebuild would bill it at full price, so the genuine edit goes to review."""
+        result, live, rec = self._run(
+            [_jar_row(LIST_RATE)],
+            target_lines=[_jar_row(LIST_RATE), _cookie_row()],
+            invoice_fields={"discount_amount": 50.0, "apply_discount_on": "Grand Total"},
+            order=_pos_origin_order(),
+        )
+
+        self.assertEqual(result.get("reason"), "needs_manual_review", result)
+        order_sync.frappe.enqueue.assert_not_called()
+        reason = order_sync._flag_order_map_for_manual_review.call_args.kwargs["reason"]
+        self.assertIn("header discount: invoice 50.00 -> rebuild 0.00", reason)
+
+    def test_g2_pos_header_discount_carried_by_the_fee_line_still_enqueues(self):
+        result, live, rec = self._run(
+            [_jar_row(LIST_RATE)],
+            target_lines=[_jar_row(LIST_RATE), _cookie_row()],
+            invoice_fields={"discount_amount": 50.0, "apply_discount_on": "Grand Total"},
+            order=_pos_origin_order(fee=-50.0),
+        )
+
+        self.assertEqual(result.get("reason"), "amendment_enqueued", result)
+        order_sync._flag_order_map_for_manual_review.assert_not_called()
+
     def test_flag_off_keeps_the_existing_review_reason(self):
         """The new branch only replaces an enqueue; flag-off review is unchanged."""
         result, live, rec = self._run(
@@ -315,6 +351,16 @@ class TestReasonClassification(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Helpers in isolation
 # ---------------------------------------------------------------------------
+
+def _pos_origin_order(*, fee: float | None = None, coupons: list[str] | None = None, origin: bool = True) -> dict:
+    order = _woo_order()
+    order["meta_data"] = [{"key": "_jarz_order_origin", "value": "ERPNext POS"}] if origin else []
+    order["created_via"] = "rest-api" if origin else "checkout"
+    order["discount_total"] = "0.00"
+    order["fee_lines"] = [{"id": 7, "name": "Discount", "total": f"{fee:.2f}"}] if fee is not None else []
+    order["coupon_lines"] = [{"code": code} for code in (coupons or [])]
+    return order
+
 
 class _Inv:
     def __init__(self, items, name="ACC-SINV-TEST"):
@@ -872,3 +918,53 @@ class TestAmendmentJobRecheck(_RunWooAmendmentJobPatcher, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeaderDiscountRebuildWouldLose(unittest.TestCase):
+    def _lose(self, order, **fields):
+        inv = _Inv([])
+        for fieldname, value in fields.items():
+            setattr(inv, fieldname, value)
+        return order_sync._header_discount_rebuild_would_lose(inv, order)
+
+    def test_no_header_discount_reports_nothing(self):
+        self.assertEqual(self._lose(_pos_origin_order()), [])
+
+    def test_website_order_is_never_checked(self):
+        """On a store-created order every header discount came FROM Woo."""
+        self.assertEqual(self._lose(_pos_origin_order(origin=False), discount_amount=50.0), [])
+
+    def test_fee_line_matching_the_discount_is_safe(self):
+        self.assertEqual(self._lose(_pos_origin_order(fee=-50.0), discount_amount=50.0), [])
+
+    def test_one_piastre_drift_is_safe(self):
+        self.assertEqual(self._lose(_pos_origin_order(fee=-49.99), discount_amount=50.0), [])
+
+    def test_missing_fee_line_is_reported(self):
+        diff = self._lose(_pos_origin_order(), discount_amount=50.0)
+        self.assertEqual(diff, [{
+            "item_code": "Header discount", "kind": "header_discount",
+            "invoice_rate": 50.0, "rebuild_rate": 0.0,
+        }])
+
+    def test_percentage_discount_is_reported_even_with_a_matching_fee(self):
+        diff = self._lose(_pos_origin_order(fee=-50.0), discount_amount=50.0, additional_discount_percentage=10.0)
+        self.assertEqual(len(diff), 1)
+        self.assertIsNone(diff[0]["rebuild_rate"])
+
+    def test_coupon_without_invoice_promo_codes_is_reported(self):
+        diff = self._lose(_pos_origin_order(fee=-50.0, coupons=["SAVE"]), discount_amount=50.0)
+        self.assertEqual(len(diff), 1)
+
+    def test_coupon_with_invoice_promo_codes_is_left_to_the_promo_engine(self):
+        self.assertEqual(
+            self._lose(_pos_origin_order(coupons=["SAVE"]), discount_amount=50.0, custom_promo_codes='["SAVE"]'),
+            [],
+        )
+
+    def test_describe_renders_header_entries(self):
+        text = order_sync._describe_repriced_lines([
+            {"item_code": "Header discount", "kind": "header_discount", "invoice_rate": 50.0, "rebuild_rate": None},
+        ])
+        self.assertEqual(text, "header discount: invoice 50.00 -> rebuild unknown")
+

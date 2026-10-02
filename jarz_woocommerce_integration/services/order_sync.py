@@ -1947,15 +1947,79 @@ def _amendment_would_reprice_unchanged_lines(inv: Any, target_lines: list[dict])
     return differences
 
 
+def _header_discount_rebuild_would_lose(inv: Any, order: dict | None) -> list[dict]:
+    """The POS header discount a Woo amendment rebuild could not reproduce.
+
+    Only for orders the POS created (``_jarz_order_origin`` / ``rest-api``): on a
+    website order every header discount came FROM Woo, and the rebuild reads it
+    back the same way. A POS header discount reaches the store as a negative fee
+    line (``outbound_sync._build_discount_fee_lines``) and the coupon-less rebuild
+    restores it from there (``_apply_noncoupon_woo_discount``) — so the common case
+    is safe, and this reports only where that round trip breaks:
+
+    * a percentage discount (``additional_discount_percentage``): the rebuild only
+      knows the old amount, which is wrong for an edited basket;
+    * coupons on the order but no promo codes on the invoice: the rebuild hands the
+      discount to jarz_pos's promo engine, which knows nothing of a manual one;
+    * otherwise, the Woo non-coupon discount (fee line + ``discount_total``) does
+      not equal the invoice's ``discount_amount`` — the push never landed, or
+      the two drifted.
+
+    Returns at most one ``{"item_code": "Header discount", "kind":
+    "header_discount", "invoice_rate", "rebuild_rate"}`` entry; ``rebuild_rate`` is
+    ``None`` where the rebuild's amount cannot be known.
+    """
+    if not isinstance(order, dict):
+        return []
+    try:
+        from jarz_woocommerce_integration.services.outbound_sync import _order_is_jarz_originated
+
+        if not _order_is_jarz_originated(order):
+            return []
+    except Exception:
+        return []
+
+    def _money(fieldname: str) -> float:
+        try:
+            return float(_row_value(inv, fieldname, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    invoice_discount = _money("discount_amount")
+    if _to_cents(invoice_discount) <= 0:
+        return []
+
+    entry = {
+        "item_code": "Header discount",
+        "kind": "header_discount",
+        "invoice_rate": round(invoice_discount, 2),
+        "rebuild_rate": None,
+    }
+    if _money("additional_discount_percentage") > 0:
+        return [entry]
+
+    coupon_codes = [c for c in (order.get("coupon_lines") or []) if isinstance(c, dict) and c.get("code")]
+    if coupon_codes:
+        invoice_codes = str(_row_value(inv, "custom_promo_codes", "") or "").strip()
+        return [] if invoice_codes not in ("", "[]") else [entry]
+
+    rebuild_discount = _woo_noncoupon_discount_total(order)
+    if abs(_to_cents(invoice_discount) - _to_cents(rebuild_discount)) > 1:
+        entry["rebuild_rate"] = round(rebuild_discount, 2)
+        return [entry]
+    return []
+
+
 def _describe_repriced_lines(differences: list[dict], limit: int = 10) -> str:
-    parts = [
-        (
-            f"{d['item_code']} (bundle total): invoice {d['invoice_rate']:.2f} -> rebuild {d['rebuild_rate']:.2f}"
-            if d.get("kind") == "bundle"
-            else f"{d['item_code']}: invoice rate {d['invoice_rate']:.2f} -> rebuild rate {d['rebuild_rate']:.2f}"
-        )
-        for d in differences[:limit]
-    ]
+    def _one(d: dict) -> str:
+        if d.get("kind") == "header_discount":
+            rebuilt = "unknown" if d.get("rebuild_rate") is None else f"{d['rebuild_rate']:.2f}"
+            return f"header discount: invoice {d['invoice_rate']:.2f} -> rebuild {rebuilt}"
+        if d.get("kind") == "bundle":
+            return f"{d['item_code']} (bundle total): invoice {d['invoice_rate']:.2f} -> rebuild {d['rebuild_rate']:.2f}"
+        return f"{d['item_code']}: invoice rate {d['invoice_rate']:.2f} -> rebuild rate {d['rebuild_rate']:.2f}"
+
+    parts = [_one(d) for d in differences[:limit]]
     if len(differences) > limit:
         parts.append(f"... and {len(differences) - limit} more")
     return ", ".join(parts)
@@ -5448,6 +5512,7 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 repriced_lines: list[dict] = []
                 if can_auto_amend:
                     repriced_lines = _amendment_would_reprice_unchanged_lines(inv, lines)
+                    repriced_lines += _header_discount_rebuild_would_lose(inv, order)
 
                 if hash_changed:
                     if can_auto_amend and repriced_lines:

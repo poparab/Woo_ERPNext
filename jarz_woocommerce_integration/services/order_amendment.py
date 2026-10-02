@@ -923,7 +923,8 @@ def _recheck_items_against_source(
 
     * the rebuilt Woo lines now match the invoice (identity: item, qty, bundle
       structure) -> ``items_already_match``, a successful no-op;
-    * the rebuild would re-price a line or bundle the POS priced by hand ->
+    * the rebuild would re-price a line or bundle the POS priced by hand, or
+      lose the POS header discount ->
       ``needs_manual_review``, Order Map flagged exactly as the gate does;
     * the lines cannot be rebuilt at all -> ``amendment_recheck_failed``,
       flagged. Fail-safe on purpose: an amendment cancels a submitted invoice,
@@ -932,6 +933,7 @@ def _recheck_items_against_source(
     from jarz_woocommerce_integration.services.order_sync import (
         _amendment_would_reprice_unchanged_lines,
         _describe_repriced_lines,
+        _header_discount_rebuild_would_lose,
         _rebuild_target_lines_for_invoice,
         _submitted_invoice_matches_target_lines,
     )
@@ -977,6 +979,7 @@ def _recheck_items_against_source(
         }
 
     repriced_lines = _amendment_would_reprice_unchanged_lines(source_si, target_lines)
+    repriced_lines += _header_discount_rebuild_would_lose(source_si, order_payload)
     if repriced_lines:
         repriced_summary = _describe_repriced_lines(repriced_lines)
         _flag_needs_review(
