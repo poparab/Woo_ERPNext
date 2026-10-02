@@ -1689,8 +1689,8 @@ def _invoice_line_identity(row: Any, bundle_items: dict[str, str] | None = None)
     any hash change, and our own echo cancelled and re-issued it with identical
     lines (ACC-SINV-2026-18442-1, 18627-1, 18624-1).
     """
-    bundle_code = str(_row_value(row, "bundle_code", "") or "")
-    parent_bundle = str(_row_value(row, "parent_bundle", "") or "")
+    bundle_code = str(_row_value(row, "bundle_code", "") or "").strip()
+    parent_bundle = str(_row_value(row, "parent_bundle", "") or "").strip()
     if bundle_items is not None:
         bundle_code = bundle_items.get(bundle_code, bundle_code) if bundle_code else ""
         parent_bundle = bundle_items.get(parent_bundle, parent_bundle) if parent_bundle else ""

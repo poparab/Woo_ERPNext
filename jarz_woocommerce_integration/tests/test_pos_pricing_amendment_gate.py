@@ -318,6 +318,18 @@ class TestGenuineEditOnPosPricedOrder(_GateCase):
         self.assertEqual(result.get("reason"), "amendment_enqueued", result)
         order_sync._flag_order_map_for_manual_review.assert_not_called()
 
+    def test_h_pos_bundle_echo_under_another_record_name_is_frozen(self):
+        """The 23-of-39 production shape: the invoice links the bundle by its Jarz
+        Bundle name, the rebuild by its Woo Jarz Bundle name. No edit, no amendment."""
+        result, live, rec = self._run(
+            _bundle_rows(MIX_AB, link_key="jdu98tulvs"),
+            target_lines=_bundle_rows(MIX_AB, link_key="cdi9cu8jaf", parent_rate=480.0),
+        )
+
+        self.assertEqual(result.get("reason"), "submitted_frozen", result)
+        order_sync.frappe.enqueue.assert_not_called()
+        order_sync._flag_order_map_for_manual_review.assert_not_called()
+
     def test_flag_off_keeps_the_existing_review_reason(self):
         """The new branch only replaces an enqueue; flag-off review is unchanged."""
         result, live, rec = self._run(
@@ -1052,6 +1064,29 @@ class TestJobRecheckHeaderDiscount(unittest.TestCase):
         oa, result = self._recheck(_pos_origin_order(fee=-50.0))
         self.assertIsNone(result)
         oa._flag_needs_review.assert_not_called()
+
+
+class TestWooJarzBundleItemIsUnique(unittest.TestCase):
+    def setUp(self):
+        self.monkeypatch = MonkeyPatch()
+        self.addCleanup(self.monkeypatch.undo)
+
+    def _validate(self, existing):
+        from jarz_woocommerce_integration.doctype.woo_jarz_bundle import woo_jarz_bundle as wjb
+
+        self.monkeypatch.setattr(wjb.frappe.db, "get_value", lambda *a, **kw: existing)
+        doc = wjb.WooJarzBundle.__new__(wjb.WooJarzBundle)
+        doc.__dict__.update({"name": "cdi9cu8jaf", "erpnext_item": "Jarz Signature Trio"})
+        doc.get = lambda key, default=None: doc.__dict__.get(key, default)
+        doc.validate()
+
+    def test_a_second_bundle_on_the_same_item_is_refused(self):
+        import frappe
+        with self.assertRaises(frappe.ValidationError):
+            self._validate("othr1bundl")
+
+    def test_a_unique_item_saves(self):
+        self._validate(None)
 
 
 if __name__ == "__main__":
