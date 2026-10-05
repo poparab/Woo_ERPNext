@@ -43,6 +43,46 @@ def _normalize_name(first: str | None, last: str | None, email: Optional[str] = 
     return "Woo Guest"
 
 
+def _pick_name_parts(*blocks: dict | None) -> tuple[str, str]:
+    """Take ``first_name``/``last_name`` from ONE block, never mix two.
+
+    A Woo account created on the shop usually carries the whole name in
+    ``billing.first_name`` with an empty ``billing.last_name``; the name this
+    app pushes out is split across ``shipping.first_name``/``last_name``.
+    Reading each field with its own ``billing or shipping`` fallback therefore
+    produced "<full billing name> <shipping surname>" — and since outbound then
+    re-split that longer name into shipping, every sync round appended the
+    surname once more ("ilo specialty coffee" grew a tail of "specialty coffee"
+    seven times on production). A name comes from whichever block names the
+    customer at all; the other block never contributes half of it.
+    """
+
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        first = str(block.get("first_name") or "").strip()
+        last = str(block.get("last_name") or "").strip()
+        if first or last:
+            return first, last
+    return "", ""
+
+
+def _is_repeated_tail_growth(current: str | None, candidate: str | None) -> bool:
+    """True when ``candidate`` is ``current`` with its own tail tacked on again.
+
+    Second line of defence for the loop above: a sync may only rename a
+    customer, never grow their name by repeating what it already ends with. A
+    genuine rename never has this shape, so refusing it costs nothing.
+    """
+
+    cur = " ".join(str(current or "").split())
+    cand = " ".join(str(candidate or "").split())
+    if not cur or not cand.startswith(cur + " "):
+        return False
+    added = cand[len(cur):].strip()
+    return bool(added) and (cur == added or cur.endswith(" " + added))
+
+
 _field_exists_cache: dict[tuple[str, str], bool] = {}
 
 
@@ -481,7 +521,13 @@ def _update_customer_identity(
             updates["disabled"] = 0
         current_customer_name = str(frappe.db.get_value("Customer", name, "customer_name") or "")
         if normalized_display_name and (overwrite_existing or not current_customer_name) and current_customer_name != normalized_display_name:
-            updates["customer_name"] = normalized_display_name
+            if _is_repeated_tail_growth(current_customer_name, normalized_display_name):
+                frappe.logger("woo").warning(
+                    f"skipped_repeated_name_growth customer={name!r} "
+                    f"current={current_customer_name!r} candidate={normalized_display_name!r}"
+                )
+            else:
+                updates["customer_name"] = normalized_display_name
         current_woo_customer_id = get_customer_woo_id(name)
         if normalized_woo_customer_id and _field_exists("Customer", "woo_customer_id") and (overwrite_existing or not current_woo_customer_id) and current_woo_customer_id != normalized_woo_customer_id:
             # One Woo account maps to one Customer. Stamping an id that another
@@ -1716,8 +1762,7 @@ def _sync_customer_payload(cust: Dict[str, Any]) -> Dict[str, Any]:
         or (cust.get("email") if isinstance(cust.get("email"), str) else None)
     )
     username = cust.get("username") if isinstance(cust.get("username"), str) else None
-    first_name = billing.get("first_name") or shipping.get("first_name")
-    last_name = billing.get("last_name") or shipping.get("last_name")
+    first_name, last_name = _pick_name_parts(billing, shipping)
     phone = billing.get("phone") or shipping.get("phone")
 
     # Use WooCommerce customer ID for idempotent customer lookup
