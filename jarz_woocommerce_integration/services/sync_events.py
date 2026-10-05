@@ -807,14 +807,50 @@ def record_manual_push_audit_event(
         return None
 
 
-def enqueue_sync_event(event_name: str, *, after_commit: bool = True, queue: str = "short") -> None:
-    frappe.enqueue(
-        "jarz_woocommerce_integration.services.sync_events.process_sync_event",
-        queue=queue,
-        timeout=900,
-        enqueue_after_commit=after_commit,
-        event_name=event_name,
-    )
+def sync_event_job_id(event_name: str) -> str:
+    return f"woo-sync-event::{event_name}"
+
+
+def enqueue_sync_event(event_name: str, *, after_commit: bool = True, queue: str = "short") -> bool:
+    """Hand one ledger event to a worker. Returns False when no job was queued.
+
+    One RQ job per event, ever: a second call while the first job is queued or
+    running is dropped by ``deduplicate``. On 2026-10-04 the order poll re-read
+    the same 600 orders every 2 minutes and queued each one again, so the short
+    queue held ~700 jobs for 337 events — all CPU spent on no-op claims.
+
+    A full queue is not an error here. The event row is already ``Pending`` and
+    ``process_due_sync_events`` (every minute) claims it straight from the
+    table, so refusing the RQ job only delays it. Raising instead made every
+    caller count it as a failure and still left the row to the sweeper.
+
+    A finished event is never queued: its job could only fail to claim it.
+    """
+    if frappe.db.get_value(EVENT_DOCTYPE, event_name, "status") in TERMINAL_STATUSES:
+        return False
+    try:
+        frappe.enqueue(
+            "jarz_woocommerce_integration.services.sync_events.process_sync_event",
+            queue=queue,
+            timeout=900,
+            enqueue_after_commit=after_commit,
+            job_id=sync_event_job_id(event_name),
+            deduplicate=True,
+            event_name=event_name,
+        )
+        return True
+    except frappe.ValidationError as exc:
+        if "Too many queued background jobs" not in str(exc):
+            raise
+        try:
+            frappe.local.message_log = [
+                m for m in (getattr(frappe.local, "message_log", None) or [])
+                if "Too many queued background jobs" not in str(m)
+            ]
+        except Exception:  # noqa: BLE001
+            pass
+        LOGGER.warning({"event": "woo_sync_event_enqueue_deferred_queue_full", "event_name": event_name})
+        return False
 
 
 def _breaker_pause_reason(open_until: datetime) -> str:

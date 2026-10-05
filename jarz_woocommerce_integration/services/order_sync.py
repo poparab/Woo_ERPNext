@@ -1205,6 +1205,25 @@ def _set_order_sync_cursor(
         setattr(settings, fieldname, value)
 
 
+def _window_saturated_without_progress(metrics: dict[str, Any], cursor_before: datetime) -> bool:
+    """True when a window read hit its page budget yet saw nothing past the cursor."""
+    pages_fetched = _safe_int(metrics.get("pages_fetched") or 0, 0)
+    total_pages = _safe_int(metrics.get("total_pages") or 0, 0)
+    max_pages = _safe_int(metrics.get("max_pages") or 0, 0)
+    if not pages_fetched or not max_pages or pages_fetched < max_pages or total_pages <= pages_fetched:
+        return False
+    latest_raw = metrics.get("latest_seen_modified_gmt")
+    if not latest_raw:
+        return True
+    try:
+        latest_dt = get_datetime(latest_raw)
+        if latest_dt.tzinfo is None:
+            latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+        return latest_dt.astimezone(timezone.utc) <= cursor_before
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _update_order_sync_cursor_from_metrics(settings: Any, cursor_name: str, metrics: dict[str, Any]) -> None:
     latest_raw = metrics.get("latest_seen_modified_gmt")
     latest_dt = None
@@ -1218,6 +1237,16 @@ def _update_order_sync_cursor_from_metrics(settings: Any, cursor_name: str, metr
         except Exception:  # noqa: BLE001
             latest_dt = None
     latest_order_id = _safe_int(metrics.get("latest_seen_order_id") or 0, 0)
+    # Never move backwards. A run that only re-read the overlap reports a
+    # latest-seen time BEFORE the cursor; writing it back widened the next
+    # window and could walk the cursor into a block it can never leave.
+    current_dt, current_order_id = _get_order_sync_cursor(settings, cursor_name)
+    if latest_dt is None:
+        latest_order_id = current_order_id
+    elif current_dt is not None and (
+        latest_dt < current_dt or (latest_dt == current_dt and latest_order_id < current_order_id)
+    ):
+        latest_dt, latest_order_id = current_dt, current_order_id
     _set_order_sync_cursor(settings, cursor_name, latest_dt, latest_order_id)
 
 
@@ -4859,6 +4888,81 @@ def _release_order_locks(lock, db_lock_key: str, db_lock_acquired: bool) -> None
             pass
 
 
+def _order_unchanged_since_last_sync(
+    order: dict,
+    existing_map: dict | None,
+    *,
+    link_field: str,
+    order_hash: str,
+    contact_snapshot: dict,
+    territory_snapshot: dict,
+) -> bool:
+    """True when the last sync already wrote exactly this order.
+
+    Hash match + valid invoice link AND the linked Sales Invoice already in the
+    target state. If the target state is cancellation (docstatus=2) but the
+    linked SI is still active, this is False so the caller goes on to cancel it.
+    """
+    if not (existing_map and existing_map.get("hash") == order_hash and existing_map.get(link_field)):
+        return False
+    linked_docstatus = frappe.db.get_value("Sales Invoice", existing_map[link_field], "docstatus")
+    if linked_docstatus is None or int(linked_docstatus) == 2:
+        return False
+    target_docstatus = _map_status(order.get("status")).get("docstatus", 0)
+    contact_hash_matches = (
+        str(existing_map.get("woo_contact_hash") or "")
+        == str(contact_snapshot.get("woo_contact_hash") or "")
+    )
+    territory_hash_matches = (
+        str(existing_map.get("woo_territory_hash") or "")
+        == str(territory_snapshot.get("woo_territory_hash") or "")
+    )
+    return (
+        int(linked_docstatus) == int(target_docstatus)
+        and target_docstatus != 2
+        and contact_hash_matches
+        and territory_hash_matches
+    )
+
+
+def _polled_order_is_unchanged(order: dict, *, territory_state_cache: dict | None = None) -> bool:
+    """Cheap pre-check for the order poll: would processing this order be a no-op?
+
+    Runs the same test ``process_order_phase1`` applies first, against the
+    payload the list call already returned, so an order nobody changed costs a
+    couple of indexed reads instead of a ledger event, an RQ job, a second Woo
+    GET and a worker fork. On 2026-10-04 something on the store touched all
+    ~11,700 orders in eight minutes; each touch minted a new event, and working
+    through them exhausted the server's CPU credits for half a day.
+
+    Any doubt returns False, which is the old behaviour (create the event).
+    """
+    try:
+        woo_id = order.get("id")
+        if not woo_id:
+            return False
+        link_field = "erpnext_sales_invoice"
+        cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
+        if link_field not in cols and "sales_invoice" in cols:
+            link_field = "sales_invoice"
+        fields = ["name", link_field, "hash"] + [
+            f for f in ("woo_contact_hash", "woo_territory_hash") if f in cols
+        ]
+        existing_map = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_id}, fields, as_dict=True)
+        if not existing_map:
+            return False
+        return _order_unchanged_since_last_sync(
+            order,
+            existing_map,
+            link_field=link_field,
+            order_hash=_compute_order_hash(order),
+            contact_snapshot=_extract_order_contact_snapshot(order),
+            territory_snapshot=_extract_order_territory_snapshot(order, territory_state_cache=territory_state_cache),
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _unlock_order(result: dict, lock, db_lock_key: str, db_lock_acquired: bool) -> dict:
     """Release the per-order locks, then hand back *result*.
 
@@ -5023,30 +5127,15 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
             except Exception:
                 existing_map[snapshot_field] = None
 
-    # Skip if order hasn't changed since last sync (hash match + valid invoice link
-    # AND the linked Sales Invoice is already in the target state).
-    # Exception: if the target state requires cancellation (docstatus=2) but the linked
-    # SI is still active (docstatus 0 or 1), fall through so it gets cancelled.
-    if existing_map and existing_map.get("hash") == order_hash and existing_map.get(LINK_FIELD):
-        linked_docstatus = frappe.db.get_value("Sales Invoice", existing_map[LINK_FIELD], "docstatus")
-        if linked_docstatus is not None and int(linked_docstatus) != 2:
-            target_docstatus = _map_status(order.get("status")).get("docstatus", 0)
-            contact_hash_matches = (
-                str((existing_map or {}).get("woo_contact_hash") or "")
-                == str(contact_snapshot.get("woo_contact_hash") or "")
-            )
-            territory_hash_matches = (
-                str((existing_map or {}).get("woo_territory_hash") or "")
-                == str(territory_snapshot.get("woo_territory_hash") or "")
-            )
-            if (
-                int(linked_docstatus) == int(target_docstatus)
-                and target_docstatus != 2
-                and contact_hash_matches
-                and territory_hash_matches
-            ):
-                return _unlock_order({"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
-            # target is cancellation but SI is active — fall through to cancel it
+    if _order_unchanged_since_last_sync(
+        order,
+        existing_map,
+        link_field=LINK_FIELD,
+        order_hash=order_hash,
+        contact_snapshot=contact_snapshot,
+        territory_snapshot=territory_snapshot,
+    ):
+        return _unlock_order({"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
 
     # Hard idempotency: if a live Sales Invoice already exists with this woo_order_id, use it.
     # Only consider submitted (docstatus=1) or draft (docstatus=0) invoices — never cancelled.
@@ -6548,8 +6637,12 @@ def _enqueue_order_window_events(
         "order": order,
         "max_pages": max_pages,
     }
+    metrics["unchanged"] = 0
+    metrics["already_handled"] = 0
+    metrics["deferred_to_sweeper"] = 0
     latest_seen_modified: datetime | None = None
     latest_seen_order_id = 0
+    territory_state_cache: dict = {}
 
     for order_payload in orders:
         modified_at, order_id = _extract_order_cursor(order_payload)
@@ -6561,13 +6654,24 @@ def _enqueue_order_window_events(
                 latest_seen_order_id = order_id
 
         try:
+            # A touched-but-identical order needs no event at all.
+            if _polled_order_is_unchanged(order_payload, territory_state_cache=territory_state_cache):
+                metrics["unchanged"] += 1
+                continue
             event = sync_events.create_inbound_order_reference_event(
                 order_id=order_payload.get("id"),
                 event_type=event_type,
                 status=order_payload.get("status"),
                 modified_gmt=order_payload.get("date_modified_gmt") or order_payload.get("date_modified"),
             )
-            sync_events.enqueue_sync_event(event.name, after_commit=False)
+            # The overlap window re-reads orders every run; their event already
+            # exists and, once finished, re-queuing it is pure worker overhead.
+            if getattr(event, "status", None) in sync_events.TERMINAL_STATUSES:
+                metrics["already_handled"] += 1
+                continue
+            if not sync_events.enqueue_sync_event(event.name, after_commit=False):
+                metrics["deferred_to_sweeper"] += 1
+                continue
             metrics["queued"] += 1
             if len(metrics["results_sample"]) < 10:
                 metrics["results_sample"].append(
@@ -6933,32 +7037,58 @@ def _run_order_cursor_sync(
     )
 
     try:
-        if sync_events.should_use_order_polling_events(settings):
-            result = _enqueue_order_window_events(
-                settings=settings,
-                event_type="order_poll",
-                limit=100,
-                status=status,
-                modified_after=_format_datetime_for_woo(modified_after_dt),
-                orderby="modified",
-                order="asc",
-                max_pages=max_pages,
-                status_filter_set=status_filter_set,
-            )
-        else:
-            result = pull_recent_orders_phase1(
+        use_events = sync_events.should_use_order_polling_events(settings)
+
+        def read_window(window_start: datetime) -> dict[str, Any]:
+            if use_events:
+                return _enqueue_order_window_events(
+                    settings=settings,
+                    event_type="order_poll",
+                    limit=100,
+                    status=status,
+                    modified_after=_format_datetime_for_woo(window_start),
+                    orderby="modified",
+                    order="asc",
+                    max_pages=max_pages,
+                    status_filter_set=status_filter_set,
+                )
+            return pull_recent_orders_phase1(
                 limit=100,
                 dry_run=False,
                 force=False,
                 allow_update=True,
                 is_historical=False,
                 status=status,
-                modified_after=_format_datetime_for_woo(modified_after_dt),
+                modified_after=_format_datetime_for_woo(window_start),
                 orderby="modified",
                 order="asc",
                 max_pages=max_pages,
                 status_filter_set=status_filter_set,
             )
+
+        result = read_window(modified_after_dt)
+        if cursor_before_dt is not None and _window_saturated_without_progress(result, cursor_before_dt):
+            # The overlap alone holds more orders than one run may read, so
+            # re-reading it can never move the cursor: on 2026-10-04 a store-wide
+            # touch put ~11,700 orders inside 15 minutes and the poll re-read the
+            # same 600 every 2 minutes for 16 hours, blind to every newer order.
+            # Read strictly after the cursor instead (Woo's modified_after is
+            # exclusive), which always makes progress.
+            frappe.logger().warning({
+                "event": "woo_order_cursor_overlap_saturated",
+                "cursor_name": cursor_name,
+                "cursor_before": _format_datetime_for_woo(cursor_before_dt),
+                "overlap_minutes": overlap_minutes,
+                "max_pages": max_pages,
+                "total_pages": result.get("total_pages"),
+            })
+            overlap_result = result
+            result = read_window(cursor_before_dt)
+            result["overlap_saturated"] = True
+            result["overlap_pass"] = {
+                key: overlap_result.get(key)
+                for key in ("orders_fetched", "queued", "unchanged", "already_handled", "errors", "total_pages")
+            }
         result.update(
             {
                 "cursor_name": cursor_name,
