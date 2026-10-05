@@ -67,6 +67,7 @@ DEFAULT_MODULES = (
     "test_customer_merge_aliases",
     # Outbound customer events keep the scope of the events they supersede.
     "test_sync_event_scope_merge",
+    "test_staging_rekey_cloned_ids",
 )
 
 _PACKAGE = "jarz_woocommerce_integration.tests"
