@@ -556,9 +556,21 @@ def _supersede_pending_events(
     exclude_event_name: str,
     local_doctype: str | None = None,
     local_docname: str | None = None,
+    only_names: list[str] | None = None,
 ) -> None:
+    """Flip older open events for the same object to ``Superseded``.
+
+    ``only_names`` (customer path) restricts the update to the events whose scope
+    the caller already folded into the newer event. Without it, an event inserted
+    by another request between that read and this update would be superseded
+    without its scope having been merged — the very lost update the merge exists
+    to prevent. ``None`` keeps the original, unrestricted behaviour (invoices).
+    """
+    if only_names is not None:
+        only_names = [name for name in only_names if name and name != exclude_event_name]
+        if not only_names:
+            return
     now = now_datetime()
-    filters = [direction, object_type, str(source_id), exclude_event_name, now, now]
     sql = [
         "UPDATE `tabWooCommerce Sync Event`",
         "SET status = 'Superseded', completed_on = %s, locked_until = NULL, last_error = 'Superseded by newer event'",
@@ -576,7 +588,155 @@ def _supersede_pending_events(
     if local_docname:
         sql.append("  AND local_docname = %s")
         params.append(local_docname)
+    if only_names is not None:
+        sql.append(f"  AND name IN ({', '.join(['%s'] * len(only_names))})")
+        params.extend(only_names)
     frappe.db.sql("\n".join(sql), tuple(params))
+
+
+def _read_event_payload(payload_json: Any) -> dict[str, Any] | None:
+    """Parse a stored payload_json (str, bytes or dict). None when unreadable."""
+    payload = payload_json
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            payload = payload.decode("utf-8")
+        except Exception:
+            return None
+    if isinstance(payload, str):
+        if not payload.strip():
+            return {}
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return None
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _customer_scope_from_payload(payload_json: Any) -> str | None:
+    """The scope a customer_push event would push; None means a full push.
+
+    Anything unreadable — malformed JSON, a non-object payload, a non-string
+    scope — is treated as a FULL push (None). That is not a guess, it is what the
+    event would have done if the worker had processed it: ``process_sync_event``
+    parses the payload with ``_from_json``, which turns malformed text into
+    ``{"raw": ...}`` (no "scope" key), so ``_dispatch_outbound_event`` passes
+    ``scope=None`` and ``sync_customer`` pushes the whole customer. Merging None
+    therefore preserves exactly that effect. Choosing anything narrower would
+    silently drop fields the superseded event would have pushed; the cost of the
+    broad choice is at most one larger, idempotent PUT.
+    """
+    payload = _read_event_payload(payload_json)
+    if payload is None:
+        return None
+    scope = payload.get("scope")
+    if scope is None or not isinstance(scope, str):
+        return None
+    return scope
+
+
+def _customer_force_from_payload(payload_json: Any) -> bool:
+    # Unreadable -> False: unlike scope, force bypasses the outbound kill switch
+    # (enable_outbound_customers), so it is never assumed.
+    payload = _read_event_payload(payload_json)
+    return bool(payload.get("force")) if payload else False
+
+
+def _merge_customer_sync_scopes(*scopes: str | None) -> str | None:
+    """Union of customer push scopes, in the serializer's format ("core,shipping").
+
+    A None / "full" anywhere makes the result None (full push). Uses the parser
+    and serializer the consumer (``outbound_sync._build_customer_payload``) uses,
+    so what is stored here is exactly what the worker will understand. Imported
+    lazily: outbound_sync imports this module lazily too, and a module-level
+    import either way round would be circular.
+    """
+    from jarz_woocommerce_integration.services.outbound_sync import (
+        _normalize_customer_sync_scopes,
+        _serialize_customer_sync_scope,
+    )
+
+    union: set[str] = set()
+    for scope in scopes:
+        parts = _normalize_customer_sync_scopes(scope)
+        if "full" in parts:
+            return None
+        union |= parts
+    return _serialize_customer_sync_scope(union)
+
+
+def _customer_scope_covers(have: str | None, want: str | None) -> bool:
+    """True when pushing ``have`` also pushes everything ``want`` would."""
+    return _merge_customer_sync_scopes(have, want) == _merge_customer_sync_scopes(have)
+
+
+def _is_event_locked(locked_until: Any, now: datetime) -> bool:
+    # Mirrors `(locked_until IS NULL OR locked_until < now)` in
+    # _supersede_pending_events: locked means locked_until >= now.
+    locked = _coerce_datetime(locked_until)
+    return locked is not None and locked >= now
+
+
+def _collect_supersedable_customer_events(customer_name: str) -> list[dict[str, Any]]:
+    """The open customer_push events a new event for ``customer_name`` will supersede.
+
+    Same WHERE clause as ``_supersede_pending_events`` (direction, object_type,
+    source_id, local_doctype, local_docname, status, lock). Status and lock are
+    re-checked in Python as well, so a row that changed shape still cannot be
+    merged unless it is genuinely supersedable.
+    """
+    now = now_datetime()
+    rows = frappe.db.sql(
+        "\n".join([
+            "SELECT name, status, locked_until, payload_json",
+            "FROM `tabWooCommerce Sync Event`",
+            "WHERE direction = %s",
+            "  AND object_type = %s",
+            "  AND source_id = %s",
+            "  AND local_doctype = %s",
+            "  AND local_docname = %s",
+            "  AND status IN ('Pending', 'RetryScheduled')",
+            "  AND (locked_until IS NULL OR locked_until < %s)",
+            "ORDER BY creation ASC",
+        ]),
+        ("Outbound", "Customer", str(customer_name), "Customer", customer_name, now),
+        as_dict=True,
+    ) or []
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        name = row.get("name")
+        if not name:
+            continue
+        if row.get("status") not in PROCESSING_STATUSES:
+            continue
+        if _is_event_locked(row.get("locked_until"), now):
+            continue
+        payload_json = row.get("payload_json")
+        candidates.append({
+            "name": name,
+            "scope": _customer_scope_from_payload(payload_json),
+            "force": _customer_force_from_payload(payload_json),
+        })
+    return candidates
+
+
+def _event_will_push_customer_scope(event: Any, scope: str | None) -> bool:
+    """Whether ``event`` is still open and its stored scope covers ``scope``.
+
+    A fresh insert always passes. The check matters on the duplicate-idempotency
+    path, where ``create_sync_event`` hands back an EXISTING row: if that row is
+    already finished (Succeeded/Superseded/...), mid-flight (Processing) or
+    locked, it will not push the merged scope, so the events we merged from must
+    not be superseded — otherwise their scopes are dropped on the floor.
+    """
+    if str(getattr(event, "status", "") or "") not in PROCESSING_STATUSES:
+        return False
+    if _is_event_locked(getattr(event, "locked_until", None), now_datetime()):
+        return False
+    return _customer_scope_covers(_customer_scope_from_payload(getattr(event, "payload_json", None)), scope)
 
 
 def create_outbound_customer_event(
@@ -586,14 +746,26 @@ def create_outbound_customer_event(
     scope: str | None = None,
     force: bool = False,
 ) -> Any:
+    # The new event supersedes every open customer_push for this customer, so it
+    # must carry the UNION of their scopes. Superseding blindly lost updates: the
+    # POS saving a primary shipping address enqueues scope="shipping" (Address
+    # insert) and then scope="core" (Customer save); "core" superseded "shipping"
+    # and Woo kept the old shipping address (staging WOOEVT-501108/501110).
+    # The merge happens before the idempotency key is built, so the key names
+    # what will actually be pushed.
+    pending = _collect_supersedable_customer_events(customer_name)
+    merged_scope = _merge_customer_sync_scopes(scope, *(row["scope"] for row in pending))
+    merged_force = bool(force) or any(row["force"] for row in pending)
     payload = {
         "customer_name": customer_name,
         "reason": reason,
-        "scope": scope,
-        "force": bool(force),
+        "scope": merged_scope,
+        "force": merged_force,
     }
+    if pending:
+        payload["merged_from"] = [row["name"] for row in pending]
     modified = _get_doc_modified("Customer", customer_name)
-    discriminator = ":".join(part for part in [scope or "full", modified] if part)
+    discriminator = ":".join(part for part in [merged_scope or "full", modified] if part)
     event = create_sync_event(
         direction="Outbound",
         event_type="customer_push",
@@ -608,15 +780,32 @@ def create_outbound_customer_event(
         payload_json=payload,
         priority=OUTBOUND_PRIORITY,
     )
-    if getattr(event, "name", None):
-        _supersede_pending_events(
-            direction="Outbound",
-            object_type="Customer",
-            source_id=customer_name,
-            exclude_event_name=event.name,
-            local_doctype="Customer",
-            local_docname=customer_name,
-        )
+    event_name = getattr(event, "name", None)
+    if not event_name or not pending:
+        return event
+    if not _event_will_push_customer_scope(event, merged_scope):
+        # Duplicate idempotency key resolved to an existing row that will not
+        # push the merged scope (finished, mid-flight or narrower). Leave the
+        # pending events alone so each still pushes its own scope; superseding
+        # them here would reintroduce the lost update.
+        LOGGER.warning({
+            "event": "woo_outbound_customer_supersede_skipped",
+            "customer": customer_name,
+            "returned_event": event_name,
+            "returned_status": getattr(event, "status", None),
+            "merged_scope": merged_scope,
+            "pending": [row["name"] for row in pending],
+        })
+        return event
+    _supersede_pending_events(
+        direction="Outbound",
+        object_type="Customer",
+        source_id=customer_name,
+        exclude_event_name=event_name,
+        local_doctype="Customer",
+        local_docname=customer_name,
+        only_names=[row["name"] for row in pending],
+    )
     return event
 
 
