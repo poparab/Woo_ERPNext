@@ -337,6 +337,10 @@ REQUIRED_FIELDS = [
         "fieldtype": "Data",
         "label": "Woo Customer ID",
         "insert_after": "customer_group",
+        # Step zero of every inbound customer/order resolution. Unindexed it
+        # was a full scan of tabCustomer (~23 ms each on a throttled box,
+        # several per sync event, ~3,000 events a day).
+        "search_index": 1,
     },
     {
         "dt": "Customer",

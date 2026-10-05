@@ -150,9 +150,13 @@ def _alias_holders(normalized: str, limit: int = 2) -> list[str]:
     if not normalized or not customer_woo_id_alias_column_exists():
         return []
     try:
+        # `> ''` comes first and is what makes this cheap: it is a range on the
+        # prefix index (patches/add_customer_woo_id_indexes), so only Customers
+        # that hold any alias are read. A bare leading-wildcard LIKE can use no
+        # index and scanned all of tabCustomer on every inbound sync event.
         return frappe.db.get_values(
             "Customer",
-            {ALIAS_FIELD: ["like", f"%,{normalized},%"]},
+            [[ALIAS_FIELD, ">", ""], [ALIAS_FIELD, "like", f"%,{normalized},%"]],
             "name",
             order_by="creation asc",
             limit=limit,

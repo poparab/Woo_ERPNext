@@ -34,15 +34,27 @@ class _Rows:
         self.writes = []
 
     def get_values(self, doctype, filters, fieldname, **kwargs):
-        (field, cond), = filters.items()
-        out = []
-        for name, row in self.rows.items():
+        # Dict form {field: value | [op, value]} or list form [[field, op, value], ...].
+        if isinstance(filters, dict):
+            conditions = [
+                (field, *(cond if isinstance(cond, list) else ["=", cond]))
+                for field, cond in filters.items()
+            ]
+        else:
+            conditions = [tuple(c) for c in filters]
+
+        def matches(row, field, op, operand):
             value = str(row.get(field) or "")
-            if isinstance(cond, list) and cond[0] == "like":
-                if cond[1].strip("%") in value:
-                    out.append(name)
-            elif value == cond:
-                out.append(name)
+            if op == "like":
+                return operand.strip("%") in value
+            if op == ">":
+                return value > operand
+            return value == operand
+
+        out = [
+            name for name, row in self.rows.items()
+            if all(matches(row, *c) for c in conditions)
+        ]
         return out[: kwargs.get("limit") or None]
 
     def get_value(self, doctype, name, field, *args, **kwargs):
@@ -349,6 +361,38 @@ class TestDedupeAndCleanupRespectAliases(unittest.TestCase):
         self.assertEqual(out, {"bucket": "alias_woo_id", "customer": "Orbt speciality Coffee - 1"})
         own = customer_cleanup._resolve_woo_customer({"id": 7000, "billing": {}}, indexes)
         self.assertEqual(own["bucket"], "exact_woo_id")
+
+
+class TestAliasLookupCanUseItsIndex(unittest.TestCase):
+    """A bare leading-wildcard LIKE can use no index: it scanned all of
+    tabCustomer on every inbound sync event (2026-10-05, ~22 ms each while the
+    server was CPU-throttled). The range on the prefix index must lead."""
+
+    def test_alias_lookup_leads_with_the_indexed_range(self):
+        captured = {}
+
+        def fake_get_values(doctype, filters, fieldname, **kwargs):
+            captured["filters"] = filters
+            return []
+
+        with patch.object(cwi, "customer_woo_id_alias_column_exists", return_value=True), \
+                patch.object(cwi.frappe.db, "get_values", side_effect=fake_get_values):
+            cwi._alias_holders("6540")
+
+        self.assertEqual(
+            captured["filters"],
+            [[cwi.ALIAS_FIELD, ">", ""], [cwi.ALIAS_FIELD, "like", "%,6540,%"]],
+        )
+
+    def test_woo_customer_id_is_declared_indexed(self):
+        from jarz_woocommerce_integration.utils import custom_fields
+
+        (field,) = [
+            f for f in custom_fields.REQUIRED_FIELDS
+            if f.get("dt") == "Customer" and f.get("fieldname") == "woo_customer_id"
+        ]
+        # Without search_index Frappe DROPS a hand-made index on the next migrate.
+        self.assertEqual(field.get("search_index"), 1)
 
 
 if __name__ == "__main__":
