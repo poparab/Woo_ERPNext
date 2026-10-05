@@ -68,8 +68,15 @@ STAGING_HOST_MARKERS = ("erpstg",)
 NON_PRODUCTION_STORE_MARKERS = ("demo.", "staging", "stg.", "-stg", "test.", "localhost", "127.0.0.1")
 
 
+def _host_name() -> str:
+	# A seam for tests: patching ``frappe.local.conf`` directly is unsafe, because
+	# mock restores an attribute of a werkzeug Local by deleting it, which unbinds
+	# ``frappe.conf`` for every later test in the run.
+	return str(frappe.local.conf.get("host_name") or "")
+
+
 def _guard() -> None:
-	host = str(frappe.local.conf.get("host_name") or "").lower()
+	host = _host_name().lower()
 	if any(marker in host for marker in PRODUCTION_HOST_MARKERS):
 		raise RuntimeError(f"REFUSED: {host!r} is production.")
 	if not any(marker in host for marker in STAGING_HOST_MARKERS):

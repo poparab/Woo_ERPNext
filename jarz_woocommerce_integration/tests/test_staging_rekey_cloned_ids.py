@@ -79,7 +79,7 @@ NEW = datetime(2026, 9, 1)
 class TestGuard(unittest.TestCase):
 	def _run_guard(self, host, base_url="https://demo.orderjarz.com"):
 		fake = _FakeDB(base_url=base_url)
-		with unittest.mock.patch.object(frappe.local, "conf", {"host_name": host}, create=True), \
+		with unittest.mock.patch.object(rekey, "_host_name", return_value=host), \
 			unittest.mock.patch.object(frappe, "db", fake):
 			rekey._guard()
 
@@ -169,7 +169,7 @@ class TestPlanAndApply(unittest.TestCase):
 		self.assertEqual(plan["kept"], [])
 
 	def _run(self, fake, **kwargs):
-		with unittest.mock.patch.object(frappe.local, "conf", {"host_name": "https://erpstg.orderjarz.com"}, create=True), \
+		with unittest.mock.patch.object(rekey, "_host_name", return_value="https://erpstg.orderjarz.com"), \
 			unittest.mock.patch.object(frappe, "db", fake), \
 			unittest.mock.patch.object(frappe, "clear_cache") as clear_cache:
 			report = rekey.run(**kwargs)
