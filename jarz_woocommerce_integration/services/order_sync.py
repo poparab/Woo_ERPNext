@@ -1724,7 +1724,38 @@ SKIPPED_SUCCESS_REASONS = {
     # same invoice (order_map_status). Ignoring it is the point; counting it as
     # a failure would have reconcile and the outbox retry it forever.
     RETIRED_DUPLICATE_REASON,
+    # The POS created this order for a live invoice; outbound adopts it (see
+    # `_order_owner_invoice`). Counting it as a failure would retry an import
+    # that must never happen.
+    "owned_by_pos_invoice",
 }
+
+#: Skip reason: the order's ``erpnext_sales_invoice`` meta names a live invoice
+#: that does not record the order yet (a create whose reply was lost).
+OWNED_BY_POS_INVOICE_REASON = "owned_by_pos_invoice"
+
+
+def _order_owner_invoice(order: dict) -> str | None:
+    """The live Sales Invoice whose outbound push created this Woo order, if any.
+
+    Every order outbound creates carries ``erpnext_sales_invoice`` in its meta.
+    Returns that invoice only while it is live (draft or submitted); a cancelled
+    owner gives None and leaves the order to the ordinary inbound rules.
+    """
+    for entry in order.get("meta_data") or []:
+        if not isinstance(entry, dict) or str(entry.get("key") or "") != "erpnext_sales_invoice":
+            continue
+        name = str(entry.get("value") or "").strip()
+        if not name:
+            return None
+        try:
+            docstatus = frappe.db.get_value("Sales Invoice", name, "docstatus")
+        except Exception:  # noqa: BLE001
+            return None
+        if docstatus is not None and int(docstatus) in (0, 1):
+            return name
+        return None
+    return None
 
 
 def _compute_order_hash(order: dict) -> str:
@@ -5258,6 +5289,37 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                     existing_map["status"] = order.get("status")
                     existing_map["woo_contact_hash"] = contact_snapshot.get("woo_contact_hash")
                     existing_map["woo_territory_hash"] = territory_snapshot.get("woo_territory_hash")
+
+    # An order the POS created for a live invoice that does not (yet) record it
+    # must never be imported as a second invoice. That is exactly the state a
+    # create left in when its reply was lost: outbound returns "in doubt" and
+    # its retry adopts the order by this same meta (outbound_sync
+    # `_find_store_order_for_invoice`). Importing it first would book the sale
+    # twice and leave the two invoices fighting over one Order Map row.
+    if not linked_invoice_name and not (existing_map and existing_map.get(LINK_FIELD)):
+        owner_invoice = _order_owner_invoice(order)
+        if owner_invoice:
+            create_sync_log_entry(
+                "InboundSkip",
+                "Skipped",
+                (
+                    f"{OWNED_BY_POS_INVOICE_REASON}: Woo order {woo_id} was created by the POS for "
+                    f"{owner_invoice}, which does not record it yet; outbound adopts it, inbound "
+                    f"does not import it as a new invoice."
+                ),
+                woo_order_id=woo_id,
+            )
+            return _unlock_order(
+                {
+                    "status": "skipped",
+                    "reason": OWNED_BY_POS_INVOICE_REASON,
+                    "success": True,
+                    "woo_order_id": woo_id,
+                    "owner_invoice": owner_invoice,
+                },
+                lock, db_lock_key, db_lock_acquired,
+            )
+
     if existing_map and not allow_update:
         # If map has a linked invoice, genuinely skip (already processed)
         if existing_map.get(LINK_FIELD):

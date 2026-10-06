@@ -194,6 +194,10 @@ def retire_duplicate_woo_order(woo_order_id: Any, keep_woo_order_id: Any, apply:
             )
         try:
             # Re-read under the lock: the in-flight sync may have changed it.
+            # REPEATABLE READ would serve the snapshot of the reads above, so
+            # end that transaction first (nothing has been written yet; the
+            # named lock belongs to the session and survives the rollback).
+            frappe.db.rollback()
             current = frappe.db.get_value(
                 ORDER_MAP_DOCTYPE, map_row["name"], [link_field, "status"], as_dict=True
             ) or {}

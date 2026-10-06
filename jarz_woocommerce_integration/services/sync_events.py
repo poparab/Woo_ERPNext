@@ -88,6 +88,9 @@ SKIP_REASON_TOKENS = (
     # the reason also contains "duplicate", a RETRY token, so unlisted every
     # webhook for a retired order would be retried until it dead-lettered.
     "retired_duplicate",
+    # A POS-created order whose invoice does not record it yet (a create whose
+    # reply was lost). Inbound skips it on purpose; outbound adopts it.
+    "owned_by_pos_invoice",
 )
 RETRYABLE_ORDER_REASONS = {"locked", "db_locked"}
 #: Retryable outbound details that must not trip the outbound circuit breaker:

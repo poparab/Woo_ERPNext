@@ -42,8 +42,10 @@ class _Callbacks:
 class _FakeDB:
     """Records every call in order, so tests can assert on sequencing."""
 
-    def __init__(self, *, lock_result=1, lock_raises=False, invoice_woo_order_id=_NO_ROW, map_rows=(), retired_ids=()):
+    def __init__(self, *, lock_result=1, lock_raises=False, invoice_woo_order_id=_NO_ROW, map_rows=(), retired_ids=(), other_owners=None):
         self.retired_ids = {int(x) for x in retired_ids}
+        # woo_order_id -> another live invoice that records it
+        self.other_owners = dict(other_owners or {})
         self.lock_result = lock_result
         self.lock_raises = lock_raises
         self.invoice_woo_order_id = invoice_woo_order_id
@@ -61,6 +63,9 @@ class _FakeDB:
             return ((self.lock_result,),)
         if "RELEASE_LOCK" in flat:
             return ((1,),)
+        if "FROM `tabSales Invoice` WHERE woo_order_id = %s AND name != %s" in flat:
+            owner = self.other_owners.get(int(params[0]))
+            return ((owner,),) if owner else ()
         if "FROM `tabSales Invoice`" in flat:
             if self.invoice_woo_order_id is _NO_ROW:
                 return ()
@@ -158,9 +163,16 @@ def _cfg():
     )
 
 
-def _run_push(db, invoice, client, *, own_transaction, payload=None):
+def _run_push(db, invoice, client, *, own_transaction, payload=None, in_doubt_hold=False):
     customer = SimpleNamespace(name=invoice.customer)
     built_payload = dict(payload or {"status": "processing"})
+    # Every payload build, so tests can see create-vs-update and its base order.
+    db.build_calls = []
+    db.noted_in_doubt = unittest.mock.MagicMock()
+
+    def fake_build(*args, **kwargs):
+        db.build_calls.append(kwargs)
+        return dict(built_payload)
     mark_status = unittest.mock.MagicMock()
 
     def fake_get_doc(doctype, name=None):
@@ -169,9 +181,10 @@ def _run_push(db, invoice, client, *, own_transaction, payload=None):
     patches = [
         unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _cfg())),
         unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client),
-        unittest.mock.patch.object(
-            outbound_sync, "_build_order_payload", side_effect=lambda *a, **k: dict(built_payload)
-        ),
+        unittest.mock.patch.object(outbound_sync, "_build_order_payload", side_effect=fake_build),
+        # The in-doubt hold lives in the Redis cache; keep tests independent of it.
+        unittest.mock.patch.object(outbound_sync, "_create_recently_in_doubt", return_value=in_doubt_hold),
+        unittest.mock.patch.object(outbound_sync, "_note_create_in_doubt", db.noted_in_doubt),
         unittest.mock.patch.object(outbound_sync, "_payload_total_mismatch", return_value=None),
         # Always a real change, so the write path (PUT or POST) is what is tested.
         unittest.mock.patch.object(outbound_sync, "_order_payload_requires_update", return_value=True),
@@ -508,7 +521,20 @@ class TestCreateIsSentOnce(unittest.TestCase):
 
         _run_push(db, _Invoice(), client, own_transaction=True, payload=payload)
 
-        self.assertEqual(client.lookups, [{"search": "01205476482", "per_page": 20, "orderby": "id", "order": "desc"}])
+        self.assertEqual(
+            client.lookups,
+            [{"search": "01205476482", "per_page": 50, "orderby": "id", "order": "desc", "_fields": "id,status,meta_data"}],
+        )
+
+    def test_customer_orders_are_searched_once_without_the_phone(self):
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _Client(created_id=18102)
+
+        _run_push(db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertEqual(len(client.lookups), 1)
+        self.assertEqual(client.lookups[0]["customer"], 7705)
+        self.assertNotIn("search", client.lookups[0])
 
     def test_store_that_cannot_be_asked_gets_no_create(self):
         db = _FakeDB(invoice_woo_order_id=None)
@@ -605,3 +631,160 @@ class TestInlineCallersOwnTheirTransaction(unittest.TestCase):
                      unittest.mock.patch.object(outbound_sync.frappe, "enqueue") as enqueue:
                     outbound_sync._enqueue_invoice_return_sync(credit_note, method="on_submit", force=force)
                 self.assertEqual(enqueue.call_args.kwargs["own_transaction"], expected)
+
+
+class _Store404Client(_Client):
+    """The order the invoice records was deleted from the store."""
+
+    def __init__(self, gone_id, **kwargs):
+        super().__init__(**kwargs)
+        self.gone_id = gone_id
+
+    def put(self, path, payload):
+        if path == f"orders/{self.gone_id}":
+            self.puts.append(path)
+            raise outbound_sync.WooAPIError(404, path, "Invalid ID.")
+        return super().put(path, payload)
+
+
+class _NoIdReplyClient(_Client):
+    def post(self, path, payload, **kwargs):
+        self.posts.append(path)
+        self.post_kwargs.append(kwargs)
+        return {}
+
+
+class _BlankLookupClient(_Client):
+    def get(self, path, params=None):
+        if path == "orders":
+            self.lookups.append(dict(params or {}))
+            return {}  # a blank 200 parses to {}
+        return super().get(path, params)
+
+
+class TestCreateRecoveryEdges(unittest.TestCase):
+    """Follow-ups from the review of 83d3488."""
+
+    def test_order_already_recorded_by_another_invoice_goes_to_review(self):
+        db = _FakeDB(invoice_woo_order_id=None, other_owners={17863: "ACC-SINV-2026-18740"})
+        client = _Client(store_orders=[_store_order(17863)])
+
+        result, _ = _run_push(db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertEqual(result["detail"], outbound_sync.ORDER_OWNED_ELSEWHERE_DETAIL)
+        self.assertEqual(result["conflict"], {17863: "ACC-SINV-2026-18740"})
+        self.assertEqual((client.puts, client.posts), ([], []))
+        self.assertEqual(sync_events._classify_text_reason(result["detail"]), "review")
+
+    def test_blank_lookup_reply_is_not_read_as_no_order(self):
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _BlankLookupClient()
+
+        result, _ = _run_push(db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertEqual(result["detail"], outbound_sync.ORDER_LOOKUP_FAILED_DETAIL)
+        self.assertEqual(client.posts, [])
+
+    def test_create_reply_without_an_id_is_in_doubt_not_synced(self):
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _NoIdReplyClient()
+
+        result, mark_status = _run_push(db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertEqual(result["detail"], outbound_sync.ORDER_CREATE_IN_DOUBT_DETAIL)
+        self.assertEqual(db.invoice_updates(), [])
+        self.assertNotIn("Synced", [c.kwargs.get("status") for c in mark_status.call_args_list])
+
+    def test_create_in_doubt_starts_a_hold_and_the_hold_blocks_a_new_create(self):
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _FailingCreateClient(outbound_sync.requests.Timeout("read timed out"))
+        _run_push(db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+        db.noted_in_doubt.assert_called_once_with(INVOICE)
+
+        # A push inside the hold (e.g. the manual button) finds nothing yet and
+        # must not create: the lost request may still be saving on the store.
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _Client(created_id=18200)
+        result, _ = _run_push(
+            db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD, in_doubt_hold=True
+        )
+        self.assertEqual(result["detail"], outbound_sync.ORDER_CREATE_IN_DOUBT_DETAIL)
+        self.assertEqual(client.posts, [])
+
+    def test_hold_never_blocks_adopting_an_order_that_exists(self):
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _Client(store_orders=[_store_order(17863)])
+        result, _ = _run_push(
+            db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD, in_doubt_hold=True
+        )
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 17863})
+
+    def test_adoption_builds_the_update_from_the_full_order(self):
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _Client(store_orders=[_store_order(17863)])
+
+        _run_push(db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertIn("orders/17863", client.gets, "the lookup reads id/status/meta only")
+        last_build = db.build_calls[-1]
+        self.assertFalse(last_build["is_create"])
+        self.assertEqual(last_build["existing_order"]["id"], 17863)
+
+    def test_an_open_order_beats_one_staff_cancelled(self):
+        db = _FakeDB(invoice_woo_order_id=None)
+        client = _Client(store_orders=[_store_order(17864), _store_order(17863, status="cancelled")])
+
+        result, _ = _run_push(db, _Invoice(), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertEqual(result["woo_order_id"], 17864)
+
+    def test_deleted_order_is_recreated_with_a_create_payload(self):
+        db = _FakeDB(invoice_woo_order_id=17863)
+        client = _Store404Client(17863, created_id=18300)
+
+        result, _ = _run_push(db, _Invoice(woo_order_id=17863), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 18300})
+        self.assertEqual(client.posts, ["orders"])
+        self.assertEqual(client.post_kwargs, [{"max_attempts": 1}])
+        last_build = db.build_calls[-1]
+        self.assertTrue(last_build["is_create"])
+        self.assertIsNone(last_build["existing_order"])
+
+    def test_deleted_order_hands_over_to_another_order_the_invoice_owns(self):
+        db = _FakeDB(invoice_woo_order_id=17863)
+        client = _Store404Client(17863, store_orders=[_store_order(17870), _store_order(17863)])
+
+        result, _ = _run_push(db, _Invoice(woo_order_id=17863), client, own_transaction=True, payload=_CREATE_PAYLOAD)
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 17870})
+        self.assertEqual(client.posts, [])
+        self.assertEqual(client.puts, ["orders/17863", "orders/17870"])
+        last_build = db.build_calls[-1]
+        self.assertFalse(last_build["is_create"])
+        self.assertEqual(last_build["existing_order"]["id"], 17870)
+        self.assertEqual(db.invoice_updates()[0]["woo_order_id"], 17870)
+
+
+class TestAmendedSourceNeverRevivesARetiredOrder(unittest.TestCase):
+    def test_source_column_naming_a_retired_order_falls_through_to_the_map(self):
+        amendment = SimpleNamespace(amended_from=INVOICE, get=lambda key, default=None: INVOICE)
+
+        def get_value(doctype, filters, fieldname=None, *args, **kwargs):
+            if doctype == "Sales Invoice":
+                return 17865
+            if doctype == "WooCommerce Order Map" and fieldname == "status":
+                return "retired-duplicate" if filters.get("woo_order_id") == 17865 else "completed"
+            return None
+
+        db = SimpleNamespace(get_value=get_value, get_table_columns=lambda doctype: ["erpnext_sales_invoice"])
+        map_rows = [
+            {"woo_order_id": 17865, "status": "retired-duplicate"},
+            {"woo_order_id": 17864, "status": "completed"},
+        ]
+        with unittest.mock.patch.object(outbound_sync.frappe, "db", db), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_all", return_value=map_rows), \
+             unittest.mock.patch.object(outbound_sync, "_resolve_order_map_link_field", return_value="erpnext_sales_invoice"):
+            recovered = outbound_sync._recover_amended_invoice_woo_order_id(amendment)
+
+        self.assertEqual(recovered, 17864)

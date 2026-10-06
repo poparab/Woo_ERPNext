@@ -377,17 +377,17 @@ class TestRetireDuplicateWooOrder(unittest.TestCase):
         # and the lock is released before the store is touched.
         self.assertEqual(
             [entry[0] for entry in log],
-            ["lock", "set_value", "commit", "unlock", "echo", "put", "note"],
+            ["lock", "rollback", "set_value", "commit", "unlock", "echo", "put", "note"],
         )
         self.assertEqual(log[0][1], "woo-order-17863")
-        _, doctype, name, values = log[1]
+        _, doctype, name, values = log[2]
         self.assertEqual((doctype, name), ("WooCommerce Order Map", "WOOMAP-13274"))
         self.assertEqual(values["status"], RETIRED_DUPLICATE_MAP_STATUS)
         self.assertEqual(values["needs_manual_review"], 0)
         self.assertEqual(values["manual_review_reason"], "Duplicate of #17864 created by concurrent outbound push")
-        self.assertEqual(log[5][1:], ("orders/17863", {"status": "cancelled"}))
-        self.assertIn("#17864", log[6][2])
-        self.assertIn("not a real order", log[6][2])
+        self.assertEqual(log[6][1:], ("orders/17863", {"status": "cancelled"}))
+        self.assertIn("#17864", log[7][2])
+        self.assertIn("not a real order", log[7][2])
 
     def test_refuses_while_an_inbound_sync_holds_the_order(self):
         result, log = self._run(apply=True, lock_free=False)
@@ -402,7 +402,8 @@ class TestRetireDuplicateWooOrder(unittest.TestCase):
 
         self.assertEqual(result["status"], "refused")
         self.assertEqual(result["reason"], "order_map_changed")
-        self.assertEqual([entry[0] for entry in log], ["lock", "rollback", "unlock"])
+        # rollback #1 ends the pre-lock snapshot so the re-read is fresh; #2 abandons.
+        self.assertEqual([entry[0] for entry in log], ["lock", "rollback", "rollback", "unlock"])
 
     def test_connection_error_on_the_cancel_is_reported_as_partial(self):
         log = []
@@ -438,6 +439,82 @@ class TestRetireDuplicateWooOrder(unittest.TestCase):
 
         self.assertEqual(result["status"], "refused")
         self.assertEqual(result["reason"], "duplicate_equals_keep")
+
+
+class TestInboundNeverImportsAnOrderThePosOwns(unittest.TestCase):
+    """A create whose reply was lost leaves a store order its invoice does not
+    record yet. Inbound must leave it for outbound to adopt (review of 83d3488)."""
+
+    def _phase1(self, *, owner_docstatus, linked_invoices=()):
+        sql_log = []
+        redis_lock = _DummyLock()
+
+        def get_value(doctype, filters=None, fieldname=None, *args, **kwargs):
+            if doctype == "Sales Invoice":
+                return owner_docstatus
+            return None  # no Order Map row for this order yet
+
+        db = SimpleNamespace(
+            sql=_lock_sql(sql_log),
+            get_table_columns=lambda doctype: ["erpnext_sales_invoice"],
+            get_value=get_value,
+            set_value=unittest.mock.MagicMock(),
+            commit=unittest.mock.MagicMock(),
+        )
+        get_all = unittest.mock.MagicMock(return_value=[{"name": n, "creation": None} for n in linked_invoices])
+        get_doc = unittest.mock.MagicMock()
+        ensure_customer = unittest.mock.MagicMock(side_effect=AssertionError("would import"))
+        sync_log = unittest.mock.MagicMock()
+        order = {
+            "id": 17900,
+            "status": "processing",
+            "line_items": [],
+            "meta_data": [{"key": "erpnext_sales_invoice", "value": "ACC-SINV-2026-18800"}],
+        }
+
+        with unittest.mock.patch.object(order_sync, "get_redis_conn", return_value=SimpleNamespace(lock=lambda *a, **k: redis_lock)), \
+             unittest.mock.patch.object(order_sync.frappe, "db", db), \
+             unittest.mock.patch.object(order_sync.frappe, "get_all", get_all), \
+             unittest.mock.patch.object(order_sync.frappe, "get_doc", get_doc), \
+             unittest.mock.patch.object(order_sync, "_extract_order_contact_snapshot", return_value={}), \
+             unittest.mock.patch.object(order_sync, "_extract_order_territory_snapshot", return_value={}), \
+             unittest.mock.patch.object(order_sync, "ensure_customer_with_addresses", ensure_customer), \
+             unittest.mock.patch.object(order_sync, "create_sync_log_entry", sync_log):
+            try:
+                result = order_sync.process_order_phase1(order, SimpleNamespace())
+            except AssertionError as exc:
+                result = {"imported": str(exc)}
+        return result, redis_lock, sql_log, ensure_customer, db
+
+    def test_order_created_for_a_live_invoice_is_left_for_outbound(self):
+        result, redis_lock, sql_log, ensure_customer, db = self._phase1(owner_docstatus=1)
+
+        self.assertEqual(result["status"], "skipped")
+        self.assertEqual(result["reason"], order_sync.OWNED_BY_POS_INVOICE_REASON)
+        self.assertIs(result["success"], True)
+        self.assertEqual(result["owner_invoice"], "ACC-SINV-2026-18800")
+        ensure_customer.assert_not_called()
+        db.set_value.assert_not_called()
+        self.assertTrue(redis_lock.released)
+        self.assertTrue(any("RELEASE_LOCK" in q for q in sql_log))
+
+    def test_cancelled_owner_falls_back_to_the_ordinary_rules(self):
+        result, *_ = self._phase1(owner_docstatus=2)
+
+        self.assertNotEqual(result.get("reason"), order_sync.OWNED_BY_POS_INVOICE_REASON)
+
+    def test_skip_counts_as_success_and_never_as_a_retry(self):
+        self.assertIn(order_sync.OWNED_BY_POS_INVOICE_REASON, order_sync.SKIPPED_SUCCESS_REASONS)
+        self.assertEqual(sync_events._classify_text_reason(order_sync.OWNED_BY_POS_INVOICE_REASON), "skip")
+
+    def test_owner_is_read_from_the_meta_only_while_live(self):
+        order = {"meta_data": [{"key": "erpnext_sales_invoice", "value": "ACC-SINV-2026-18800"}]}
+        for docstatus, expected in ((0, "ACC-SINV-2026-18800"), (1, "ACC-SINV-2026-18800"), (2, None), (None, None)):
+            with self.subTest(docstatus=docstatus):
+                db = SimpleNamespace(get_value=lambda *a, **k: docstatus)
+                with unittest.mock.patch.object(order_sync.frappe, "db", db):
+                    self.assertEqual(order_sync._order_owner_invoice(order), expected)
+        self.assertIsNone(order_sync._order_owner_invoice({"meta_data": []}))
 
 
 if __name__ == "__main__":
