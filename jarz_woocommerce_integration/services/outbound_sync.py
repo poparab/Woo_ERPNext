@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, Optional
 
 import frappe
+import requests
 try:
     _frappe_utils = importlib.import_module("frappe.utils")
 except ImportError:  # pragma: no cover - allow type checkers without frappe
@@ -35,7 +36,7 @@ from jarz_woocommerce_integration.utils.customer_woo_id import (
 )
 from jarz_woocommerce_integration.services import payment_map, tracking_link
 from jarz_woocommerce_integration.services.order_map_status import is_retired_duplicate_status
-from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient
+from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient, WooTransientError
 
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
 
@@ -1583,6 +1584,9 @@ def _enqueue_invoice_return_sync(
         enqueue_after_commit=not force,
         now=force,
         credit_note_name=credit_note_name,
+        # A queued job owns its transaction; a `now=True` call runs inside the
+        # submit/cancel request and must not be committed from the push.
+        own_transaction=not force,
     )
 
 
@@ -1623,7 +1627,7 @@ def _return_is_full(
     return original_total > 0 and returned_total >= original_total - _RETURN_TOLERANCE
 
 
-def sync_invoice_return(credit_note_name: str) -> dict:
+def sync_invoice_return(credit_note_name: str, own_transaction: bool = False) -> dict:
     """Reflect an ERPNext credit note onto the ORIGINAL WooCommerce order.
 
     Never pushes the credit note itself — it is a local accounting document, not
@@ -1739,6 +1743,10 @@ def sync_invoice_return(credit_note_name: str) -> dict:
     result["order_sync"] = sync_sales_invoice(
         original_invoice,
         reason="credit_note_full" if is_full else "credit_note_partial",
+        # Nothing above writes to the DB, so a queued job may let the push
+        # commit around its critical section; without it the push would hold
+        # the invoice row (SELECT ... FOR UPDATE) through every store call.
+        own_transaction=own_transaction,
     )
     return result
 
@@ -3562,6 +3570,18 @@ def _handover_woo_order_to_replacement(
     inbound path treats the order as unmapped and builds a second invoice for it.
     """
     if not woo_order_id or not replacement_invoice:
+        return
+
+    # Check the row BEFORE writing anything: a retired duplicate must not reach
+    # the replacement invoice's woo_order_id either, or its next push would
+    # revive the cancelled duplicate on the store.
+    if _woo_order_id_is_retired(woo_order_id):
+        LOGGER.warning({
+            "event": "woo_outbound_amendment_handover_refused_retired",
+            "source_invoice": source_invoice,
+            "replacement_invoice": replacement_invoice,
+            "woo_order_id": woo_order_id,
+        })
         return
 
     try:
@@ -5573,6 +5593,126 @@ def _order_map_woo_order_id_for_invoice(invoice_name: str, *, prefer: Any = None
     return candidates[0]
 
 
+def _woo_order_id_is_retired(woo_order_id: Any) -> bool:
+    """True when this Woo order's Order Map row is a retired duplicate."""
+    woo_id = _normalize_woo_order_id(woo_order_id)
+    if not woo_id:
+        return False
+    try:
+        status = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_id}, "status")
+    except Exception:  # noqa: BLE001
+        return False
+    return is_retired_duplicate_status(status)
+
+
+# ---------------------------------------------------------------------------
+# Creating an order: send it once, recover by lookup
+# ---------------------------------------------------------------------------
+#
+# Creating an order is the one store write that is not idempotent. The client
+# used to retry every request up to three times on a timeout, a connection error
+# or a 408/429/5xx -- POST included -- so a store that saved the order but lost
+# the reply (proxy 502, a slow plugin past the 60 s timeout) got a second and a
+# third order, none of them recorded anywhere in ERPNext. Those duplicates have
+# no Order Map row, so neither the push lock nor `retire_duplicate_woo_order`
+# can see them, and the inbound poll may import them as new invoices.
+#
+# So the create is sent exactly once. When its outcome is unknown the push
+# stops (retryable) instead of guessing, and every create -- the first one and
+# any retry -- first looks on the store for an order this invoice already owns:
+# each order we create carries `erpnext_sales_invoice` in its meta data.
+
+#: The order meta key every order this app creates carries (see _build_order_payload).
+_INVOICE_META_KEY = "erpnext_sales_invoice"
+
+#: How many of a customer's most recent orders the lookup reads. A lost create
+#: is seconds to minutes old, so it is always near the top when ordered by id.
+_STORE_ORDER_LOOKUP_PAGE = 20
+
+#: Result details. Both contain a retry token ("temporarily"), so the outbox
+#: reschedules them; neither is in NON_BREAKER_RETRY_DETAILS, because both mean
+#: the store itself misbehaved.
+ORDER_LOOKUP_FAILED_DETAIL = "order_lookup_failed: store temporarily unavailable, nothing created"
+ORDER_CREATE_IN_DOUBT_DETAIL = (
+    "order_create_in_doubt: store reply lost (temporarily unknown whether the order exists); "
+    "the next attempt looks it up before creating"
+)
+
+
+def _order_carries_invoice(order: Any, invoice_name: str) -> bool:
+    if not isinstance(order, dict):
+        return False
+    for entry in order.get("meta_data") or []:
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("key") or "") == _INVOICE_META_KEY
+            and str(entry.get("value") or "").strip() == invoice_name
+        ):
+            return True
+    return False
+
+
+def _find_store_order_for_invoice(
+    client: WooClient,
+    invoice_name: str,
+    payload: dict,
+    *,
+    exclude_ids: tuple = (),
+) -> Dict[str, Any]:
+    """Look on the store for an order this invoice already created.
+
+    Returns ``{"order": <order dict>}`` when found, ``{"order": None}`` when the
+    store has none, and ``{"error": <text>}`` when the store could not be asked
+    -- the caller must then NOT create, because "could not look" is not "none".
+
+    Searches by the order's Woo customer, then by the billing phone (WooCommerce
+    order search covers billing fields), newest ids first, and keeps only orders
+    whose meta names this invoice. Retired duplicates, trashed orders and
+    ``exclude_ids`` never count. Several matches mean earlier duplicates exist:
+    the oldest is the one the customer was told about, so it wins.
+    """
+    queries: list[dict] = []
+    customer_id = cint(payload.get("customer_id"))
+    if customer_id:
+        queries.append({"customer": customer_id})
+    phone = str((payload.get("billing") or {}).get("phone") or "").strip()
+    if phone:
+        queries.append({"search": phone})
+    if not queries:
+        return {"order": None}
+
+    excluded = {cint(x) for x in exclude_ids if cint(x)}
+    matches: dict[int, dict] = {}
+    for query in queries:
+        params = {**query, "per_page": _STORE_ORDER_LOOKUP_PAGE, "orderby": "id", "order": "desc"}
+        try:
+            rows = client.get("orders", params=params)
+        except (WooAPIError, requests.RequestException) as exc:
+            return {"error": str(exc)}
+        for order in rows if isinstance(rows, list) else []:
+            order_id = cint((order or {}).get("id"))
+            if not order_id or order_id in excluded:
+                continue
+            if str(order.get("status") or "").strip().lower() == "trash":
+                continue
+            if _order_carries_invoice(order, invoice_name):
+                matches[order_id] = order
+        if matches:
+            break
+
+    live = [order_id for order_id in sorted(matches) if not _woo_order_id_is_retired(order_id)]
+    if not live:
+        return {"order": None}
+    if len(live) > 1:
+        LOGGER.warning({
+            "event": "woo_outbound_store_has_several_orders_for_invoice",
+            "invoice": invoice_name,
+            "woo_order_ids": live,
+            "adopted": live[0],
+        })
+    return {"order": matches[live[0]]}
+
+
 def sync_sales_invoice(
     invoice_name: str,
     *,
@@ -5726,6 +5866,17 @@ def _sync_sales_invoice(
         locking=not push_lock.own_transaction,
         fallback=in_memory_woo_order_id,
     )
+    if original_woo_order_id and _woo_order_id_is_retired(original_woo_order_id):
+        # The invoice column names an order retired as a duplicate (a stale
+        # full-document save can put one back). Pushing to it would revive a
+        # cancelled duplicate on the store, so resolve the real order instead.
+        LOGGER.warning({
+            "event": "woo_outbound_invoice_id_is_retired_duplicate",
+            "invoice": invoice_name,
+            "woo_order_id": original_woo_order_id,
+            "reason": reason,
+        })
+        original_woo_order_id = None
     woo_order_id = (
         original_woo_order_id
         or _order_map_woo_order_id_for_invoice(invoice_name, prefer=in_memory_woo_order_id)
@@ -5762,10 +5913,8 @@ def _sync_sales_invoice(
                 _mark_invoice_status(invoice_name, status="error", error=exc.message)
                 return {"status": "error", "detail": exc.message}
 
-    unpayable_transition = _detect_unpayable_transition(invoice, existing_order)
-
-    try:
-        payload = _build_order_payload(
+    def _build_payload() -> Dict[str, Any]:
+        return _build_order_payload(
             invoice,
             cfg,
             cancel=cancel,
@@ -5773,6 +5922,39 @@ def _sync_sales_invoice(
             is_create=not woo_order_id,
             client=client,
         )
+
+    try:
+        payload = _build_payload()
+        if not woo_order_id:
+            # About to create. First make sure the store does not already hold
+            # an order for this invoice from an earlier create whose reply was
+            # lost -- see "Creating an order: send it once, recover by lookup".
+            lookup = _find_store_order_for_invoice(client, invoice_name, payload)
+            if lookup.get("error"):
+                LOGGER.warning({
+                    "event": "woo_outbound_store_order_lookup_failed",
+                    "invoice": invoice_name,
+                    "error": lookup["error"],
+                    "reason": reason,
+                })
+                _mark_invoice_status(invoice_name, status="error", error=ORDER_LOOKUP_FAILED_DETAIL)
+                return {"status": "error", "detail": ORDER_LOOKUP_FAILED_DETAIL, "retryable": True}
+            adopted = lookup.get("order")
+            if adopted:
+                woo_order_id = cint(adopted.get("id"))
+                existing_order = adopted
+                # Not from the invoice column: PUT it and write the id back.
+                recovered_amended_order_id = True
+                order_map_exists = bool(
+                    frappe.db.exists("WooCommerce Order Map", {"woo_order_id": woo_order_id})
+                )
+                LOGGER.warning({
+                    "event": "woo_outbound_adopted_existing_store_order",
+                    "invoice": invoice_name,
+                    "woo_order_id": woo_order_id,
+                    "reason": reason,
+                })
+                payload = _build_payload()
     except MissingWooProductError as exc:
         LOGGER.warning({
             "event": "woo_outbound_missing_product_mapping",
@@ -5782,6 +5964,8 @@ def _sync_sales_invoice(
         })
         _mark_invoice_status(invoice_name, status="error", error=str(exc))
         return {"status": "error", "detail": str(exc)}
+
+    unpayable_transition = _detect_unpayable_transition(invoice, existing_order)
 
     # --- Refuse to push a total we already know is wrong ---------------------
     # _check_response_total below catches drift AFTER the store has been written,
@@ -5832,18 +6016,64 @@ def _sync_sales_invoice(
     # From here the store may hold an order our DB does not record yet, so the
     # push lock must outlive this transaction (see `_InvoicePushLock.release`).
     push_lock.uncommitted_write = True
+    def _create_in_doubt(exc: Exception) -> Dict[str, Any]:
+        # The create went out and its outcome is unknown: the store may hold the
+        # order. Never send it again from here; the next attempt runs the
+        # lookup above first and adopts the order if it exists.
+        LOGGER.error({
+            "event": "woo_outbound_order_create_in_doubt",
+            "invoice": invoice_name,
+            "error": str(exc),
+            "reason": reason,
+        })
+        _mark_invoice_status(invoice_name, status="error", error=ORDER_CREATE_IN_DOUBT_DETAIL)
+        return {"status": "error", "detail": ORDER_CREATE_IN_DOUBT_DETAIL, "retryable": True}
+
     try:
         if woo_order_id:
             response = client.put(f"orders/{woo_order_id}", payload)
         else:
-            response = client.post("orders", payload)
+            # Exactly one attempt: see "Creating an order: send it once".
+            response = client.post("orders", payload, max_attempts=1)
+    except requests.RequestException as exc:
+        if woo_order_id:
+            raise
+        return _create_in_doubt(exc)
     except WooAPIError as exc:
+        if not woo_order_id and isinstance(exc, WooTransientError):
+            return _create_in_doubt(exc)
         if woo_order_id and exc.status_code == 404:
-            # The order we meant to update is gone, so this POST creates a new
-            # one — and a created order is ours, which means it needs the origin
-            # the update payload was deliberately built without.
-            _apply_origin_metadata(payload, invoice, cfg)
-            response = client.post("orders", payload)
+            # The order we meant to update is gone. Before creating a new one,
+            # make sure the store holds no other order for this invoice.
+            gone_id = woo_order_id
+            lookup = _find_store_order_for_invoice(
+                client, invoice_name, payload, exclude_ids=(gone_id,)
+            )
+            if lookup.get("error"):
+                _mark_invoice_status(invoice_name, status="error", error=ORDER_LOOKUP_FAILED_DETAIL)
+                return {"status": "error", "detail": ORDER_LOOKUP_FAILED_DETAIL, "retryable": True}
+            adopted = lookup.get("order")
+            if adopted:
+                woo_order_id = cint(adopted.get("id"))
+                LOGGER.warning({
+                    "event": "woo_outbound_adopted_existing_store_order",
+                    "invoice": invoice_name,
+                    "woo_order_id": woo_order_id,
+                    "gone_woo_order_id": gone_id,
+                    "reason": reason,
+                })
+                _mark_outbound_push_in_flight(woo_order_id)
+                response = client.put(f"orders/{woo_order_id}", payload)
+            else:
+                # A created order is ours, which means it needs the origin the
+                # update payload was deliberately built without.
+                _apply_origin_metadata(payload, invoice, cfg)
+                try:
+                    response = client.post("orders", payload, max_attempts=1)
+                except requests.RequestException as post_exc:
+                    return _create_in_doubt(post_exc)
+                except WooTransientError as post_exc:
+                    return _create_in_doubt(post_exc)
         else:
             LOGGER.error({
                 "event": "woo_outbound_invoice_error",

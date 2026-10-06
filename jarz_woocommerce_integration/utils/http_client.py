@@ -307,6 +307,7 @@ class WooClient:
         *,
         params: dict | None = None,
         data: dict | None = None,
+        max_attempts: int | None = None,
     ) -> tuple[Any, dict]:
         """Issue a Woo request, falling back to ``?rest_route=`` if needed.
 
@@ -328,11 +329,17 @@ class WooClient:
             WooTransientError: when a retryable failure (200-with-non-JSON, 429,
                 5xx) survived every attempt. The message carries a sanitized body
                 snippet + Content-Type so the cause is visible in logs/Sentry.
+
+        ``max_attempts`` overrides the client default for this one call. A
+        request that is not safe to repeat (creating an order) passes 1: the
+        ``?rest_route=`` fallback below still applies, because it only fires on
+        a 4xx the REST API never saw.
         """
 
         try:
             return self._perform_request_in_mode(
-                method, resource, params=params, data=data, rest_route=self.use_rest_route
+                method, resource, params=params, data=data, rest_route=self.use_rest_route,
+                max_attempts=max_attempts,
             )
         except _PrettyRouteUnavailable as signal:
             detail = signal.detail
@@ -340,7 +347,8 @@ class WooClient:
         self.use_rest_route = True
         _log_rest_route_fallback(self.base_url, detail)
         return self._perform_request_in_mode(
-            method, resource, params=params, data=data, rest_route=True
+            method, resource, params=params, data=data, rest_route=True,
+            max_attempts=max_attempts,
         )
 
     def _perform_request_in_mode(
@@ -351,6 +359,7 @@ class WooClient:
         params: dict | None = None,
         data: dict | None = None,
         rest_route: bool = False,
+        max_attempts: int | None = None,
     ) -> tuple[Any, dict]:
         """Issue a Woo request in one URL mode, retrying transient failures.
 
@@ -361,7 +370,7 @@ class WooClient:
         url = self._build_url(resource, rest_route=rest_route)
         safe_url = sanitize_url(url)
         session = self._session or requests
-        attempts = max(1, int(self.max_attempts or DEFAULT_MAX_ATTEMPTS))
+        attempts = max(1, int(max_attempts or self.max_attempts or DEFAULT_MAX_ATTEMPTS))
 
         for attempt in range(1, attempts + 1):
             is_last = attempt >= attempts
@@ -456,8 +465,18 @@ class WooClient:
             }
         return payload
 
-    def _request(self, method: str, resource: str, *, params: dict | None = None, data: dict | None = None) -> dict:
-        body, _headers = self._perform_request(method, resource, params=params, data=data)
+    def _request(
+        self,
+        method: str,
+        resource: str,
+        *,
+        params: dict | None = None,
+        data: dict | None = None,
+        max_attempts: int | None = None,
+    ) -> dict:
+        body, _headers = self._perform_request(
+            method, resource, params=params, data=data, max_attempts=max_attempts
+        )
         return body
 
     def _request_raw(self, method: str, resource: str, *, params: dict | None = None, data: dict | None = None) -> tuple[dict | list, dict]:
@@ -467,8 +486,15 @@ class WooClient:
     def get(self, resource: str, params: dict | None = None) -> dict:
         return self._request("GET", resource, params=params)
 
-    def post(self, resource: str, data: dict) -> dict:
-        return self._request("POST", resource, data=data)
+    def post(self, resource: str, data: dict, *, max_attempts: int | None = None) -> dict:
+        """POST ``data``. Pass ``max_attempts=1`` when repeating it would be harmful.
+
+        A POST that creates something is not idempotent: when the store saved
+        the order but the reply was lost (timeout, proxy 502), a retry creates a
+        second order in the customer's account. Callers creating orders send it
+        once and recover through a lookup instead (see outbound_sync).
+        """
+        return self._request("POST", resource, data=data, max_attempts=max_attempts)
 
     def put(self, resource: str, data: dict) -> dict:
         return self._request("PUT", resource, data=data)

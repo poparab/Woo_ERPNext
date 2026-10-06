@@ -19,7 +19,13 @@ def push_sales_invoice(invoice_name: str) -> dict:
     access.ensure_operator_access()
     frappe.has_permission("Sales Invoice", "write", invoice_name, throw=True)
     try:
-        result = sync_sales_invoice(invoice_name, reason="manual_button", force=True)
+        # own_transaction: this request has written nothing yet (only permission
+        # checks above), so the push may commit around its critical section
+        # instead of holding the invoice row (SELECT ... FOR UPDATE) through
+        # every store call while staff work on the same order.
+        result = sync_sales_invoice(
+            invoice_name, reason="manual_button", force=True, own_transaction=True
+        )
         sync_events.record_manual_push_audit_event(
             object_type="Sales Invoice",
             docname=invoice_name,

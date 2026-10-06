@@ -10,6 +10,8 @@ Pure unit tests: ``frappe.db``, the Woo client and the sync log are fakes.
 """
 
 import unittest
+
+import requests
 import unittest.mock
 from datetime import datetime
 from types import SimpleNamespace
@@ -284,14 +286,31 @@ class TestOutboundIgnoresRetiredRows(unittest.TestCase):
 
 
 class _MaintenanceDB:
-    def __init__(self, log, *, invoice_woo_order_id=17864, duplicate_status="processing"):
+    def __init__(
+        self,
+        log,
+        *,
+        invoice_woo_order_id=17864,
+        duplicate_status="processing",
+        lock_free=True,
+        relinked_under_lock=None,
+    ):
         self.log = log
         self.invoice_woo_order_id = invoice_woo_order_id
         self.duplicate_status = duplicate_status
+        self.lock_free = lock_free
+        # What the duplicate's row links once the inbound lock is held (an
+        # in-flight sync may have moved it); None = unchanged.
+        self.relinked_under_lock = relinked_under_lock
 
     def get_value(self, doctype, filters, fieldname=None, as_dict=False):
         if doctype == "Sales Invoice":
             return {"name": INVOICE, "woo_order_id": self.invoice_woo_order_id}
+        if filters == "WOOMAP-13274":  # re-read by name under the inbound lock
+            return {
+                "erpnext_sales_invoice": self.relinked_under_lock or INVOICE,
+                "status": self.duplicate_status,
+            }
         woo_id = filters.get("woo_order_id")
         if woo_id == 17863:
             return {"name": "WOOMAP-13274", "erpnext_sales_invoice": INVOICE, "status": self.duplicate_status}
@@ -299,11 +318,23 @@ class _MaintenanceDB:
             return {"name": "WOOMAP-13273", "erpnext_sales_invoice": INVOICE, "status": "completed"}
         return None
 
+    def sql(self, query, values=None, *args, **kwargs):
+        if query.startswith("SELECT GET_LOCK"):
+            self.log.append(("lock", values[0]))
+            return ((1 if self.lock_free else 0,),)
+        if query.startswith("SELECT RELEASE_LOCK"):
+            self.log.append(("unlock", values[0]))
+            return ((1,),)
+        raise AssertionError(f"unexpected SQL: {query}")
+
     def set_value(self, doctype, name, values, update_modified=False):
         self.log.append(("set_value", doctype, name, dict(values)))
 
     def commit(self):
         self.log.append(("commit",))
+
+    def rollback(self):
+        self.log.append(("rollback",))
 
 
 class TestRetireDuplicateWooOrder(unittest.TestCase):
@@ -342,15 +373,51 @@ class TestRetireDuplicateWooOrder(unittest.TestCase):
         result, log = self._run(apply=True)
 
         self.assertEqual(result["status"], "applied")
-        self.assertEqual([entry[0] for entry in log], ["set_value", "commit", "echo", "put", "note"])
-        _, doctype, name, values = log[0]
+        # The marker is written and committed under the inbound per-order lock,
+        # and the lock is released before the store is touched.
+        self.assertEqual(
+            [entry[0] for entry in log],
+            ["lock", "set_value", "commit", "unlock", "echo", "put", "note"],
+        )
+        self.assertEqual(log[0][1], "woo-order-17863")
+        _, doctype, name, values = log[1]
         self.assertEqual((doctype, name), ("WooCommerce Order Map", "WOOMAP-13274"))
         self.assertEqual(values["status"], RETIRED_DUPLICATE_MAP_STATUS)
         self.assertEqual(values["needs_manual_review"], 0)
         self.assertEqual(values["manual_review_reason"], "Duplicate of #17864 created by concurrent outbound push")
-        self.assertEqual(log[3][1:], ("orders/17863", {"status": "cancelled"}))
-        self.assertIn("#17864", log[4][2])
-        self.assertIn("not a real order", log[4][2])
+        self.assertEqual(log[5][1:], ("orders/17863", {"status": "cancelled"}))
+        self.assertIn("#17864", log[6][2])
+        self.assertIn("not a real order", log[6][2])
+
+    def test_refuses_while_an_inbound_sync_holds_the_order(self):
+        result, log = self._run(apply=True, lock_free=False)
+
+        self.assertEqual(result["status"], "refused")
+        self.assertEqual(result["reason"], "inbound_sync_in_progress")
+        # Nothing written, nothing sent to the store.
+        self.assertEqual([entry[0] for entry in log], ["lock"])
+
+    def test_refuses_when_the_row_moved_while_waiting_for_the_lock(self):
+        result, log = self._run(apply=True, relinked_under_lock="ACC-SINV-2026-99999")
+
+        self.assertEqual(result["status"], "refused")
+        self.assertEqual(result["reason"], "order_map_changed")
+        self.assertEqual([entry[0] for entry in log], ["lock", "rollback", "unlock"])
+
+    def test_connection_error_on_the_cancel_is_reported_as_partial(self):
+        log = []
+        db = _MaintenanceDB(log)
+
+        class Client:
+            def put(self, path, payload):
+                raise requests.ConnectionError("connection reset")
+
+        with unittest.mock.patch.object(order_maintenance.frappe, "db", db),              unittest.mock.patch.object(outbound_sync, "_resolve_order_map_link_field", return_value="erpnext_sales_invoice"),              unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), None)),              unittest.mock.patch.object(outbound_sync, "_build_client", return_value=Client()),              unittest.mock.patch.object(outbound_sync, "_mark_outbound_push_in_flight"):
+            result = order_maintenance.retire_duplicate_woo_order(17863, 17864, apply=True)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["reason"], "woo_cancel_failed")
+        self.assertTrue(result["order_map_retired"])
 
     def test_rerun_on_a_retired_row_does_not_rewrite_it(self):
         result, log = self._run(apply=True, duplicate_status=RETIRED_DUPLICATE_MAP_STATUS)

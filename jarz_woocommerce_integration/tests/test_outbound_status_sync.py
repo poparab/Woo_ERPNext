@@ -66,15 +66,17 @@ class DummyClient:
         self.put_calls = []
         self.post_calls = []
 
-    def get(self, path):
+    def get(self, path, params=None):
         self.get_calls.append(path)
+        if path == "orders":
+            return []  # the pre-create store lookup: no order owns this invoice yet
         return dict(self.existing_order)
 
     def put(self, path, payload):
         self.put_calls.append((path, payload))
         return {"id": 14500, "number": "14500"}
 
-    def post(self, path, payload):
+    def post(self, path, payload, **_kwargs):
         self.post_calls.append((path, payload))
         return {"id": 14500, "number": "14500"}
 
@@ -88,7 +90,7 @@ class DummyResponseClient(DummyClient):
         self.put_calls.append((path, payload))
         return dict(self.response)
 
-    def post(self, path, payload):
+    def post(self, path, payload, **_kwargs):
         self.post_calls.append((path, payload))
         return dict(self.response)
 
@@ -98,11 +100,13 @@ class DummyMissingOrderClient(DummyClient):
         super().__init__(existing_order=None)
         self.created_order_id = created_order_id
 
-    def get(self, path):
+    def get(self, path, params=None):
         self.get_calls.append(path)
+        if path == "orders":
+            return []  # the pre-create store lookup: no order owns this invoice yet
         raise outbound_sync.WooAPIError(404, path, "Invalid ID.", {"message": "Invalid ID."})
 
-    def post(self, path, payload):
+    def post(self, path, payload, **_kwargs):
         self.post_calls.append((path, payload))
         return {"id": self.created_order_id, "number": str(self.created_order_id)}
 

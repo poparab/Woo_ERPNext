@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 import frappe
+import requests
 
 from jarz_woocommerce_integration.services.order_map_status import (
     RETIRED_DUPLICATE_MAP_STATUS,
@@ -23,6 +24,29 @@ from jarz_woocommerce_integration.services.order_map_status import (
 from jarz_woocommerce_integration.utils.http_client import WooAPIError
 
 ORDER_MAP_DOCTYPE = "WooCommerce Order Map"
+
+#: The MariaDB named lock inbound order processing holds per Woo order
+#: (order_sync._process_order_phase1: ``f"woo-order-{woo_id}"``).
+INBOUND_ORDER_LOCK_PREFIX = "woo-order-"
+_INBOUND_ORDER_LOCK_WAIT_SECONDS = 10
+
+
+def _acquire_inbound_order_lock(woo_order_id: int) -> bool:
+    try:
+        rows = frappe.db.sql(
+            "SELECT GET_LOCK(%s, %s)",
+            (f"{INBOUND_ORDER_LOCK_PREFIX}{woo_order_id}", _INBOUND_ORDER_LOCK_WAIT_SECONDS),
+        )
+    except Exception:  # noqa: BLE001 - cannot tell: do not mark without the lock
+        return False
+    return bool(rows and rows[0] and rows[0][0] == 1)
+
+
+def _release_inbound_order_lock(woo_order_id: int) -> None:
+    try:
+        frappe.db.sql("SELECT RELEASE_LOCK(%s)", (f"{INBOUND_ORDER_LOCK_PREFIX}{woo_order_id}",))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _as_int(value: Any) -> int:
@@ -156,19 +180,46 @@ def retire_duplicate_woo_order(woo_order_id: Any, keep_woo_order_id: Any, apply:
         result["status"] = "dry_run"
         return result
 
-    # 1. Marker first, and durable, before the store is touched.
+    # 1. Marker first, and durable, before the store is touched. Held under the
+    #    inbound per-order lock (the one order_sync._process_order_phase1 takes):
+    #    an inbound sync of this order already in flight could otherwise write
+    #    its stale snapshot -- `status` included -- over the marker, and the
+    #    cancel below would then reach the real invoice.
     if not already_retired:
-        frappe.db.set_value(
-            ORDER_MAP_DOCTYPE,
-            map_row["name"],
-            {
-                "status": RETIRED_DUPLICATE_MAP_STATUS,
-                "needs_manual_review": 0,
-                "manual_review_reason": _review_reason(keep_id),
-            },
-            update_modified=True,
-        )
-    frappe.db.commit()
+        if not _acquire_inbound_order_lock(duplicate_id):
+            return _refuse(
+                result,
+                "inbound_sync_in_progress",
+                f"{INBOUND_ORDER_LOCK_PREFIX}{duplicate_id} is held; re-run in a minute",
+            )
+        try:
+            # Re-read under the lock: the in-flight sync may have changed it.
+            current = frappe.db.get_value(
+                ORDER_MAP_DOCTYPE, map_row["name"], [link_field, "status"], as_dict=True
+            ) or {}
+            if current.get(link_field) != invoice_name:
+                frappe.db.rollback()
+                return _refuse(
+                    result,
+                    "order_map_changed",
+                    f"Order Map {map_row['name']} now links {current.get(link_field) or 'nothing'}",
+                )
+            if not is_retired_duplicate_status(current.get("status")):
+                frappe.db.set_value(
+                    ORDER_MAP_DOCTYPE,
+                    map_row["name"],
+                    {
+                        "status": RETIRED_DUPLICATE_MAP_STATUS,
+                        "needs_manual_review": 0,
+                        "manual_review_reason": _review_reason(keep_id),
+                    },
+                    update_modified=True,
+                )
+            frappe.db.commit()
+        finally:
+            _release_inbound_order_lock(duplicate_id)
+    else:
+        frappe.db.commit()
     result["order_map_retired"] = True
 
     # 2. Our own write must read as an echo to anything that still looks.
@@ -181,7 +232,8 @@ def retire_duplicate_woo_order(woo_order_id: Any, keep_woo_order_id: Any, apply:
         result.update({"status": "partial", "reason": f"woo_client_unavailable:{exc}"})
         return result
 
-    # 3. Cancel the duplicate on the store.
+    # 3. Cancel the duplicate on the store. Safe to repeat, so a failure here is
+    #    reported as partial and fixed by re-running.
     try:
         response = client.put(f"orders/{duplicate_id}", {"status": "cancelled"})
         result["woo_status"] = (response or {}).get("status") if isinstance(response, dict) else None
@@ -192,8 +244,14 @@ def retire_duplicate_woo_order(woo_order_id: Any, keep_woo_order_id: Any, apply:
             "detail": exc.message or f"status_code={exc.status_code}",
         })
         return result
+    except requests.RequestException as exc:
+        result.update({"status": "partial", "reason": "woo_cancel_failed", "detail": str(exc)})
+        return result
 
     # 4. Tell staff, privately, what this order is.
-    result["note"] = outbound_sync._post_woo_order_note(client, duplicate_id, note_body)
+    try:
+        result["note"] = outbound_sync._post_woo_order_note(client, duplicate_id, note_body)
+    except requests.RequestException as exc:
+        result["note"] = f"failed: {exc}"
     result["status"] = "applied" if result["note"] in ("posted", "already_posted") else "partial"
     return result

@@ -226,6 +226,42 @@ class TestRetryThenRecoverOrExhaust(unittest.TestCase):
             client.list_orders_with_meta(params={"per_page": 10})
 
         assert len(session.calls) == 3
+
+
+class TestOrderCreateIsSentOnce(unittest.TestCase):
+    """A POST that creates an order must never be repeated by the client.
+
+    The store may have saved the order before the 502/timeout, so a retry made a
+    second order in the customer's account (review of b951743).
+    """
+
+    def test_single_attempt_post_is_sent_once_on_502(self):
+        client, session = _client([FakeResponse(status_code=502, text="<html>502 Bad Gateway</html>")])
+
+        with self.assertRaises(WooTransientError):
+            client.post("orders", {"status": "processing"}, max_attempts=1)
+
+        assert [call["method"] for call in session.calls] == ["POST"]
+
+    def test_single_attempt_post_reraises_a_timeout_without_resending(self):
+        client, session = _client([requests.Timeout("read timed out")])
+
+        with self.assertRaises(requests.Timeout):
+            client.post("orders", {"status": "processing"}, max_attempts=1)
+
+        assert len(session.calls) == 1
+
+    def test_override_does_not_change_the_client_default(self):
+        def bad_gateway():
+            return FakeResponse(status_code=502, text="<html>502 Bad Gateway</html>")
+
+        client, session = _client([bad_gateway(), bad_gateway(), _json_response({"id": 1})])
+
+        with self.assertRaises(WooTransientError):
+            client.post("orders", {"status": "processing"}, max_attempts=1)
+        # The same client's next GET still gets its usual retries.
+        assert client.get("orders/1") == {"id": 1}
+        assert [call["method"] for call in session.calls] == ["POST", "GET", "GET"]
 # --- (d) 401/403 raise promptly, no retries, and stay loud (not transient) ---
 
 
