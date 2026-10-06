@@ -10,7 +10,11 @@ class TestManualSync(unittest.TestCase):
              unittest.mock.patch.object(manual_sync.sync_events, "record_manual_push_audit_event") as record_audit:
             result = manual_sync.push_sales_invoice("SINV-0001")
 
-        sync_invoice.assert_called_once_with("SINV-0001", reason="manual_button", force=True)
+        # own_transaction: the request has written nothing before the push, so
+        # the push may commit instead of holding the invoice row FOR UPDATE.
+        sync_invoice.assert_called_once_with(
+            "SINV-0001", reason="manual_button", force=True, own_transaction=True
+        )
         record_audit.assert_called_once_with(
             object_type="Sales Invoice",
             docname="SINV-0001",
