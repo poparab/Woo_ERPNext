@@ -34,6 +34,7 @@ from jarz_woocommerce_integration.utils.customer_woo_id import (
     set_customer_woo_id,
 )
 from jarz_woocommerce_integration.services import payment_map, tracking_link
+from jarz_woocommerce_integration.services.order_map_status import is_retired_duplicate_status
 from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClient
 
 LOGGER = frappe.logger("jarz_woocommerce.outbound")
@@ -1519,6 +1520,9 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
         invoice_name=invoice_name,
         reason=reason,
         cancel=cancel,
+        # A queued job owns its transaction; a `now=True` call runs inside the
+        # caller's (e.g. a submit request) and must never be committed from here.
+        own_transaction=not force,
     )
 
 
@@ -3500,16 +3504,24 @@ def _recover_amended_invoice_woo_order_id(invoice: frappe.model.document.Documen
     except Exception:
         pass
 
+    # A retired duplicate row links the same invoice as the real order's row, so
+    # an unfiltered "any row for this invoice" could hand the amendment a Woo
+    # order that was cancelled as a duplicate. Read them all and skip retired.
     link_field = _resolve_order_map_link_field()
     try:
-        map_row = frappe.db.get_value(
+        map_rows = frappe.get_all(
             "WooCommerce Order Map",
-            {link_field: amended_from},
-            ["woo_order_id"],
-            as_dict=True,
-        )
-        recovered = (map_row or {}).get("woo_order_id") if isinstance(map_row, dict) else None
-        return cint(recovered) or None
+            filters={link_field: amended_from},
+            fields=["woo_order_id", "status"],
+            order_by="creation asc",
+        ) or []
+        for map_row in map_rows:
+            if is_retired_duplicate_status(map_row.get("status")):
+                continue
+            recovered = cint(map_row.get("woo_order_id"))
+            if recovered:
+                return recovered
+        return None
     except Exception:
         return None
 
@@ -3572,7 +3584,14 @@ def _handover_woo_order_to_replacement(
 
     link_field = _resolve_order_map_link_field()
     try:
-        map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_order_id}, "name")
+        map_row = frappe.db.get_value(
+            "WooCommerce Order Map", {"woo_order_id": woo_order_id}, ["name", "status"], as_dict=True
+        )
+        # Never move a retired duplicate onto the replacement: it would hand
+        # the live invoice a Woo order that was cancelled as a duplicate.
+        map_name = None
+        if isinstance(map_row, dict) and not is_retired_duplicate_status(map_row.get("status")):
+            map_name = map_row.get("name")
         if map_name:
             frappe.db.set_value(
                 "WooCommerce Order Map",
@@ -3866,6 +3885,22 @@ def _relink_order_map_to_invoice(
         map_name = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_order_id}, "name")
     except Exception:
         map_name = None
+
+    if map_name:
+        try:
+            map_status = frappe.db.get_value("WooCommerce Order Map", map_name, "status")
+        except Exception:  # noqa: BLE001
+            map_status = None
+        if is_retired_duplicate_status(map_status):
+            # Never overwrite the marker (map_updates carries `status`): a push
+            # that lands on a retired duplicate is a bug to surface, not to heal.
+            LOGGER.warning({
+                "event": "woo_outbound_order_map_relink_refused_retired",
+                "invoice": invoice_name,
+                "woo_order_id": woo_order_id,
+                "order_map": map_name,
+            })
+            return
 
     try:
         if map_name:
@@ -5377,7 +5412,202 @@ def _build_tracking_metadata(invoice: frappe.model.document.Document) -> list[di
     return tracking_link.build_tracking_metadata(invoice, settings)
 
 
-def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: bool = False, force: bool = False) -> dict:
+# ---------------------------------------------------------------------------
+# One outbound order push per invoice at a time
+# ---------------------------------------------------------------------------
+#
+# ACC-SINV-2026-18733 (2026-10-06) became three Woo orders, 17863/17864/17865.
+# Each push read `woo_order_id`, found it empty and POSTed; nothing stopped two
+# workers from doing that for the same invoice, and the id written back after
+# the ~8 s POST only became visible when that job committed. The same happened
+# to ACC-SINV-2026-18176 and -18339. The read-decide-POST-writeback section
+# below therefore runs under a per-invoice MariaDB advisory lock, re-reads the
+# CURRENT id under that lock, and also trusts an Order Map row that already
+# links the invoice (the invoice column alone can be stale or blanked).
+
+#: Result detail when another worker holds the invoice's push lock. It contains
+#: "locked", so the outbox classifies it as retryable; sync_events keeps it out
+#: of the circuit breaker, because it is contention and not a store failure.
+INVOICE_PUSH_LOCKED_DETAIL = "invoice_push_locked"
+
+#: How long to wait for another worker's push of the same invoice. The POST in
+#: the incident took ~8 s. Waiting is cheaper than a retry round trip, but not
+#: unbounded: when it expires the outbox retries instead of creating an order.
+_INVOICE_PUSH_LOCK_WAIT_SECONDS = 30
+
+#: MariaDB rejects user-lock names longer than 64 characters.
+_MAX_USER_LOCK_NAME = 64
+
+
+def _invoice_push_lock_key(invoice_name: str) -> str:
+    key = f"woo-outbound-inv:{invoice_name}"
+    if len(key) > _MAX_USER_LOCK_NAME:
+        digest = hashlib.sha1(str(invoice_name).encode("utf-8")).hexdigest()
+        key = f"woo-outbound-inv:{digest}"
+    return key
+
+
+def _release_named_lock(key: str) -> None:
+    try:
+        frappe.db.sql("SELECT RELEASE_LOCK(%s)", (key,))
+    except Exception:  # noqa: BLE001 - not held / connection gone: nothing to do
+        pass
+
+
+def _release_named_lock_at_transaction_end(key: str) -> bool:
+    """Release ``key`` only once the current transaction commits or rolls back.
+
+    A named lock belongs to the DB *session*, not the transaction. Releasing it
+    while our `woo_order_id` write-back is still uncommitted lets the next
+    holder read the old value and POST again, which is the very race the lock
+    exists to stop. Frappe runs these callbacks right after the SQL COMMIT /
+    ROLLBACK. Returns False when the callback API is unavailable, so the caller
+    can fall back to releasing immediately (a session that closes releases its
+    locks anyway).
+    """
+    try:
+        frappe.db.after_commit.add(lambda: _release_named_lock(key))
+        frappe.db.after_rollback.add(lambda: _release_named_lock(key))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _InvoicePushLock:
+    """Per-invoice advisory lock around read-decide-POST-writeback.
+
+    ``own_transaction`` says whether the caller holds no uncommitted work of its
+    own, so this push may commit. True for the outbox worker (it commits its
+    claim before dispatching) and for a queued `sync_sales_invoice` job; False
+    for inline callers such as the manual push button or a `now=True` enqueue
+    inside a submit request.
+    """
+
+    def __init__(self, invoice_name: str, *, own_transaction: bool = False):
+        self.invoice_name = invoice_name
+        self.key = _invoice_push_lock_key(invoice_name)
+        self.own_transaction = bool(own_transaction)
+        self.acquired = False
+        # True from the moment we write to the store until our DB write-back is
+        # committed. While True, releasing early could expose a stale id.
+        self.uncommitted_write = False
+
+    def acquire(self) -> bool:
+        try:
+            rows = frappe.db.sql(
+                "SELECT GET_LOCK(%s, %s)", (self.key, _INVOICE_PUSH_LOCK_WAIT_SECONDS)
+            )
+            self.acquired = bool(rows and rows[0] and rows[0][0] == 1)
+        except Exception as exc:  # noqa: BLE001
+            # Fail closed: without the lock we cannot rule out a concurrent POST.
+            LOGGER.warning({
+                "event": "woo_outbound_invoice_lock_error",
+                "invoice": self.invoice_name,
+                "error": str(exc),
+            })
+            self.acquired = False
+        return self.acquired
+
+    def release(self) -> None:
+        if not self.acquired:
+            return
+        self.acquired = False
+        if self.uncommitted_write and _release_named_lock_at_transaction_end(self.key):
+            return
+        _release_named_lock(self.key)
+
+
+def _normalize_woo_order_id(value: Any) -> Optional[int]:
+    return cint(value) or None
+
+
+def _read_current_invoice_woo_order_id(invoice_name: str, *, locking: bool, fallback: Any = None) -> Optional[int]:
+    """The invoice's committed ``woo_order_id``, read under the push lock.
+
+    MariaDB runs REPEATABLE READ: a plain SELECT inside a transaction that has
+    already read something returns that transaction's old snapshot, not what
+    another worker committed since. Callers that own their transaction commit
+    before calling this (fresh snapshot, no row lock). Inline callers cannot
+    commit, so they use ``locking=True``: ``SELECT ... FOR UPDATE`` always reads
+    the latest committed row, on a single primary-key row that this push is
+    about to write anyway.
+    """
+    sql = "SELECT woo_order_id FROM `tabSales Invoice` WHERE name = %s"
+    if locking:
+        sql += " FOR UPDATE"
+    rows = frappe.db.sql(sql, (invoice_name,))
+    if not rows or not rows[0]:
+        return _normalize_woo_order_id(fallback)
+    return _normalize_woo_order_id(rows[0][0])
+
+
+def _order_map_woo_order_id_for_invoice(invoice_name: str, *, prefer: Any = None) -> Optional[int]:
+    """A Woo order an Order Map row already links to this invoice, if any.
+
+    The invoice column is not the only record of the order: the map row is
+    written in the same push, and a concurrent full-document save of the
+    invoice can put back an empty ``woo_order_id`` it loaded earlier. Retired
+    duplicates never count. Prefers ``prefer`` when it is one of the linked
+    orders, otherwise the oldest live row (the first order created is the one
+    the customer was told about).
+    """
+    link_field = _resolve_order_map_link_field()
+    rows = frappe.db.sql(
+        f"SELECT woo_order_id, status FROM `tabWooCommerce Order Map` "
+        f"WHERE `{link_field}` = %s ORDER BY creation ASC",
+        (invoice_name,),
+        as_dict=True,
+    ) or []
+    candidates: list[int] = []
+    for row in rows:
+        if is_retired_duplicate_status(row.get("status")):
+            continue
+        woo_id = _normalize_woo_order_id(row.get("woo_order_id"))
+        if woo_id and woo_id not in candidates:
+            candidates.append(woo_id)
+    if not candidates:
+        return None
+    preferred = _normalize_woo_order_id(prefer)
+    if preferred and preferred in candidates:
+        return preferred
+    return candidates[0]
+
+
+def sync_sales_invoice(
+    invoice_name: str,
+    *,
+    reason: str | None = None,
+    cancel: bool = False,
+    force: bool = False,
+    own_transaction: bool = False,
+) -> dict:
+    """Push one Sales Invoice to WooCommerce (create or update its order).
+
+    ``own_transaction=True`` declares that the caller has no uncommitted work of
+    its own, which lets the push commit around its critical section; see
+    `_InvoicePushLock`. The lock is released on every exit path.
+    """
+    push_lock = _InvoicePushLock(invoice_name, own_transaction=own_transaction)
+    try:
+        return _sync_sales_invoice(
+            invoice_name,
+            reason=reason,
+            cancel=cancel,
+            force=force,
+            push_lock=push_lock,
+        )
+    finally:
+        push_lock.release()
+
+
+def _sync_sales_invoice(
+    invoice_name: str,
+    *,
+    reason: str | None,
+    cancel: bool,
+    force: bool,
+    push_lock: _InvoicePushLock,
+) -> dict:
     settings, cfg = _get_settings()
     if not cfg.enable_order_push and not force:
         _note_outbound_disabled("enable_outbound_orders")
@@ -5471,9 +5701,48 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         sync_customer(customer_doc.name, reason="order_dependency", force=True)
         customer_doc = frappe.get_doc("Customer", invoice.customer)
 
-    original_woo_order_id = getattr(invoice, "woo_order_id", None)
-    woo_order_id = original_woo_order_id or _recover_amended_invoice_woo_order_id(invoice)
+    # --- Serialise the create-or-update decision per invoice ------------------
+    # Everything from here to the write-back runs under the invoice's push lock,
+    # so two workers can no longer both see "no Woo order yet" and both POST.
+    if not push_lock.acquire():
+        # Never fall through to a POST without the lock. The outbox reads this
+        # as retryable ("locked") and tries again on its backoff schedule; the
+        # invoice is deliberately NOT marked Error, nothing failed.
+        LOGGER.warning({
+            "event": "woo_outbound_invoice_lock_busy",
+            "invoice": invoice_name,
+            "reason": reason,
+        })
+        return {"status": "error", "detail": INVOICE_PUSH_LOCKED_DETAIL, "retryable": True}
+
+    if push_lock.own_transaction:
+        # End the snapshot this transaction opened before we held the lock, so
+        # the reads below see whatever the previous holder committed.
+        frappe.db.commit()
+
+    in_memory_woo_order_id = getattr(invoice, "woo_order_id", None)
+    original_woo_order_id = _read_current_invoice_woo_order_id(
+        invoice_name,
+        locking=not push_lock.own_transaction,
+        fallback=in_memory_woo_order_id,
+    )
+    woo_order_id = (
+        original_woo_order_id
+        or _order_map_woo_order_id_for_invoice(invoice_name, prefer=in_memory_woo_order_id)
+        or _recover_amended_invoice_woo_order_id(invoice)
+    )
+    # Any id that did not come from the invoice's own column (Order Map row or
+    # amended source) must be PUT and written back, never skipped as in sync.
     recovered_amended_order_id = bool(woo_order_id and not original_woo_order_id)
+    if woo_order_id and str(woo_order_id) != str(_woo_id or ""):
+        LOGGER.info({
+            "event": "woo_outbound_invoice_id_resolved_under_lock",
+            "invoice": invoice_name,
+            "stale_woo_order_id": _woo_id,
+            "woo_order_id": woo_order_id,
+            "reason": reason,
+        })
+        order_map_exists = bool(frappe.db.exists("WooCommerce Order Map", {"woo_order_id": woo_order_id}))
     existing_order: Optional[Dict[str, Any]] = None
     if woo_order_id:
         try:
@@ -5560,6 +5829,9 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
     # is still open, so a marker set afterwards would already have lost the race
     # (see `_mark_outbound_push_in_flight`).
     _mark_outbound_push_in_flight(woo_order_id)
+    # From here the store may hold an order our DB does not record yet, so the
+    # push lock must outlive this transaction (see `_InvoicePushLock.release`).
+    push_lock.uncommitted_write = True
     try:
         if woo_order_id:
             response = client.put(f"orders/{woo_order_id}", payload)
@@ -5640,6 +5912,15 @@ def sync_sales_invoice(invoice_name: str, *, reason: str | None = None, cancel: 
         contact_snapshot=contact_snapshot,
         territory_snapshot=territory_snapshot,
     )
+
+    # Make the new id durable and visible NOW, not when the outbox finishes the
+    # event: the next worker for this invoice must see it, and a worker killed
+    # during the note/verification steps below must not roll it back (the retry
+    # would then POST a second order). Only when we own the transaction; an
+    # inline caller's lock is instead released after its own commit.
+    if push_lock.own_transaction:
+        frappe.db.commit()
+        push_lock.uncommitted_write = False
 
     # `set_paid` only ever moves an order *to* paid. Say so out loud when the
     # invoice has gone back to outstanding — see `_detect_unpayable_transition`.

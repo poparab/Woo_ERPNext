@@ -6,6 +6,7 @@ from typing import Any
 
 import frappe
 
+from jarz_woocommerce_integration.services.order_map_status import RETIRED_DUPLICATE_MAP_STATUS
 from jarz_woocommerce_integration.services.order_sync import pull_single_order_phase1
 from jarz_woocommerce_integration.utils.http_client import WooClient
 
@@ -157,8 +158,12 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
         JOIN `tabSales Invoice` si ON si.name = wm.{link_field}
         WHERE wm.woo_order_id IN ({placeholders})
           AND IFNULL(si.is_return, 0) = 0
+          AND IFNULL(wm.status, '') != %s
         """,
-        tuple(woo_order_ids),
+        # A retired duplicate is cancelled on the store on purpose but links the
+        # REAL invoice. Matching through it would reclassify (and re-key the
+        # woo_order_id of) that invoice once it is ever cancelled for any reason.
+        tuple(woo_order_ids) + (RETIRED_DUPLICATE_MAP_STATUS,),
         as_dict=True,
     )
 
@@ -225,13 +230,15 @@ def _sample_data_correction_invoices(limit: int = 20) -> list[dict[str, Any]]:
                si.grand_total,
                IFNULL(si.custom_cancellation_reason, '') AS cancellation_reason
         FROM `tabSales Invoice` si
-        LEFT JOIN `tabWooCommerce Order Map` wm ON wm.{link_field} = si.name
+        LEFT JOIN `tabWooCommerce Order Map` wm
+               ON wm.{link_field} = si.name
+              AND IFNULL(wm.status, '') != %s
         WHERE si.docstatus = 2
           AND IFNULL(si.custom_cancellation_type, '') = %s
         ORDER BY si.modified DESC
         LIMIT %s
         """,
-        (DATA_CORRECTION_TYPE, limit),
+        (RETIRED_DUPLICATE_MAP_STATUS, DATA_CORRECTION_TYPE, limit),
         as_dict=True,
     )
     if not rows:

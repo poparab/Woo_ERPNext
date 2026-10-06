@@ -39,6 +39,11 @@ from typing import TYPE_CHECKING, Any
 import frappe
 from frappe import _
 
+from jarz_woocommerce_integration.services.order_map_status import (
+    RETIRED_DUPLICATE_REASON,
+    is_retired_duplicate_row,
+)
+
 if TYPE_CHECKING:
     pass
 
@@ -334,7 +339,7 @@ def run_woo_amendment_job(
         map_row = frappe.db.get_value(
             "WooCommerce Order Map",
             {"woo_order_id": woo_order_id},
-            ["name", LINK_FIELD, "hash"],
+            ["name", LINK_FIELD, "hash", "status"],
             as_dict=True,
         )
         if not map_row or not map_row.get(LINK_FIELD):
@@ -342,6 +347,15 @@ def run_woo_amendment_job(
                 "status": "skipped",
                 "reason": "no_order_map",
                 "woo_order_id": woo_order_id,
+            }
+        # A retired duplicate links the REAL invoice; amending that invoice from
+        # the duplicate's lines would rewrite a delivered, paid order.
+        if is_retired_duplicate_row(map_row):
+            return {
+                "status": "skipped",
+                "reason": RETIRED_DUPLICATE_REASON,
+                "woo_order_id": woo_order_id,
+                "invoice": map_row.get(LINK_FIELD),
             }
 
         source_si_name = map_row[LINK_FIELD]

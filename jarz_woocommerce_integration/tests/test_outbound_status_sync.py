@@ -185,8 +185,21 @@ def _outbound_cfg():
     )
 
 
+def _grant_push_lock_sql(query, params=None, as_dict=False):
+    """`frappe.db.sql` stand-in for sync_sales_invoice's per-invoice push lock.
+
+    Grants GET_LOCK / RELEASE_LOCK and returns no rows for the fresh reads made
+    under the lock, so the push falls back to the in-memory invoice exactly as
+    it did before the lock existed. The lock itself is covered in
+    test_outbound_invoice_push_lock.
+    """
+    if "GET_LOCK" in query or "RELEASE_LOCK" in query:
+        return ((1,),)
+    return []
+
+
 def _db_stub(*, exists=None, get_value=None, set_value=None):
-    stub = SimpleNamespace()
+    stub = SimpleNamespace(sql=_grant_push_lock_sql)
     if exists is not None:
         stub.exists = exists if callable(exists) else (lambda *args, **kwargs: exists)
     if get_value is not None:
@@ -230,6 +243,7 @@ def _patch_common(monkeypatch, invoice, client, *, order_map_exists=True):
         SimpleNamespace(
             exists=lambda doctype, filters: order_map_exists,
             set_value=fake_set_value,
+            sql=_grant_push_lock_sql,
         ),
     )
     monkeypatch.setattr(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))

@@ -83,8 +83,18 @@ SKIP_REASON_TOKENS = (
     # the Woo lines (order_amendment). A correct no-op; unlisted it would fall
     # through to "review" and raise a NeedsReview for nothing.
     "items_already_match",
+    # An Order Map row retired as a duplicate (order_map_status). Inbound skips
+    # it on purpose. Must stay in this tuple: skip tokens are checked first, and
+    # the reason also contains "duplicate", a RETRY token, so unlisted every
+    # webhook for a retired order would be retried until it dead-lettered.
+    "retired_duplicate",
 )
 RETRYABLE_ORDER_REASONS = {"locked", "db_locked"}
+#: Retryable outbound details that must not trip the outbound circuit breaker:
+#: they describe contention between our own workers, not a failing store.
+#: Mirrors outbound_sync.INVOICE_PUSH_LOCKED_DETAIL (not imported: this module
+#: only imports outbound_sync lazily, inside the dispatcher).
+NON_BREAKER_RETRY_DETAILS = frozenset({"invoice_push_locked"})
 TERMINAL_STATUSES = {"Succeeded", "Skipped", "Superseded", "Failed", "NeedsReview", "DeadLetter"}
 ATTENTION_EVENT_STATUSES = {"Failed", "NeedsReview", "DeadLetter"}
 
@@ -1128,21 +1138,38 @@ def _claim_due_sync_events(
     now = now_datetime()
     worker_id = f"{_site_name()}:{uuid.uuid4().hex[:12]}"
     lock_until = now + timedelta(seconds=cfg.lock_ttl_seconds)
-    params: list[Any] = [now, now]
+    params: list[Any] = [now, now, now]
     sql = [
-        "SELECT name",
-        "FROM `tabWooCommerce Sync Event`",
-        "WHERE status IN ('Pending', 'RetryScheduled')",
-        "  AND (next_attempt_at IS NULL OR next_attempt_at <= %s)",
-        "  AND (locked_until IS NULL OR locked_until < %s)",
+        "SELECT ev.name",
+        "FROM `tabWooCommerce Sync Event` ev",
+        "WHERE ev.status IN ('Pending', 'RetryScheduled')",
+        "  AND (ev.next_attempt_at IS NULL OR ev.next_attempt_at <= %s)",
+        "  AND (ev.locked_until IS NULL OR ev.locked_until < %s)",
+        # One outbound push per object at a time. WOOEVT-865508 was claimed
+        # while 865505 was still pushing the same invoice, and both POSTed a
+        # new Woo order. A sibling held by a live lock defers this event; it is
+        # re-queued as soon as that sibling finishes (see
+        # _enqueue_next_outbound_sibling), or picked up by the next sweep.
+        # Not atomic on its own -- two claims in the same instant can both
+        # pass -- so the per-invoice advisory lock in sync_sales_invoice stays
+        # the real guard; this keeps workers from queueing up behind it.
+        "  AND NOT (ev.direction = 'Outbound' AND EXISTS (",
+        "    SELECT 1 FROM `tabWooCommerce Sync Event` busy",
+        "    WHERE busy.direction = 'Outbound'",
+        "      AND busy.object_type = ev.object_type",
+        "      AND busy.source_id = ev.source_id",
+        "      AND busy.name != ev.name",
+        "      AND busy.status = 'Processing'",
+        "      AND busy.locked_until >= %s",
+        "  ))",
     ]
     if event_name:
-        sql.append("  AND name = %s")
+        sql.append("  AND ev.name = %s")
         params.append(event_name)
     if not allow_outbound:
-        sql.append("  AND direction != 'Outbound'")
+        sql.append("  AND ev.direction != 'Outbound'")
     sql.extend([
-        "ORDER BY priority ASC, first_seen_on ASC",
+        "ORDER BY ev.priority ASC, ev.first_seen_on ASC",
         "LIMIT %s",
         "FOR UPDATE SKIP LOCKED",
     ])
@@ -1342,6 +1369,10 @@ def _dispatch_outbound_event(event_doc: Any, payload: dict[str, Any]) -> Any:
             reason=payload.get("reason") or "sync_event",
             force=bool(payload.get("force")),
             cancel=bool(payload.get("cancel")),
+            # The claim was committed before dispatch, so the only uncommitted
+            # work in this transaction is the push's own: it may commit around
+            # its critical section (fresh read under the lock, durable id).
+            own_transaction=True,
         )
     raise ValueError(f"Unsupported outbound object_type: {event_doc.object_type}")
 
@@ -1374,7 +1405,9 @@ def _apply_outbound_result(event_doc: Any, result: Any) -> dict[str, Any]:
             return _mark_skipped(event_doc, result, str(result.get("reason") or "skipped"))
         if result.get("status") == "error" or result.get("success") is False:
             detail = str(result.get("detail") or result.get("error") or result.get("reason") or "error")
-            if _classify_text_reason(detail) == "retry":
+            # Another worker pushing the same invoice is contention, not a sick
+            # store: retry it, but never let it count toward pausing ALL outbound.
+            if _classify_text_reason(detail) == "retry" and detail not in NON_BREAKER_RETRY_DETAILS:
                 _record_outbound_circuit_breaker_failure(detail)
             return _handle_failure(event_doc, result=result, detail=detail)
     return _mark_success(event_doc, result)
@@ -1430,6 +1463,7 @@ def _process_claimed_event(event_doc: Any) -> dict[str, Any]:
             result = _dispatch_inbound_event(event_doc, payload)
             outcome = _apply_inbound_result(event_doc, result)
         frappe.db.commit()
+        _enqueue_next_outbound_sibling(event_doc)
         return {"event_name": event_doc.name, **outcome}
     except Exception as exc:  # noqa: BLE001
         LOGGER.error({
@@ -1440,7 +1474,48 @@ def _process_claimed_event(event_doc: Any) -> dict[str, Any]:
         outcome = _handle_exception(event_doc, exc)
         event_doc.db_set({"traceback": frappe.get_traceback()}, update_modified=False)
         frappe.db.commit()
+        _enqueue_next_outbound_sibling(event_doc)
         return {"event_name": event_doc.name, **outcome}
+
+
+def _enqueue_next_outbound_sibling(event_doc: Any) -> None:
+    """Queue the next due outbound event for the same object, now that we are done.
+
+    `_claim_due_sync_events` defers an outbound event while a sibling for the
+    same object is Processing. Its own RQ job has usually already run and given
+    up by then ("not_due_or_already_claimed"), so without this nudge it would
+    wait for the next `process_due_sync_events` sweep. Best effort: the sweep
+    remains the backstop.
+    """
+    if getattr(event_doc, "direction", None) != "Outbound":
+        return
+    try:
+        now = now_datetime()
+        rows = frappe.db.sql(
+            """
+            SELECT name
+            FROM `tabWooCommerce Sync Event`
+            WHERE direction = 'Outbound'
+              AND object_type = %s
+              AND source_id = %s
+              AND name != %s
+              AND status IN ('Pending', 'RetryScheduled')
+              AND (next_attempt_at IS NULL OR next_attempt_at <= %s)
+              AND (locked_until IS NULL OR locked_until < %s)
+            ORDER BY priority ASC, first_seen_on ASC
+            LIMIT 1
+            """,
+            (event_doc.object_type, event_doc.source_id, event_doc.name, now, now),
+            as_dict=True,
+        )
+        if rows:
+            enqueue_sync_event(rows[0]["name"], after_commit=False)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_sync_event_sibling_enqueue_failed",
+            "event_name": getattr(event_doc, "name", None),
+            "error": str(exc),
+        })
 
 
 def process_sync_event(event_name: str) -> dict[str, Any]:

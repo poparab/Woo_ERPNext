@@ -21,6 +21,12 @@ from jarz_woocommerce_integration.services.customer_sync import (
     _is_duplicate_key_error,
     _resolve_territory_from_state,
 )
+from jarz_woocommerce_integration.services.order_map_status import (
+    RETIRED_DUPLICATE_MAP_STATUS,
+    RETIRED_DUPLICATE_REASON,
+    is_retired_duplicate_row,
+    is_retired_duplicate_status,
+)
 
 
 DEFAULT_LIVE_ORDER_OVERLAP_MINUTES = 15
@@ -1714,6 +1720,10 @@ SKIPPED_SUCCESS_REASONS = {
     # processed correctly one connection over.
     "locked",
     "db_locked",
+    # The Order Map row was retired as a duplicate of another Woo order for the
+    # same invoice (order_map_status). Ignoring it is the point; counting it as
+    # a failure would have reconcile and the outbox retry it forever.
+    RETIRED_DUPLICATE_REASON,
 }
 
 
@@ -4945,12 +4955,16 @@ def _polled_order_is_unchanged(order: dict, *, territory_state_cache: dict | Non
         cols = frappe.db.get_table_columns("WooCommerce Order Map") or []
         if link_field not in cols and "sales_invoice" in cols:
             link_field = "sales_invoice"
-        fields = ["name", link_field, "hash"] + [
+        fields = ["name", link_field, "hash", "status"] + [
             f for f in ("woo_contact_hash", "woo_territory_hash") if f in cols
         ]
         existing_map = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": woo_id}, fields, as_dict=True)
         if not existing_map:
             return False
+        if is_retired_duplicate_row(existing_map):
+            # A retired duplicate is never processed, so an event for it is
+            # pure churn (process_order_phase1 would only skip it again).
+            return True
         return _order_unchanged_since_last_sync(
             order,
             existing_map,
@@ -5110,6 +5124,34 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 existing_map = {"name": nm, LINK_FIELD: None, "hash": None, "status": None}
         except Exception:
             existing_map = None
+
+    # A retired duplicate (an extra Woo order a racing outbound push created for
+    # an invoice that already has its real order) must never reach the code
+    # below: it links the REAL invoice, so a cancel/trash of the duplicate would
+    # cancel or relabel that invoice, and any write to the row would erase the
+    # marker. Return before the unchanged check, the SI lookup and every write.
+    if existing_map and is_retired_duplicate_row(existing_map):
+        create_sync_log_entry(
+            "InboundSkip",
+            "Skipped",
+            (
+                f"{RETIRED_DUPLICATE_REASON}: Woo order {woo_id} is a retired duplicate "
+                f"(Order Map {existing_map.get('name')}); it is not a real order and "
+                f"is never applied to {existing_map.get(LINK_FIELD) or 'the linked invoice'}."
+            ),
+            woo_order_id=woo_id,
+        )
+        return _unlock_order(
+            {
+                "status": "skipped",
+                "reason": RETIRED_DUPLICATE_REASON,
+                "success": True,
+                "woo_order_id": woo_id,
+                "order_map": existing_map.get("name"),
+            },
+            lock, db_lock_key, db_lock_acquired,
+        )
+
     order_hash = _compute_order_hash(order)
     contact_snapshot = _extract_order_contact_snapshot(order)
     territory_snapshot = _extract_order_territory_snapshot(
@@ -6716,9 +6758,13 @@ def pull_single_order_phase1(order_id: int | str, dry_run: bool = False, force: 
 
     # Prefer updating the existing invoice; only delete mapping if explicitly forced and no update allowed
     if force and not allow_update:
-        existing = frappe.db.get_value("WooCommerce Order Map", {"woo_order_id": order_id}, "name")
-        if existing:
-            frappe.delete_doc("WooCommerce Order Map", existing, force=1, ignore_permissions=True)
+        existing = frappe.db.get_value(
+            "WooCommerce Order Map", {"woo_order_id": order_id}, ["name", "status"], as_dict=True
+        )
+        # Deleting a retired duplicate's row would let this very pull import the
+        # cancelled duplicate as a new invoice. Keep it; phase 1 skips it.
+        if existing and existing.get("name") and not is_retired_duplicate_row(existing):
+            frappe.delete_doc("WooCommerce Order Map", existing["name"], force=1, ignore_permissions=True)
 
     if dry_run:
         status_map = _map_status(order.get("status"))
@@ -6768,11 +6814,19 @@ def refresh_order_contact_snapshot(order_id: int | str, *, dry_run: bool = False
     map_row = frappe.db.get_value(
         "WooCommerce Order Map",
         {"woo_order_id": woo_id},
-        ["name", link_field],
+        ["name", link_field, "status"],
         as_dict=True,
     )
     if not map_row:
         return {"status": "skipped", "reason": "not_mapped", "woo_order_id": woo_id}
+    if is_retired_duplicate_row(map_row):
+        # The duplicate's contact data must not be written onto the real invoice.
+        return {
+            "status": "skipped",
+            "reason": RETIRED_DUPLICATE_REASON,
+            "woo_order_id": woo_id,
+            "order_map": map_row.get("name"),
+        }
 
     invoice_name = map_row.get(link_field)
     if not invoice_name:
@@ -7232,6 +7286,13 @@ def reconcile_deleted_orders_cron():  # pragma: no cover - scheduler entry for d
         )
 
         for row in rows:
+            # A retired duplicate is cancelled/trashed on the store on purpose,
+            # and its row links the REAL invoice: acting on it would cancel or
+            # relabel a delivered, paid invoice. Filtered here rather than in the
+            # get_all filters because a `!=` filter drops rows whose status is
+            # NULL on some Frappe query paths, and those are live orders.
+            if is_retired_duplicate_status(row.get("status")):
+                continue
             woo_id = int(row.get("woo_order_id") or 0)
             invoice_name = str(row.get("erpnext_sales_invoice") or "")
             if not woo_id or not invoice_name:
@@ -7782,9 +7843,12 @@ def _batch_create_payment_entries(
               AND IFNULL(si.outstanding_amount, 0) > 0
               AND si.woo_order_id IS NOT NULL
               AND wm.status IN ({placeholders})
+              AND IFNULL(wm.status, '') != %s
             ORDER BY si.posting_date ASC, si.name ASC
             """,
-            tuple(status_list),
+            # Retired duplicates link the real invoice; their status must never
+            # drive a payment on it (and would double-list the invoice).
+            tuple(status_list) + (RETIRED_DUPLICATE_MAP_STATUS,),
             as_dict=True,
         )
     except Exception as fetch_err:

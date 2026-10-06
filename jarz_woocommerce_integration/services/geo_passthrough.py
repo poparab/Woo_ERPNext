@@ -77,6 +77,7 @@ import frappe
 from jarz_woocommerce_integration.doctype.woocommerce_settings.woocommerce_settings import (
     WooCommerceSettings,
 )
+from jarz_woocommerce_integration.services.order_map_status import is_retired_duplicate_row
 from jarz_woocommerce_integration.utils.http_client import WooClient
 
 LOGGER = frappe.logger("jarz_woocommerce.geo")
@@ -651,11 +652,16 @@ def resolve_invoice_addresses(woo_order_id: Any) -> tuple[Optional[str], Optiona
     """``(sales_invoice, customer_address, shipping_address_name)`` for a Woo id."""
     link_field = _order_map_link_field()
     try:
-        invoice = frappe.db.get_value(
-            "WooCommerce Order Map", {"woo_order_id": woo_order_id}, link_field
+        map_row = frappe.db.get_value(
+            "WooCommerce Order Map", {"woo_order_id": woo_order_id}, [link_field, "status"], as_dict=True
         )
     except Exception:  # noqa: BLE001
-        invoice = None
+        map_row = None
+    invoice = None
+    # A retired duplicate links the REAL invoice; never pin its addresses from
+    # the duplicate order.
+    if isinstance(map_row, dict) and not is_retired_duplicate_row(map_row):
+        invoice = map_row.get(link_field)
     if not invoice:
         return None, None, None
     try:
