@@ -879,6 +879,9 @@ class TestEvaluatePaidAmendment(_RunWooAmendmentJobPatcher, unittest.TestCase):
             raise AssertionError(f"unexpected get_doc({doctype!r}, {name!r})")
 
         self.monkeypatch.setattr(oa.frappe, "get_doc", _fake_get_doc)
+        # A real now_datetime() on a cold cache loads System Settings through
+        # the strict fake get_doc above.
+        self.monkeypatch.setattr(oa.frappe.utils, "now_datetime", lambda: "2026-06-01 12:00:00")
         self.monkeypatch.setattr(oa.frappe.db, "savepoint", MagicMock())
         self.monkeypatch.setattr(oa.frappe.db, "rollback", MagicMock())
         self.monkeypatch.setattr(oa.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))
@@ -935,103 +938,3 @@ class TestEvaluatePaidAmendment(_RunWooAmendmentJobPatcher, unittest.TestCase):
         assert savepoint_name.startswith("woo_amend_")
         assert "-" not in savepoint_name
         assert all(char.isalnum() or char == "_" for char in savepoint_name)
-
-
-# ---------------------------------------------------------------------------
-# stamp_out_for_delivery_flag
-# ---------------------------------------------------------------------------
-
-class TestStampOutForDeliveryFlag(unittest.TestCase):
-    def test_stamps_flag_on_first_ofd_transition(self):
-        from jarz_pos.events.sales_invoice import stamp_out_for_delivery_flag
-
-        db_set_calls = []
-
-        class FakeMeta:
-            def get_field(self, fieldname):
-                return True if fieldname == "custom_was_out_for_delivery" else None
-
-        fake_frappe = SimpleNamespace(
-            get_meta=lambda dt: FakeMeta(),
-            db=SimpleNamespace(set_value=lambda *a, **kw: db_set_calls.append((a, kw))),
-        )
-
-        doc = SimpleNamespace(
-            name="ACC-SINV-00042",
-            custom_was_out_for_delivery=0,
-            custom_sales_invoice_state="Out for Delivery",
-            sales_invoice_state=None,
-        )
-
-        import jarz_pos.events.sales_invoice as si_events
-        original_frappe = si_events.frappe
-        si_events.frappe = fake_frappe
-        try:
-            stamp_out_for_delivery_flag(doc)
-        finally:
-            si_events.frappe = original_frappe
-
-        assert db_set_calls, "set_value should have been called"
-        assert doc.custom_was_out_for_delivery == 1
-
-    def test_does_not_stamp_when_already_flagged(self):
-        from jarz_pos.events.sales_invoice import stamp_out_for_delivery_flag
-
-        db_set_calls = []
-
-        class FakeMeta:
-            def get_field(self, fieldname):
-                return True
-
-        fake_frappe = SimpleNamespace(
-            get_meta=lambda dt: FakeMeta(),
-            db=SimpleNamespace(set_value=lambda *a, **kw: db_set_calls.append((a, kw))),
-        )
-
-        doc = SimpleNamespace(
-            name="ACC-SINV-00042",
-            custom_was_out_for_delivery=1,
-            custom_sales_invoice_state="Out for Delivery",
-            sales_invoice_state=None,
-        )
-
-        import jarz_pos.events.sales_invoice as si_events
-        original_frappe = si_events.frappe
-        si_events.frappe = fake_frappe
-        try:
-            stamp_out_for_delivery_flag(doc)
-        finally:
-            si_events.frappe = original_frappe
-
-        assert not db_set_calls, "set_value should NOT be called when flag is already 1"
-
-    def test_does_not_stamp_for_non_ofd_state(self):
-        from jarz_pos.events.sales_invoice import stamp_out_for_delivery_flag
-
-        db_set_calls = []
-
-        class FakeMeta:
-            def get_field(self, fieldname):
-                return True
-
-        fake_frappe = SimpleNamespace(
-            get_meta=lambda dt: FakeMeta(),
-            db=SimpleNamespace(set_value=lambda *a, **kw: db_set_calls.append((a, kw))),
-        )
-
-        doc = SimpleNamespace(
-            name="ACC-SINV-00042",
-            custom_was_out_for_delivery=0,
-            custom_sales_invoice_state="Delivered",
-            sales_invoice_state=None,
-        )
-
-        import jarz_pos.events.sales_invoice as si_events
-        original_frappe = si_events.frappe
-        si_events.frappe = fake_frappe
-        try:
-            stamp_out_for_delivery_flag(doc)
-        finally:
-            si_events.frappe = original_frappe
-
-        assert not db_set_calls

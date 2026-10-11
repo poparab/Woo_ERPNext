@@ -604,6 +604,9 @@ class TestOrderSyncRecovery(unittest.TestCase):
         self.monkeypatch.setattr(order_sync.frappe.db, "set_value", lambda *args, **kwargs: writes.append((args, kwargs)))
         self.monkeypatch.setattr(order_sync.frappe.db, "commit", lambda: writes.append("commit"))
         self.monkeypatch.setattr(order_sync.frappe.db, "get_table_columns", lambda doctype: ["erpnext_sales_invoice"])
+        # The snapshot stamps synced_on; a real now_datetime() reads the System
+        # Settings timezone through the fake get_value above when the cache is cold.
+        self.monkeypatch.setattr(order_sync.frappe.utils, "now_datetime", lambda: "2026-06-01 12:00:00")
 
         result = order_sync.refresh_order_contact_snapshot("14505", dry_run=True)
 

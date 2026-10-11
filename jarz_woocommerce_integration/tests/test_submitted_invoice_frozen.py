@@ -96,6 +96,14 @@ def _make_settings():
     )
 
 
+# Sales Invoice custom fields the code under test probes with get_meta().get_field.
+_INVOICE_FIELDS = frozenset({
+    "custom_cancellation_type",
+    "custom_cancellation_reason",
+    "custom_was_out_for_delivery",
+})
+
+
 def _setup_common_mocks(
     monkeypatch,
     *,
@@ -231,9 +239,25 @@ def _setup_common_mocks(
 
     monkeypatch.setattr(order_sync.frappe, "get_doc", _fake_get_doc)
 
-    monkeypatch.setattr(order_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False))
+    # A real frappe._dict, not a SimpleNamespace: frappe's own code on these paths
+    # (msgprint, db.set_value, rollback) reads flags that a bare namespace lacks.
+    monkeypatch.setattr(order_sync.frappe, "flags", order_sync.frappe._dict(ignore_woo_outbound=False))
+    # db.sql is stubbed to [] above, so a real get_meta cannot load any DocType.
+    monkeypatch.setattr(
+        order_sync.frappe,
+        "get_meta",
+        lambda doctype, *a, **kw: SimpleNamespace(get_field=lambda fieldname: fieldname in _INVOICE_FIELDS),
+    )
+    monkeypatch.setattr(order_sync.frappe.db, "set_value", lambda *a, **kw: None)
+    monkeypatch.setattr(order_sync.frappe.db, "rollback", lambda *a, **kw: None)
+    monkeypatch.setattr(order_sync.frappe, "log_error", lambda *a, **kw: None)
     monkeypatch.setattr(order_sync.frappe.db, "commit", lambda: None)
     monkeypatch.setattr(order_sync.frappe.utils, "now_datetime", lambda: "2026-05-12 12:00:00")
+    # today()/nowdate() call frappe.utils.data.now_datetime directly, which on a
+    # cold cache loads System Settings through the fake get_doc above and then
+    # fails to pickle the MagicMock it gets back into redis.
+    monkeypatch.setattr(order_sync.frappe.utils, "today", lambda: "2026-05-12")
+    monkeypatch.setattr(order_sync.frappe.utils, "nowdate", lambda: "2026-05-12")
 
     monkeypatch.setattr(
         order_sync,
