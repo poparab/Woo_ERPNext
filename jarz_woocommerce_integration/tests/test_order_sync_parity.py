@@ -640,7 +640,10 @@ class TestInboundOrderNotes(ParityTestCase):
             True,
         )
 
-    def test_customer_note_already_in_remarks_is_not_duplicated(self):
+    def test_create_time_customer_note_is_materialised(self):
+        # remarks already holds the note, but the POS app never shows remarks —
+        # the note must still become a row the app does show.
+        created = []
         self.patch_attr(
             order_sync,
             "frappe",
@@ -649,12 +652,71 @@ class TestInboundOrderNotes(ParityTestCase):
         self.patch_attr(
             order_sync,
             "_materialize_invoice_note",
-            lambda *a, **k: self.fail("must not duplicate the create-path remarks"),
+            lambda invoice_name, body, *, marker, author=None: created.append(marker) or True,
         )
 
         self.assertEqual(
             order_sync._materialize_changed_customer_note(
                 {"customer_note": "Please call on arrival"}, "ACC-SINV-0010"
+            ),
+            1,
+        )
+
+    def test_same_note_keys_identically_and_an_edit_keys_differently(self):
+        markers = []
+        self.patch_attr(
+            order_sync,
+            "_materialize_invoice_note",
+            lambda invoice_name, body, *, marker, author=None: markers.append(marker) or True,
+        )
+        for text in ("Call on arrival", "Call on arrival", "Leave it with the doorman"):
+            order_sync._materialize_changed_customer_note({"customer_note": text}, "ACC-SINV-0012")
+
+        self.assertEqual(markers[0], markers[1])
+        self.assertNotEqual(markers[0], markers[2])
+
+    def test_unchanged_order_still_mirrors_an_edited_note(self):
+        calls = []
+        self.patch_attr(order_sync, "_invoice_note_doctype_available", lambda: True)
+        self.patch_attr(
+            order_sync,
+            "_materialize_changed_customer_note",
+            lambda order, invoice: calls.append((order["customer_note"], invoice)) or 1,
+        )
+        settings = SimpleNamespace(enable_inbound_order_notes=1)
+
+        self.assertEqual(
+            order_sync._mirror_customer_note_on_unchanged_order(
+                {"customer_note": "Leave it with the doorman"}, "ACC-SINV-0013", settings=settings
+            ),
+            1,
+        )
+        self.assertEqual(calls, [("Leave it with the doorman", "ACC-SINV-0013")])
+
+    def test_unchanged_order_without_note_or_invoice_does_nothing(self):
+        self.patch_attr(
+            order_sync,
+            "_materialize_changed_customer_note",
+            lambda *a, **k: self.fail("nothing to mirror"),
+        )
+        settings = SimpleNamespace(enable_inbound_order_notes=1)
+        for order, invoice in (({"customer_note": "  "}, "ACC-SINV-0014"), ({"customer_note": "x"}, None)):
+            with self.subTest(order=order, invoice=invoice):
+                self.assertEqual(
+                    order_sync._mirror_customer_note_on_unchanged_order(order, invoice, settings=settings),
+                    0,
+                )
+
+    def test_unchanged_order_respects_the_notes_switch(self):
+        self.patch_attr(
+            order_sync,
+            "_materialize_changed_customer_note",
+            lambda *a, **k: self.fail("switch is off"),
+        )
+        self.assertEqual(
+            order_sync._mirror_customer_note_on_unchanged_order(
+                {"customer_note": "x"}, "ACC-SINV-0015",
+                settings=SimpleNamespace(enable_inbound_order_notes=0),
             ),
             0,
         )

@@ -4342,8 +4342,8 @@ def sync_woo_order_notes(
     * notes this integration pushed OUT are skipped (see :func:`_woo_note_is_ours`);
     * WooCommerce's own "system" notes (status-change logs) are skipped — ERPNext
       already knows the status and they would drown the real messages;
-    * a changed ``customer_note`` is materialised too, unless it is still the text
-      already sitting in ``remarks`` from the create path;
+    * the ``customer_note`` is materialised too, once per distinct text — the
+      create-time note and every later edit;
     * degrades quietly-but-logged when jarz_pos (and therefore the DocType) is not
       installed.
     """
@@ -4483,23 +4483,19 @@ def enqueue_woo_order_note_sync(order: dict, invoice_name: str, *, settings: Any
 
 
 def _materialize_changed_customer_note(order: dict, invoice_name: str) -> int:
-    """Mirror ``customer_note`` when it no longer matches what is in ``remarks``.
+    """Mirror the order's current ``customer_note`` as a Jarz Invoice Note.
 
-    On CREATE the customer note is copied into ``remarks``; a note added or edited
-    on the website after that never reached ERPNext at all, because the submitted
-    invoice is frozen and nothing re-reads the field. Materialising the change as
-    a note row keeps the invoice untouched (no GL, no re-save) while still putting
-    the text in front of whoever is fulfilling the order.
+    The checkout note is copied into ``remarks`` on CREATE too, but the POS app
+    never shows ``remarks`` — only note rows reach the people fulfilling the
+    order. So every note becomes a row, the create-time one included, and an
+    edit made on the website later becomes a further row with the new text.
+    Keyed on a digest of the text, so re-polling the same note is a no-op and
+    only a genuinely different note adds a row. The invoice itself is never
+    touched (no GL, no re-save).
     """
     customer_note = str(order.get("customer_note") or "").strip()
     if not customer_note:
         return 0
-    try:
-        remarks = str(frappe.db.get_value("Sales Invoice", invoice_name, "remarks") or "")
-    except Exception:  # noqa: BLE001
-        remarks = ""
-    if customer_note in remarks:
-        return 0  # already on the invoice from the create path — not a change
 
     import hashlib
 
@@ -4507,6 +4503,29 @@ def _materialize_changed_customer_note(order: dict, invoice_name: str) -> int:
     marker = f"{WOO_CUSTOMER_NOTE_MARKER}({digest})"
     stored = f"{customer_note[:900]}\n\n{marker}"
     return 1 if _materialize_invoice_note(invoice_name, stored, marker=marker, author="WooCommerce") else 0
+
+
+def _mirror_customer_note_on_unchanged_order(order: dict, invoice_name: str | None, *, settings: Any) -> int:
+    """Catch a customer-note edit on an order the sync otherwise considers unchanged.
+
+    ``customer_note`` is not part of the order hash, so a note added or edited
+    on the website lands on the "unchanged" fast path, which never queues the
+    note sync. This is a local check only (no Woo call): one dedupe lookup when
+    the order carries a note, nothing at all when it does not. Never raises.
+    """
+    if not invoice_name or not str((order or {}).get("customer_note") or "").strip():
+        return 0
+    try:
+        if not _inbound_order_notes_enabled(settings) or not _invoice_note_doctype_available():
+            return 0
+        return _materialize_changed_customer_note(order, invoice_name)
+    except Exception:  # noqa: BLE001
+        _log_throttled_error(
+            key="customer_note_unchanged_path_failed",
+            title="Woo: could not mirror an edited customer note",
+            message=frappe.get_traceback(),
+        )
+        return 0
 
 
 def _check_and_repair_submitted_invoice_drift(inv, woo_id, territory_name=None, pos_profile=None, default_warehouse=None):
@@ -5264,6 +5283,11 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
         # snapshot and, when the pin genuinely moved, the Address. Geo-only DB
         # writes: no hooks, no outbound push. Never raises.
         _refresh_linked_invoice_pins(order, (existing_map or {}).get(LINK_FIELD), woo_id=woo_id)
+        # Same story for the customer note: it is outside the hash too.
+        if not is_historical:
+            _mirror_customer_note_on_unchanged_order(
+                order, (existing_map or {}).get(LINK_FIELD), settings=settings
+            )
         return _unlock_order({"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
 
     # Hard idempotency: if a live Sales Invoice already exists with this woo_order_id, use it.
