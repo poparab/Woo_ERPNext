@@ -175,6 +175,12 @@ doc_events = {
 		],
 	},
 	"Sales Invoice": {
+		# ERPNext re-fetches customer_name from the Customer (billing name) on
+		# every save; keep the Woo order's shipping name. See
+		# services/invoice_display_name.py.
+		"validate": "jarz_woocommerce_integration.services.invoice_display_name.keep_woo_display_name",
+		"before_update_after_submit": "jarz_woocommerce_integration.services.invoice_display_name.keep_woo_display_name",
+		"before_cancel": "jarz_woocommerce_integration.services.invoice_display_name.keep_woo_display_name",
 		"on_submit": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
 		"on_update_after_submit": [
 			"jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_sync",
