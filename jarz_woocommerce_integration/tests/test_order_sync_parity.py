@@ -652,7 +652,8 @@ class TestInboundOrderNotes(ParityTestCase):
         self.patch_attr(
             order_sync,
             "_materialize_invoice_note",
-            lambda invoice_name, body, *, marker, author=None: created.append(marker) or True,
+            lambda invoice_name, body, *, marker, author=None, match_full_text=False: created.append(marker)
+            or True,
         )
 
         self.assertEqual(
@@ -662,18 +663,64 @@ class TestInboundOrderNotes(ParityTestCase):
             1,
         )
 
-    def test_same_note_keys_identically_and_an_edit_keys_differently(self):
-        markers = []
+    def test_customer_note_row_is_keyed_on_its_full_text_without_a_digest(self):
+        calls = []
         self.patch_attr(
             order_sync,
             "_materialize_invoice_note",
-            lambda invoice_name, body, *, marker, author=None: markers.append(marker) or True,
+            lambda invoice_name, body, **kwargs: calls.append((body, kwargs)) or True,
         )
-        for text in ("Call on arrival", "Call on arrival", "Leave it with the doorman"):
-            order_sync._materialize_changed_customer_note({"customer_note": text}, "ACC-SINV-0012")
+        order_sync._materialize_changed_customer_note({"customer_note": "Call on arrival"}, "ACC-SINV-0012")
 
-        self.assertEqual(markers[0], markers[1])
-        self.assertNotEqual(markers[0], markers[2])
+        body, kwargs = calls[0]
+        self.assertEqual(body, "Call on arrival\n\n— WooCommerce customer note")
+        self.assertTrue(kwargs["match_full_text"])
+        self.assertEqual(kwargs["marker"], order_sync.WOO_CUSTOMER_NOTE_MARKER)
+
+    def test_invoice_has_note_text_matches_same_and_legacy_rows_only(self):
+        stored = [
+            "Call on arrival\r\n\r\n— WooCommerce customer note",
+            "Ring twice\n\n— WooCommerce customer note (b9df781f297f)",
+        ]
+        self.patch_attr(
+            order_sync,
+            "frappe",
+            SimpleNamespace(get_all=lambda *a, **k: list(stored)),
+        )
+        has = lambda text: order_sync._invoice_has_note_text(  # noqa: E731
+            "ACC-SINV-0012", f"{text}\n\n— WooCommerce customer note", marker="x"
+        )
+
+        self.assertTrue(has("Call on arrival"))
+        self.assertTrue(has("Ring twice"))  # legacy digest row still counts
+        self.assertFalse(has("Leave it with the doorman"))  # an edit adds a row
+        self.assertFalse(has("call on arrival"))  # case-only edit too
+
+    def test_strip_customer_note_digest_patch_rewrites_only_legacy_rows(self):
+        from jarz_woocommerce_integration.patches import strip_customer_note_digest as patch
+
+        writes = []
+        rows = [
+            SimpleNamespace(name="JIN-1", note="Ring twice\n\n— WooCommerce customer note (b9df781f297f)"),
+            SimpleNamespace(name="JIN-2", note="Ring twice\n\n— WooCommerce customer note"),
+        ]
+        self.patch_attr(
+            patch,
+            "frappe",
+            SimpleNamespace(
+                db=SimpleNamespace(
+                    exists=lambda *a, **k: True,
+                    set_value=lambda doctype, name, field, value, **k: writes.append((name, value, k)),
+                ),
+                get_all=lambda *a, **k: rows,
+            ),
+        )
+        patch.execute()
+
+        self.assertEqual(
+            writes,
+            [("JIN-1", "Ring twice\n\n— WooCommerce customer note", {"update_modified": False})],
+        )
 
     def test_unchanged_order_still_mirrors_an_edited_note(self):
         calls = []
@@ -731,7 +778,9 @@ class TestInboundOrderNotes(ParityTestCase):
         self.patch_attr(
             order_sync,
             "_materialize_invoice_note",
-            lambda invoice_name, body, *, marker, author=None: created.append((body, marker))
+            lambda invoice_name, body, *, marker, author=None, match_full_text=False: created.append(
+                (body, marker)
+            )
             or True,
         )
 
@@ -742,7 +791,7 @@ class TestInboundOrderNotes(ParityTestCase):
         self.assertEqual(count, 1)
         body, marker = created[0]
         self.assertTrue(body.startswith("Changed my mind"))
-        self.assertTrue(marker.startswith(order_sync.WOO_CUSTOMER_NOTE_MARKER))
+        self.assertEqual(marker, order_sync.WOO_CUSTOMER_NOTE_MARKER)
         self.assertTrue(body.endswith(marker))
 
 

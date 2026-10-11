@@ -110,7 +110,14 @@ _INVOICE_NOTE_DOCTYPE = "Jarz Invoice Note"
 #: ``outbound_sync.sync_invoice_note``'s own "(Jarz POS)" signature, which we skip
 #: on the way in.
 WOO_ORDER_NOTE_MARKER = "— WooCommerce order note #"
-WOO_CUSTOMER_NOTE_MARKER = "— WooCommerce customer note "
+#: Trailer on a checkout customer note. Staff read it, so it carries no machine
+#: key: a customer note has no Woo id, and the row is matched on its full text
+#: instead (see ``_invoice_has_note_text``).
+WOO_CUSTOMER_NOTE_MARKER = "— WooCommerce customer note"
+#: The first shape (8d6f567) appended a sha1 digest to the trailer — noise on
+#: the staff's card. Rows in that shape still count as already-materialised, and
+#: ``patches/strip_customer_note_digest`` removes the digest from them.
+_LEGACY_CUSTOMER_NOTE_DIGEST = re.compile(r"(— WooCommerce customer note) \([0-9a-f]{12}\)\s*$")
 POS_OUTBOUND_NOTE_SIGNATURE = "(Jarz POS)"
 
 #: Note bodies this app writes OUTBOUND that carry neither signature below,
@@ -4265,16 +4272,53 @@ def _invoice_note_doctype_available() -> bool:
         return False
 
 
-def _materialize_invoice_note(invoice_name: str, body: str, *, marker: str, author: str | None = None) -> bool:
+def _clean_invoice_note_text(value: Any) -> str:
+    """The normalisation ``JarzInvoiceNote.validate`` applies before saving."""
+    raw = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    return "\n".join(line.rstrip() for line in raw.split("\n")).strip()
+
+
+def _invoice_has_note_text(invoice_name: str, body: str, *, marker: str) -> bool:
+    """True when the invoice already holds a note with exactly this text.
+
+    Compared in Python, not with SQL ``=``: the column collation ignores case and
+    a customer's edit may differ only in that. A legacy row's digest is dropped
+    before comparing, so it still counts as the same note.
+    """
+    target = _clean_invoice_note_text(body)
+    rows = frappe.get_all(
+        _INVOICE_NOTE_DOCTYPE,
+        filters={"sales_invoice": invoice_name, "note": ["like", f"%{marker}%"]},
+        pluck="note",
+        limit=500,
+    )
+    return any(
+        _LEGACY_CUSTOMER_NOTE_DIGEST.sub(r"\1", _clean_invoice_note_text(row)) == target
+        for row in rows
+    )
+
+
+def _materialize_invoice_note(
+    invoice_name: str,
+    body: str,
+    *,
+    marker: str,
+    author: str | None = None,
+    match_full_text: bool = False,
+) -> bool:
     """Create one Jarz Invoice Note, idempotently. Returns True when inserted.
 
-    Idempotency is keyed on ``marker`` — the Woo note id (or a digest of the
-    customer note) embedded in the stored text. There is no field on that DocType
-    to hold a Woo id and this app must not add one to another app's DocType, so
-    the key lives in the note body where it is also human-readable.
+    Idempotency is keyed on ``marker`` — the Woo note id embedded in the stored
+    text. There is no field on that DocType to hold a Woo id and this app must
+    not add one to another app's DocType, so the key lives in the note body where
+    it is also human-readable. A customer note has no id: with
+    ``match_full_text`` the key is the whole body instead.
     """
     try:
-        if frappe.db.exists(
+        if match_full_text:
+            if _invoice_has_note_text(invoice_name, body, marker=marker):
+                return False
+        elif frappe.db.exists(
             _INVOICE_NOTE_DOCTYPE,
             {"sales_invoice": invoice_name, "note": ["like", f"%{marker}%"]},
         ):
@@ -4489,20 +4533,26 @@ def _materialize_changed_customer_note(order: dict, invoice_name: str) -> int:
     never shows ``remarks`` — only note rows reach the people fulfilling the
     order. So every note becomes a row, the create-time one included, and an
     edit made on the website later becomes a further row with the new text.
-    Keyed on a digest of the text, so re-polling the same note is a no-op and
-    only a genuinely different note adds a row. The invoice itself is never
-    touched (no GL, no re-save).
+    Keyed on the full text, so re-polling the same note is a no-op and only a
+    genuinely different note adds a row. The invoice itself is never touched
+    (no GL, no re-save).
     """
     customer_note = str(order.get("customer_note") or "").strip()
     if not customer_note:
         return 0
 
-    import hashlib
-
-    digest = hashlib.sha1(customer_note.encode("utf-8")).hexdigest()[:12]
-    marker = f"{WOO_CUSTOMER_NOTE_MARKER}({digest})"
-    stored = f"{customer_note[:900]}\n\n{marker}"
-    return 1 if _materialize_invoice_note(invoice_name, stored, marker=marker, author="WooCommerce") else 0
+    stored = f"{customer_note[:900]}\n\n{WOO_CUSTOMER_NOTE_MARKER}"
+    return (
+        1
+        if _materialize_invoice_note(
+            invoice_name,
+            stored,
+            marker=WOO_CUSTOMER_NOTE_MARKER,
+            author="WooCommerce",
+            match_full_text=True,
+        )
+        else 0
+    )
 
 
 def _mirror_customer_note_on_unchanged_order(order: dict, invoice_name: str | None, *, settings: Any) -> int:
