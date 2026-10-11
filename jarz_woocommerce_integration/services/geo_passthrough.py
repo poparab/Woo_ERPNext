@@ -394,7 +394,7 @@ def _droppin_source_label(meta: dict[str, Any]) -> str:
     raw = str(_first_present(meta, _DPN_PIN_SOURCE_KEYS) or "").strip().lower()
     if not raw:
         return PIN_SOURCE_DROPPIN_DEFAULT
-    return raw[:140]
+    return raw[:140].strip()
 
 
 def _order_meta_pin(
