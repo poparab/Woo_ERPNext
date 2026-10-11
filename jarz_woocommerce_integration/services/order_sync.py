@@ -21,6 +21,7 @@ from jarz_woocommerce_integration.services.customer_sync import (
     _is_duplicate_key_error,
     _resolve_territory_from_state,
 )
+from jarz_woocommerce_integration.services import geo_passthrough as _geo_passthrough
 from jarz_woocommerce_integration.services.order_map_status import (
     RETIRED_DUPLICATE_MAP_STATUS,
     RETIRED_DUPLICATE_REASON,
@@ -4966,6 +4967,44 @@ def _order_unchanged_since_last_sync(
     )
 
 
+def _apply_invoice_pin_snapshot_safely(order: dict, invoice_name: str | None, *, woo_id: Any = None) -> bool:
+    """Freeze this order's delivery pin onto its invoice. Never raises."""
+    if not invoice_name:
+        return False
+    try:
+        return bool(_geo_passthrough.apply_invoice_pin_snapshot(order, invoice_name))
+    except Exception as exc:  # noqa: BLE001 - geo is never worth an order
+        try:
+            frappe.logger("jarz_woocommerce.geo").warning({
+                "event": "woo_delivery_pin_snapshot_call_failed",
+                "woo_order_id": woo_id,
+                "invoice": invoice_name,
+                "error": str(exc),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
+def _refresh_linked_invoice_pins(order: dict, invoice_name: str | None, *, woo_id: Any = None) -> dict:
+    """Unchanged-branch pin refresh (snapshot + Address on a real edit). Never raises."""
+    if not invoice_name:
+        return {"snapshot_written": False, "address_refreshed": False}
+    try:
+        return _geo_passthrough.refresh_invoice_pins(order, invoice_name)
+    except Exception as exc:  # noqa: BLE001
+        try:
+            frappe.logger("jarz_woocommerce.geo").warning({
+                "event": "woo_invoice_pin_refresh_call_failed",
+                "woo_order_id": woo_id,
+                "invoice": invoice_name,
+                "error": str(exc),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        return {"snapshot_written": False, "address_refreshed": False}
+
+
 def _polled_order_is_unchanged(order: dict, *, territory_state_cache: dict | None = None) -> bool:
     """Cheap pre-check for the order poll: would processing this order be a no-op?
 
@@ -4996,7 +5035,7 @@ def _polled_order_is_unchanged(order: dict, *, territory_state_cache: dict | Non
             # A retired duplicate is never processed, so an event for it is
             # pure churn (process_order_phase1 would only skip it again).
             return True
-        return _order_unchanged_since_last_sync(
+        unchanged = _order_unchanged_since_last_sync(
             order,
             existing_map,
             link_field=link_field,
@@ -5004,6 +5043,18 @@ def _polled_order_is_unchanged(order: dict, *, territory_state_cache: dict | Non
             contact_snapshot=_extract_order_contact_snapshot(order),
             territory_snapshot=_extract_order_territory_snapshot(order, territory_state_cache=territory_state_cache),
         )
+        if not unchanged:
+            return False
+        # The order hash deliberately excludes meta (it must not churn on Woo's
+        # volatile meta), so a customer pin edited on Woo after the invoice
+        # exists is invisible to it. One indexed read compares the pin with the
+        # invoice's frozen snapshot; a difference lets the event through so
+        # process_order_phase1's unchanged branch can refresh it. Returns False
+        # (= "no difference") whenever the snapshot fields are missing, so this
+        # can never requeue the same order on every poll.
+        if _geo_passthrough.invoice_pin_snapshot_differs(order, existing_map.get(link_field)):
+            return False
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -5208,6 +5259,11 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
         contact_snapshot=contact_snapshot,
         territory_snapshot=territory_snapshot,
     ):
+        # A pin edited on Woo does not move the order hash (meta is excluded on
+        # purpose), so this is where it lands. Refresh the invoice's frozen pin
+        # snapshot and, when the pin genuinely moved, the Address. Geo-only DB
+        # writes: no hooks, no outbound push. Never raises.
+        _refresh_linked_invoice_pins(order, (existing_map or {}).get(LINK_FIELD), woo_id=woo_id)
         return _unlock_order({"status": "skipped", "reason": "unchanged", "woo_order_id": woo_id}, lock, db_lock_key, db_lock_acquired)
 
     # Hard idempotency: if a live Sales Invoice already exists with this woo_order_id, use it.
@@ -5661,6 +5717,13 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                 # and would silently undo a db_set made just before it — the same
                 # trap that once lost the cancellation labels.
                 _ensure_invoice_is_pos_flag(inv.name, woo_order_id=woo_id)
+
+                # Per-invoice delivery-pin snapshot: same class of write as the
+                # is_pos stamp (direct DB, no hooks, no ledger), and placed after
+                # the terminal branch for the same inv.cancel() reason. Every
+                # return below this point (OFD lock, frozen, amendment, review)
+                # therefore still records the order's current pin and flags.
+                _apply_invoice_pin_snapshot_safely(order, inv.name, woo_id=woo_id)
 
                 # --- OFD permanent hard-lock -----------------------------------------
                 # Once an invoice has ever reached "Out for Delivery", it may no longer
@@ -6345,6 +6408,13 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
         # submitted unpaid by design. See _neutralize_is_pos_before_document_write.
         if inv and inv.docstatus in (1, 2):
             _ensure_invoice_is_pos_flag(inv.name, woo_order_id=woo_id)
+
+        # --- Per-invoice delivery-pin snapshot ---------------------------------
+        # Created and updated invoices alike, drafts included. Written after the
+        # last document save/submit/cancel above so no in-memory doc overwrites
+        # it. Direct DB write: no hooks, no outbound push. Never raises.
+        if inv:
+            _apply_invoice_pin_snapshot_safely(order, inv.name, woo_id=woo_id)
 
         # --- Woo vs ERPNext price reconciliation (F-20) ----------------------
         # Report-only. ERPNext prices always win (see _build_invoice_items); this

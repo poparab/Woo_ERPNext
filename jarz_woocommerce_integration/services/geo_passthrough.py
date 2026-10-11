@@ -182,6 +182,20 @@ _LNG_LIMIT = 180.0
 _COORD_PRECISION = 6
 _COORD_EPSILON = 5e-7
 
+# Egypt bounding box. Every branch this store delivers from is in Egypt, so a
+# pin outside this box is never a usable delivery point -- it is a customer who
+# dropped the pin while abroad, a browser that geolocated a VPN exit, or a
+# prefill from a saved address in another country (a Paris pin was accepted on
+# staging before this existed). It is not discarded silently: the delivery-pin
+# path reports it as the ``outside_egypt`` flag so a human sees it.
+#
+# A latitude/longitude swap of a Cairo or Alexandria point (30,31 -> 31,30)
+# stays inside this box and cannot be detected here; nothing tries to.
+EGYPT_LAT_MIN = 22.0
+EGYPT_LAT_MAX = 32.0
+EGYPT_LNG_MIN = 24.5
+EGYPT_LNG_MAX = 37.0
+
 _MAPS_COORD_PATTERNS: tuple[re.Pattern[str], ...] = (
     # ?q=30.0444,31.2357 / ?query= / &ll= / &destination= / q=loc:30.04,31.23
     re.compile(
@@ -230,8 +244,12 @@ def _to_float(value: Any) -> Optional[float]:
     return number
 
 
-def make_pin(latitude: Any, longitude: Any) -> Optional[GeoPin]:
-    """Validate a coordinate pair, returning ``None`` for anything unusable."""
+def _make_world_pin(latitude: Any, longitude: Any) -> Optional[GeoPin]:
+    """Validate a coordinate pair anywhere on Earth (no Egypt check).
+
+    Only used to *detect* a pin that exists but is outside Egypt; such a pin is
+    never written anywhere as a coordinate.
+    """
     lat = _to_float(latitude)
     lng = _to_float(longitude)
     if lat is None or lng is None:
@@ -243,6 +261,33 @@ def make_pin(latitude: Any, longitude: Any) -> Optional[GeoPin]:
     if abs(lat) < _COORD_EPSILON and abs(lng) < _COORD_EPSILON:
         return None
     return GeoPin(round(lat, _COORD_PRECISION), round(lng, _COORD_PRECISION))
+
+
+def pin_in_egypt(pin: Optional[GeoPin]) -> bool:
+    """True when ``pin`` falls inside the Egypt bounding box."""
+    if pin is None:
+        return False
+    return (
+        EGYPT_LAT_MIN <= pin.latitude <= EGYPT_LAT_MAX
+        and EGYPT_LNG_MIN <= pin.longitude <= EGYPT_LNG_MAX
+    )
+
+
+def make_pin(latitude: Any, longitude: Any) -> Optional[GeoPin]:
+    """Validate a coordinate pair, returning ``None`` for anything unusable.
+
+    Usable means a real point inside Egypt: every downstream consumer (Address
+    geo fields, the invoice delivery snapshot, courier routing) needs a point a
+    rider can drive to.
+    """
+    pin = _make_world_pin(latitude, longitude)
+    if pin is None or not pin_in_egypt(pin):
+        return None
+    return pin
+
+
+def _pin_factory(egypt_only: bool):
+    return make_pin if egypt_only else _make_world_pin
 
 
 def _same_coordinate(left: Any, right: Optional[float]) -> bool:
@@ -257,14 +302,18 @@ def _same_coordinate(left: Any, right: Optional[float]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def parse_maps_link(text: Any) -> Optional[GeoPin]:
+def parse_maps_link(text: Any, *, egypt_only: bool = True) -> Optional[GeoPin]:
     """Pull a coordinate pair out of a Google Maps link (or bare "lat,lng").
 
     Short ``maps.app.goo.gl`` links carry no coordinates and resolving them needs
     a network round trip, so they return ``None`` rather than being followed.
+
+    ``egypt_only=False`` is for detection only (the ``outside_egypt`` flag); the
+    default keeps every caller that writes coordinates inside Egypt.
     """
     if not text:
         return None
+    factory = _pin_factory(egypt_only)
     raw = str(text)
     if len(raw) > 2000:
         raw = raw[:2000]
@@ -272,7 +321,7 @@ def parse_maps_link(text: Any) -> Optional[GeoPin]:
         match = pattern.search(raw)
         if not match:
             continue
-        pin = make_pin(match.group(1), match.group(2))
+        pin = factory(match.group(1), match.group(2))
         if pin:
             return pin
     return None
@@ -314,24 +363,86 @@ def _first_present(values: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
+def _first_present_key(values: dict[str, Any], keys: tuple[str, ...]) -> Optional[str]:
+    """Key whose value ``_first_present`` would return, or ``None``."""
+    for key in keys:
+        if key not in values:
+            continue
+        value = values[key]
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return key
+    return None
+
+
+# Pin-source labels written to ``Sales Invoice.custom_delivery_pin_source``.
+PIN_SOURCE_JARZ_CHECKOUT = "jarz_checkout"
+PIN_SOURCE_DROPPIN_DEFAULT = "droppin"
+PIN_SOURCE_MAPS_LINK = "maps_link"
+PIN_SOURCE_ADDRESS_COORDINATES = "address_coordinates"
+
+# DropPin's own provenance / coverage verdict keys (never read before).
+_DPN_PIN_SOURCE_KEYS = ("_dpn_pin_source", "dpn_pin_source")
+_DPN_AREA_STATUS_KEYS = ("_dpn_area_status", "dpn_area_status")
+_DPN_AREA_MISMATCH_KEYS = ("_dpn_area_mismatch", "dpn_area_mismatch")
+_TRUTHY_TOKENS = frozenset({"yes", "true", "1", "y", "on"})
+
+
+def _droppin_source_label(meta: dict[str, Any]) -> str:
+    raw = str(_first_present(meta, _DPN_PIN_SOURCE_KEYS) or "").strip().lower()
+    if not raw:
+        return PIN_SOURCE_DROPPIN_DEFAULT
+    return raw[:140]
+
+
+def _order_meta_pin(
+    meta: dict[str, Any], *, egypt_only: bool = True
+) -> tuple[Optional[GeoPin], str]:
+    """``(pin, source_label)`` for the order-level meta pin, or ``(None, "")``."""
+    if not meta:
+        return None, ""
+    factory = _pin_factory(egypt_only)
+    lat_key = _first_present_key(meta, _ORDER_LAT_META_KEYS)
+    pin = factory(
+        _first_present(meta, _ORDER_LAT_META_KEYS),
+        _first_present(meta, _ORDER_LNG_META_KEYS),
+    )
+    if pin:
+        if lat_key and "dpn" in lat_key:
+            return pin, _droppin_source_label(meta)
+        return pin, PIN_SOURCE_JARZ_CHECKOUT
+    for key in _ORDER_COMBINED_META_KEYS:
+        pin = parse_maps_link(meta.get(key), egypt_only=egypt_only)
+        if pin:
+            return pin, PIN_SOURCE_JARZ_CHECKOUT
+    return None, ""
+
+
 def extract_order_pin(order: Any) -> Optional[GeoPin]:
     """Return the explicit ``_jarz_lat``/``_jarz_lng`` pin from an order payload."""
     if not isinstance(order, dict):
         return None
     meta = _meta_value_map(order.get("meta_data"))
-    if not meta:
-        return None
-    pin = make_pin(
-        _first_present(meta, _ORDER_LAT_META_KEYS),
-        _first_present(meta, _ORDER_LNG_META_KEYS),
-    )
+    pin, _source = _order_meta_pin(meta, egypt_only=True)
+    return pin
+
+
+def _address_pin_with_source(
+    address_data: Any, *, egypt_only: bool = True
+) -> tuple[Optional[GeoPin], str]:
+    if not isinstance(address_data, dict):
+        return None, ""
+    factory = _pin_factory(egypt_only)
+    pin = factory(address_data.get("latitude"), address_data.get("longitude"))
     if pin:
-        return pin
-    for key in _ORDER_COMBINED_META_KEYS:
-        pin = parse_maps_link(meta.get(key))
+        return pin, PIN_SOURCE_ADDRESS_COORDINATES
+    for key in _WOO_ADDRESS_TEXT_KEYS:
+        pin = parse_maps_link(address_data.get(key), egypt_only=egypt_only)
         if pin:
-            return pin
-    return None
+            return pin, PIN_SOURCE_MAPS_LINK
+    return None, ""
 
 
 def extract_address_pin(address_data: Any) -> Optional[GeoPin]:
@@ -341,16 +452,8 @@ def extract_address_pin(address_data: Any) -> Optional[GeoPin]:
     valid input here -- its ``address_line2`` Maps link is ``pos_link``
     provenance, not ``customer_pin``.
     """
-    if not isinstance(address_data, dict):
-        return None
-    pin = make_pin(address_data.get("latitude"), address_data.get("longitude"))
-    if pin:
-        return pin
-    for key in _WOO_ADDRESS_TEXT_KEYS:
-        pin = parse_maps_link(address_data.get(key))
-        if pin:
-            return pin
-    return None
+    pin, _source = _address_pin_with_source(address_data, egypt_only=True)
+    return pin
 
 
 def _woo_address_has_text(data: Any) -> bool:
@@ -384,6 +487,98 @@ def resolve_order_pins(order: Any) -> tuple[Optional[GeoPin], Optional[GeoPin]]:
     billing_pin = (None if has_shipping else order_pin) or extract_address_pin(billing)
     shipping_pin = (order_pin if has_shipping else None) or extract_address_pin(shipping)
     return billing_pin, shipping_pin
+
+
+# Tokens written (sorted, comma-joined) to ``Sales Invoice.custom_delivery_pin_flag``.
+PIN_FLAG_OUTSIDE_AREA = "outside_area"
+PIN_FLAG_AREA_MISMATCH = "area_mismatch"
+PIN_FLAG_OUTSIDE_EGYPT = "outside_egypt"
+PIN_FLAGS: tuple[str, ...] = (PIN_FLAG_AREA_MISMATCH, PIN_FLAG_OUTSIDE_AREA, PIN_FLAG_OUTSIDE_EGYPT)
+
+
+def _empty_delivery_pin() -> dict[str, Any]:
+    return {"latitude": 0.0, "longitude": 0.0, "source": "", "flags": ""}
+
+
+def _normalize_flags(value: Any) -> str:
+    """Canonical flag string: known tokens only, de-duplicated, sorted."""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        tokens = value.split(",")
+    else:
+        tokens = list(value)
+    clean = {str(token).strip().lower() for token in tokens}
+    return ",".join(sorted(token for token in clean if token in PIN_FLAGS))
+
+
+def resolve_delivery_pin(order: Any) -> dict[str, Any]:
+    """The pin for the order's *delivery* destination, plus its review flags.
+
+    Returns ``{"latitude", "longitude", "source", "flags"}`` -- exactly the shape
+    of the four ``Sales Invoice`` snapshot fields:
+
+    * Routing is the same as :func:`resolve_order_pins`: the destination is the
+      shipping block when it carries text, otherwise billing; an order-meta pin
+      outranks a Maps link parsed out of that block's address lines.
+    * ``latitude``/``longitude`` are ``0.0`` when there is no usable pin
+      (Frappe Float columns are NOT NULL DEFAULT 0; never None). ``source`` is
+      then ``""``.
+    * ``source`` is the raw origin: DropPin's ``_dpn_pin_source`` (``prefill``,
+      ``customer_checkout`` ...), ``jarz_checkout`` for our own ``_jarz_*``
+      meta, ``maps_link`` for a link parsed from the address text,
+      ``address_coordinates`` for explicit lat/lng keys on the Woo address.
+    * ``flags`` is a sorted comma-joined subset of ``outside_area`` (DropPin's
+      ``_dpn_area_status`` set and not ``inside``), ``area_mismatch``
+      (``_dpn_area_mismatch`` truthy) and ``outside_egypt`` (a pin was supplied
+      but lies outside the Egypt box, so it is not used).
+
+    Never raises.
+    """
+    result = _empty_delivery_pin()
+    try:
+        if not isinstance(order, dict):
+            return result
+        meta = _meta_value_map(order.get("meta_data"))
+        billing = order.get("billing") or {}
+        shipping = order.get("shipping") or {}
+        destination = shipping if _woo_address_has_text(shipping) else billing
+
+        flags: set[str] = set()
+
+        meta_pin, meta_source = _order_meta_pin(meta, egypt_only=True)
+        address_pin, address_source = _address_pin_with_source(destination, egypt_only=True)
+        if meta_pin:
+            pin, source = meta_pin, meta_source
+        elif address_pin:
+            pin, source = address_pin, address_source
+        else:
+            pin, source = None, ""
+
+        # Detection only: a world-valid pin that the Egypt check discarded.
+        for raw_pin, _raw_source in (
+            _order_meta_pin(meta, egypt_only=False),
+            _address_pin_with_source(destination, egypt_only=False),
+        ):
+            if raw_pin is not None and not pin_in_egypt(raw_pin):
+                flags.add(PIN_FLAG_OUTSIDE_EGYPT)
+
+        area_status = str(_first_present(meta, _DPN_AREA_STATUS_KEYS) or "").strip().lower()
+        if area_status and area_status != "inside":
+            flags.add(PIN_FLAG_OUTSIDE_AREA)
+        mismatch = str(_first_present(meta, _DPN_AREA_MISMATCH_KEYS) or "").strip().lower()
+        if mismatch in _TRUTHY_TOKENS:
+            flags.add(PIN_FLAG_AREA_MISMATCH)
+
+        if pin is not None:
+            result["latitude"] = pin.latitude
+            result["longitude"] = pin.longitude
+            result["source"] = source
+        result["flags"] = _normalize_flags(flags)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({"event": "woo_delivery_pin_resolve_failed", "error": str(exc)})
+        return _empty_delivery_pin()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +832,281 @@ def apply_order_pins(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Per-invoice delivery-pin snapshot
+# ---------------------------------------------------------------------------
+#
+# The Address pin is shared by every order a customer places to that address,
+# so a later order with a different pin silently changed what earlier invoices
+# showed. The snapshot freezes, per Sales Invoice, the pin THIS order carried.
+#
+# The four fields are created by jarz_pos (it owns the Sales Invoice schema);
+# until they exist on a site everything below is a no-op. Writes go through
+# ``frappe.db.set_value(..., update_modified=False)``: it works on a submitted
+# invoice, fires no document hook and therefore can never reach the Woo
+# outbound push (invariant 2 above applies to invoices just as to Addresses).
+
+# Deliberately the *_pin_* pair: the plain custom_delivery_{lat,long}itude fields
+# already exist on Sales Invoice and hold the courier's proof-of-delivery GPS.
+# This module must never write those.
+SI_PIN_LATITUDE_FIELD = "custom_delivery_pin_latitude"
+SI_PIN_LONGITUDE_FIELD = "custom_delivery_pin_longitude"
+SI_PIN_SOURCE_FIELD = "custom_delivery_pin_source"
+SI_PIN_FLAG_FIELD = "custom_delivery_pin_flag"
+INVOICE_PIN_FIELDS: tuple[str, ...] = (
+    SI_PIN_LATITUDE_FIELD,
+    SI_PIN_LONGITUDE_FIELD,
+    SI_PIN_SOURCE_FIELD,
+    SI_PIN_FLAG_FIELD,
+)
+
+_FLAG_MESSAGES: dict[str, str] = {
+    PIN_FLAG_OUTSIDE_AREA: (
+        "Customer pin is outside the delivery area chosen at checkout - check the "
+        "location before dispatch / دبوس العميل خارج منطقة التوصيل المختارة - راجع "
+        "الموقع قبل الإرسال"
+    ),
+    PIN_FLAG_AREA_MISMATCH: (
+        "Customer pin does not match the area selected at checkout - confirm the "
+        "address before dispatch / دبوس العميل لا يطابق المنطقة المختارة عند الطلب - "
+        "تأكد من العنوان قبل الإرسال"
+    ),
+    PIN_FLAG_OUTSIDE_EGYPT: (
+        "Customer pin is outside Egypt and was ignored - get the correct location "
+        "from the customer / دبوس العميل خارج مصر وتم تجاهله - اطلب الموقع الصحيح "
+        "من العميل"
+    ),
+}
+
+
+def invoice_pin_fields_available() -> bool:
+    """True when jarz_pos's four Sales Invoice delivery-pin fields exist."""
+    try:
+        meta = frappe.get_meta("Sales Invoice")
+        if not meta:
+            return False
+        return all(bool(meta.get_field(fieldname)) for fieldname in INVOICE_PIN_FIELDS)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _snapshot_values(delivery: dict[str, Any]) -> dict[str, Any]:
+    return {
+        SI_PIN_LATITUDE_FIELD: float(delivery.get("latitude") or 0.0),
+        SI_PIN_LONGITUDE_FIELD: float(delivery.get("longitude") or 0.0),
+        SI_PIN_SOURCE_FIELD: str(delivery.get("source") or ""),
+        SI_PIN_FLAG_FIELD: _normalize_flags(delivery.get("flags")),
+    }
+
+
+def _stored_float(value: Any) -> float:
+    number = _to_float(value)
+    return number if number is not None else 0.0
+
+
+def _snapshot_is_empty(row: Optional[dict[str, Any]]) -> bool:
+    if not row:
+        return True
+    return (
+        abs(_stored_float(row.get(SI_PIN_LATITUDE_FIELD))) < _COORD_EPSILON
+        and abs(_stored_float(row.get(SI_PIN_LONGITUDE_FIELD))) < _COORD_EPSILON
+        and not str(row.get(SI_PIN_SOURCE_FIELD) or "").strip()
+        and not _normalize_flags(row.get(SI_PIN_FLAG_FIELD))
+    )
+
+
+def _snapshots_equal(stored: Optional[dict[str, Any]], desired: dict[str, Any]) -> bool:
+    """Compare a stored SI row with :func:`_snapshot_values` output.
+
+    An absent / never-written snapshot reads as 0, 0, "", "" -- equal to an
+    order with no pin and no flags, so historical pin-less orders never look
+    stale.
+    """
+    stored = stored or {}
+    return (
+        abs(_stored_float(stored.get(SI_PIN_LATITUDE_FIELD)) - desired[SI_PIN_LATITUDE_FIELD]) < _COORD_EPSILON
+        and abs(_stored_float(stored.get(SI_PIN_LONGITUDE_FIELD)) - desired[SI_PIN_LONGITUDE_FIELD]) < _COORD_EPSILON
+        and str(stored.get(SI_PIN_SOURCE_FIELD) or "").strip() == desired[SI_PIN_SOURCE_FIELD]
+        and _normalize_flags(stored.get(SI_PIN_FLAG_FIELD)) == desired[SI_PIN_FLAG_FIELD]
+    )
+
+
+def _read_invoice_snapshot(invoice_name: str) -> Optional[dict[str, Any]]:
+    row = frappe.db.get_value("Sales Invoice", invoice_name, list(INVOICE_PIN_FIELDS), as_dict=True)
+    return dict(row) if row else None
+
+
+def _flag_comment_text(flags: str, order: Any) -> str:
+    woo_ref = ""
+    if isinstance(order, dict):
+        woo_ref = str(order.get("number") or order.get("id") or "").strip()
+    header = f"WooCommerce order {woo_ref}: delivery pin needs review" if woo_ref else (
+        "WooCommerce delivery pin needs review"
+    )
+    lines = [header]
+    for token in flags.split(","):
+        message = _FLAG_MESSAGES.get(token)
+        if message:
+            lines.append(message)
+    return "<br>".join(lines)
+
+
+def _add_flag_comment(invoice_name: str, flags: str, order: Any) -> bool:
+    try:
+        frappe.get_doc({
+            "doctype": "Comment",
+            "comment_type": "Comment",
+            "reference_doctype": "Sales Invoice",
+            "reference_name": invoice_name,
+            "content": _flag_comment_text(flags, order),
+        }).insert(ignore_permissions=True)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_delivery_pin_comment_failed",
+            "invoice": invoice_name,
+            "flags": flags,
+            "error": str(exc),
+        })
+        return False
+
+
+def _write_invoice_pin_snapshot(order: Any, invoice_name: Any) -> dict[str, Any]:
+    """Write the snapshot when it differs. Never raises.
+
+    Returns ``{"written", "previous", "current", "comment_added"}`` where
+    ``previous`` is the stored row before the write (``None`` when it could not
+    be read) and ``current`` the values this order resolves to.
+    """
+    outcome: dict[str, Any] = {
+        "written": False,
+        "previous": None,
+        "current": None,
+        "comment_added": False,
+    }
+    if not invoice_name or not invoice_pin_fields_available():
+        return outcome
+    try:
+        desired = _snapshot_values(resolve_delivery_pin(order))
+        outcome["current"] = desired
+        stored = _read_invoice_snapshot(invoice_name)
+        if stored is None:
+            return outcome
+        outcome["previous"] = stored
+        if _snapshots_equal(stored, desired):
+            return outcome
+        frappe.db.set_value("Sales Invoice", invoice_name, dict(desired), update_modified=False)
+        outcome["written"] = True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_delivery_pin_snapshot_failed",
+            "invoice": invoice_name,
+            "error": str(exc),
+        })
+        return outcome
+
+    new_flags = desired[SI_PIN_FLAG_FIELD]
+    old_flags = _normalize_flags((outcome["previous"] or {}).get(SI_PIN_FLAG_FIELD))
+    if new_flags and new_flags != old_flags:
+        outcome["comment_added"] = _add_flag_comment(invoice_name, new_flags, order)
+
+    LOGGER.info({
+        "event": "woo_delivery_pin_snapshot_written",
+        "invoice": invoice_name,
+        "source": desired[SI_PIN_SOURCE_FIELD],
+        "flags": new_flags,
+    })
+    return outcome
+
+
+def apply_invoice_pin_snapshot(order: Any, invoice_name: Any) -> bool:
+    """Freeze this order's delivery pin + flags onto its Sales Invoice.
+
+    Writes the four ``custom_delivery_*`` fields only when they differ from what
+    is stored, on any docstatus, without touching ``modified`` or firing hooks.
+    When the flag set becomes non-empty and differs from the stored one, one
+    bilingual Comment is added to the invoice for the dispatcher. Returns True
+    when something was written. No-op (False) when the fields do not exist yet.
+    Never raises.
+    """
+    return bool(_write_invoice_pin_snapshot(order, invoice_name).get("written"))
+
+
+def invoice_pin_snapshot_differs(order: Any, invoice_name: Any) -> bool:
+    """True when the order's delivery pin/flags disagree with the invoice snapshot.
+
+    Used by the order poll's no-op pre-check. Returns False -- "nothing to do",
+    the pre-existing behaviour -- whenever the snapshot cannot be written
+    (fields missing) or read, so it can never requeue an order forever.
+    An old invoice with an empty snapshot and an order with no pin/flags is
+    equal; one whose order does carry a pin differs exactly once (backfill).
+    """
+    if not invoice_name or not invoice_pin_fields_available():
+        return False
+    try:
+        stored = _read_invoice_snapshot(invoice_name)
+        if stored is None:
+            return False
+        desired = _snapshot_values(resolve_delivery_pin(order))
+        return not _snapshots_equal(stored, desired)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def refresh_invoice_pins(order: Any, invoice_name: Any) -> dict[str, Any]:
+    """Re-apply an already-synced order's pin: invoice snapshot, then Address.
+
+    Called from the ``unchanged`` branch of order processing, which a pin edit
+    on Woo reaches because the order hash deliberately excludes meta.
+
+    The Address is only moved when this order's pin was *edited* -- the stored
+    snapshot held a different pin. An empty stored snapshot is the backfill of
+    an invoice that predates the snapshot fields: its Address already received
+    this pin when the order first synced, and re-applying it now could roll the
+    shared Address back over a newer order's pin. Never raises.
+    """
+    result = {"snapshot_written": False, "address_refreshed": False}
+    try:
+        outcome = _write_invoice_pin_snapshot(order, invoice_name)
+        result["snapshot_written"] = bool(outcome.get("written"))
+        if not outcome.get("written"):
+            return result
+        previous = outcome.get("previous") or {}
+        current = outcome.get("current") or {}
+        if _snapshot_is_empty(previous):
+            return result
+        new_lat = _stored_float(current.get(SI_PIN_LATITUDE_FIELD))
+        new_lng = _stored_float(current.get(SI_PIN_LONGITUDE_FIELD))
+        if abs(new_lat) < _COORD_EPSILON and abs(new_lng) < _COORD_EPSILON:
+            return result
+        if (
+            abs(_stored_float(previous.get(SI_PIN_LATITUDE_FIELD)) - new_lat) < _COORD_EPSILON
+            and abs(_stored_float(previous.get(SI_PIN_LONGITUDE_FIELD)) - new_lng) < _COORD_EPSILON
+        ):
+            return result
+        row = frappe.db.get_value(
+            "Sales Invoice",
+            invoice_name,
+            ["customer_address", "shipping_address_name"],
+            as_dict=True,
+        ) or {}
+        applied = apply_order_pins(
+            order,
+            billing_address=row.get("customer_address"),
+            shipping_address=row.get("shipping_address_name"),
+        )
+        result["address_refreshed"] = bool(
+            applied.get("billing_applied") or applied.get("shipping_applied")
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_invoice_pin_refresh_failed",
+            "invoice": invoice_name,
+            "error": str(exc),
+        })
+    return result
+
+
 def _order_map_link_field() -> str:
     try:
         from jarz_woocommerce_integration.services.outbound_sync import (
@@ -713,6 +1183,8 @@ def preview_order_pin(woo_order_id: Any, *, client: Any = None) -> dict[str, Any
         "shipping_address": shipping_address,
         "billing_pin": billing_pin._asdict() if billing_pin else None,
         "shipping_pin": shipping_pin._asdict() if shipping_pin else None,
+        "delivery_pin": resolve_delivery_pin(order),
+        "invoice_pin_fields_available": invoice_pin_fields_available(),
     }
 
 
@@ -732,6 +1204,9 @@ def resync_order_pin(woo_order_id: Any, *, client: Any = None) -> dict[str, Any]
     data = apply_order_pins(
         order, billing_address=billing_address, shipping_address=shipping_address
     )
+    # The manual repair also repairs this invoice's own frozen copy of the pin.
+    data["delivery_pin"] = resolve_delivery_pin(order)
+    data["invoice_snapshot_written"] = apply_invoice_pin_snapshot(order, invoice)
     data.update({"success": True, "woo_order_id": woo_order_id, "sales_invoice": invoice})
     return data
 
@@ -754,7 +1229,11 @@ def resync_order_pins_job(woo_order_ids: list[Any]) -> dict[str, Any]:
             summary["errors"] += 1
             summary["details"].append({"woo_order_id": woo_order_id, "error": str(exc)})
             continue
-        if result.get("billing_applied") or result.get("shipping_applied"):
+        if (
+            result.get("billing_applied")
+            or result.get("shipping_applied")
+            or result.get("invoice_snapshot_written")
+        ):
             summary["applied"] += 1
         else:
             summary["skipped"] += 1
