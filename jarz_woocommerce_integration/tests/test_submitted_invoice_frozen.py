@@ -621,6 +621,53 @@ class TestSubmittedInvoiceFrozen(unittest.TestCase):
         fake_inv.db_set.assert_not_called()
         fake_inv.cancel.assert_not_called()
 
+    def test_preparing_echo_never_regresses_a_submitted_in_progress_or_dispatched_invoice(self):
+        """
+        POS pushes status=preparing when an order goes In Progress, and the next
+        inbound sweep reads that same status back. The echo - and a late one that
+        arrives after the order is already Out for Delivery - must leave the
+        submitted invoice's state alone. If the order content also changed, that is
+        a separate, guarded path (manual review / dispatch lock), still no state write.
+        """
+        state_fields = {"custom_sales_invoice_state", "sales_invoice_state", "status", "docstatus"}
+        for pos_state in ("In Progress", "Out for Delivery"):
+            for matching_hash in (True, False):
+                with self.subTest(pos_state=pos_state, matching_hash=matching_hash):
+                    order = _make_woo_order(woo_id=14763, status="preparing")
+                    contact_snapshot = order_sync._extract_order_contact_snapshot(order)
+                    territory_snapshot = order_sync._extract_order_territory_snapshot(order)
+                    monkeypatch = MonkeyPatch()
+                    self.addCleanup(monkeypatch.undo)
+                    _, fake_inv = _setup_common_mocks(
+                        monkeypatch,
+                        si_docstatus=1,
+                        map_hash=order_sync._compute_order_hash(order) if matching_hash else "stale-hash",
+                        map_status="processing",
+                        map_contact_hash=contact_snapshot.get("woo_contact_hash"),
+                        map_territory_hash=territory_snapshot.get("woo_territory_hash"),
+                    )
+                    fake_inv.custom_sales_invoice_state = pos_state
+                    fake_inv.sales_invoice_state = pos_state
+
+                    result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+                    assert result["status"] == "skipped"
+                    if matching_hash:
+                        # A pure echo: the hash excludes status, so nothing changed.
+                        assert result["reason"] == "unchanged", result
+                    else:
+                        # A real content change is routed to a guarded path, never
+                        # applied as a state write.
+                        assert result["reason"] in (
+                            "submitted_frozen", "needs_manual_review", "out_for_delivery_locked",
+                        ), result
+                    assert fake_inv.custom_sales_invoice_state == pos_state
+                    assert fake_inv.sales_invoice_state == pos_state
+                    fake_inv.save.assert_not_called()
+                    fake_inv.cancel.assert_not_called()
+                    written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+                    assert not (written & state_fields), f"state fields written: {written & state_fields}"
+
     def test_submitted_frozen_is_success_in_pull_single(self):
         """
         pull_single_order_phase1 must classify submitted_frozen as a successful skip

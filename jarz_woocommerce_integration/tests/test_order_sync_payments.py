@@ -32,9 +32,11 @@ class TestInboundOrderPaidClassification(unittest.TestCase):
         status_map = {"is_paid": False}
 
         for status in (
+            "preparing",
             "pre-nasrcity",
             "pre-ismailia",
             "pre-hadayk",
+            # Legacy label of "preparing"; normalised, never a real slug.
             "pre-dokki",
         ):
             assert order_sync._should_treat_inbound_order_as_paid(
@@ -51,12 +53,22 @@ class TestInboundOrderPaidClassification(unittest.TestCase):
         statuses = set(order_sync.RECONCILE_ORDER_STATUSES.split(","))
 
         for status in (
+            "preparing",
             "pre-nasrcity",
             "pre-ismailia",
             "pre-hadayk",
-            "pre-dokki",
         ):
             assert status in statuses
+
+        # "pre-dokki" was a phantom slug (the store's label for "preparing");
+        # it must not be polled for as if it were a real status.
+        assert "pre-dokki" not in statuses
+
+    def test_pre_dokki_normalizes_to_preparing(self):
+        assert order_sync._normalize_woo_status("pre-dokki") == "preparing"
+        assert order_sync._normalize_woo_status("wc-preparing") == "preparing"
+        assert order_sync._is_processing_equivalent_woo_status("pre-dokki") is True
+        assert order_sync._is_processing_equivalent_woo_status("preparing") is True
 
     def test_legacy_pre_hadayek_alias_normalizes_to_processing_behavior(self):
         status_map = {"is_paid": False}

@@ -12,7 +12,7 @@ Flow (mirrors _run_invoice_amendment_job in jarz_pos.api.manager, but Woo-native
     4.  Re-fetch invoice (state may have changed since webhook fired).
     5.  OFD permanent hard-block.
     6.  get_invoice_amendment_eligibility()        – reuse jarz_pos eligibility check.
-    7.  Woo status guard (processing / on-hold only).
+    7.  Woo status guard (processing / preparing / on-hold only).
     8.  Amend-depth cap  (≤ 3 cancelled predecessors for same woo_order_id).
     9.  Period-close guard.
     10. Idempotency:  if replacement already exists with matching hash → skip.
@@ -449,7 +449,7 @@ def run_woo_amendment_job(
 
         # ── 7. Woo status guard ───────────────────────────────────────────────
         woo_status = str(order_payload.get("status") or "").lower()
-        allowed_statuses = {"processing", "on-hold"}
+        allowed_statuses = {"processing", "preparing", "on-hold"}
         if woo_status not in allowed_statuses:
             _flag_needs_review(
                 woo_order_id=woo_order_id,

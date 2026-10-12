@@ -154,6 +154,11 @@ _INVOICE_OUTBOUND_PAYLOAD_FIELDS = frozenset({
 })
 
 _APPROVED_INVOICE_OUTBOUND_STATUSES = frozenset({
+    # In Progress is the first state with its own store status. Without this a
+    # Recieved -> In Progress move changes ``_determine_status`` but not the
+    # approved set, so the push would never be enqueued (nothing else in a pure
+    # state change is a payload field).
+    "preparing",
     "out-for-delivery",
     "completed",
     "cancelled",
@@ -3141,6 +3146,13 @@ def _normalize_invoice_state(raw_state: Any) -> str:
 #: catches that: it compares the status in the response against the one it sent
 #: and marks the invoice Error on a mismatch rather than claiming Synced.
 WOO_STATUS_PROCESSING = "processing"
+#: ``preparing`` is likewise a *custom* store status (registered by the
+#: companion plugin, shown as "Preparing" in wp-admin). It is what POS
+#: ``In Progress`` pushes: the kitchen has started on the order. Core
+#: WooCommerce treats a custom status like ``processing`` for everything this
+#: app cares about -- ``payment_complete`` skips both, so ``_date_paid`` comes
+#: from ``_build_paid_metadata`` either way -- but it sends no customer email.
+WOO_STATUS_PREPARING = "preparing"
 WOO_STATUS_OUT_FOR_DELIVERY = "out-for-delivery"
 WOO_STATUS_COMPLETED = "completed"
 WOO_STATUS_CANCELLED = "cancelled"
@@ -3273,6 +3285,11 @@ def _is_fully_returned(invoice: frappe.model.document.Document) -> bool:
     return _returned_amount(invoice_name) >= grand_total - _RETURN_TOLERANCE
 
 
+#: Normalised invoice states that push ``preparing``. ``ready`` is the retired
+#: kanban column, kept so an invoice that was left in it still maps sensibly.
+_PREPARING_INVOICE_STATES = frozenset({"in-progress", "ready"})
+
+
 def _collect_invoice_states(invoice: frappe.model.document.Document) -> list[str]:
     states: list[str] = []
     seen: set[str] = set()
@@ -3288,8 +3305,12 @@ def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool =
     """Map ``custom_sales_invoice_state`` onto a WooCommerce order status.
 
     ``Out for Delivery`` -> ``out-for-delivery``, ``Delivered`` -> ``completed``,
-    ``Cancelled`` (or docstatus 2) -> ``cancelled``, everything earlier in the
-    pipeline -> ``processing``.
+    ``Cancelled`` (or docstatus 2) -> ``cancelled``, ``In Progress`` ->
+    ``preparing``, and the only earlier state (``Recieved``) -> ``processing``.
+
+    The kanban no longer has a ``Ready`` column. An invoice still sitting in a
+    legacy ``Ready`` state is past ``In Progress`` by definition, so it maps to
+    ``preparing`` too rather than falling back to ``processing``.
 
     **A failed delivery attempt is not a status.** COURIER_CONTRACTS.md section 1
     is explicit: no new invoice state was added for it, a failed stop leaves the
@@ -3335,6 +3356,10 @@ def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool =
                 "failure_reason": _get_doc_value(invoice, "custom_delivery_failure_reason", None),
             })
         return WOO_STATUS_OUT_FOR_DELIVERY
+    # ``_normalize_invoice_state`` turns "In Progress" / "in_progress" into
+    # "in-progress".
+    if any(state in _PREPARING_INVOICE_STATES for state in states):
+        return WOO_STATUS_PREPARING
     return WOO_STATUS_PROCESSING
 
 

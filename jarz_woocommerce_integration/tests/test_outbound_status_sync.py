@@ -565,9 +565,9 @@ class TestOutboundStatusSync(unittest.TestCase):
 
         self.assertEqual(enqueue_calls, [])
 
-    def test_enqueue_invoice_sync_skips_ready_only_status_updates(self):
-        previous = DummyInvoice(sales_invoice_state="Recieved")
-        current = DummyInvoice(sales_invoice_state="Ready")
+    def _enqueued_calls_for_state_change(self, previous_state, current_state):
+        previous = DummyInvoice(sales_invoice_state=previous_state)
+        current = DummyInvoice(sales_invoice_state=current_state)
         current._before_save = previous
         enqueue_calls = []
 
@@ -577,7 +577,39 @@ class TestOutboundStatusSync(unittest.TestCase):
              unittest.mock.patch.object(outbound_sync.frappe, "enqueue", side_effect=lambda *args, **kwargs: enqueue_calls.append((args, kwargs))):
             outbound_sync.enqueue_invoice_sync(current, method="on_update_after_submit")
 
-        self.assertEqual(enqueue_calls, [])
+        return enqueue_calls
+
+    def test_enqueue_invoice_sync_pushes_preparing_when_recieved_moves_to_in_progress(self):
+        enqueue_calls = self._enqueued_calls_for_state_change("Recieved", "In Progress")
+
+        self.assertEqual(len(enqueue_calls), 1)
+
+    def test_in_progress_is_an_approved_status_change_but_processing_is_not(self):
+        self.assertIn("preparing", outbound_sync._APPROVED_INVOICE_OUTBOUND_STATUSES)
+        self.assertNotIn("processing", outbound_sync._APPROVED_INVOICE_OUTBOUND_STATUSES)
+
+        def change(previous_state, current_state):
+            previous = DummyInvoice(sales_invoice_state=previous_state)
+            current = DummyInvoice(sales_invoice_state=current_state)
+            current._before_save = previous
+            return outbound_sync._has_approved_invoice_status_change(current)
+
+        self.assertTrue(change("Recieved", "In Progress"))
+        # Same Woo status on both sides: nothing to tell the store.
+        self.assertFalse(change("In Progress", "Ready"))
+        self.assertFalse(change("Recieved", "Recieved"))
+        # A move back to Recieved would push "processing", which is not an
+        # approved status on its own (unchanged behaviour for "processing").
+        self.assertFalse(change("In Progress", "Recieved"))
+
+    def test_enqueue_invoice_sync_skips_a_legacy_ready_to_in_progress_move(self):
+        # Both map to "preparing": the store already holds the right status.
+        self.assertEqual(self._enqueued_calls_for_state_change("Ready", "In Progress"), [])
+
+    def test_enqueue_invoice_sync_still_pushes_out_for_delivery_after_in_progress(self):
+        enqueue_calls = self._enqueued_calls_for_state_change("In Progress", "Out for Delivery")
+
+        self.assertEqual(len(enqueue_calls), 1)
 
     def test_enqueue_invoice_sync_keeps_payment_method_only_updates(self):
         previous = DummyInvoice(sales_invoice_state="Out for Delivery")
@@ -1249,14 +1281,108 @@ class TestOutboundStatusSync(unittest.TestCase):
         }
 
         for status in (
+            "processing",
+            "preparing",
+            "wc-preparing",
             "pre-nasrcity",
             "pre-ismailia",
             "pre-hadayk",
             "pre-hadayek",
+            # The store's "preparing" status was once labelled "Pre-Dokki".
             "pre-dokki",
         ):
             with self.subTest(status=status):
                 self.assertEqual(order_sync._map_status(status), expected)
+
+    def test_map_status_submits_preparing_instead_of_leaving_a_draft(self):
+        # The regression this guards: an unrecognised status falls through to
+        # Draft, which would stop a "preparing" order from ever being submitted.
+        self.assertEqual(order_sync._map_status("preparing")["docstatus"], 1)
+        self.assertEqual(order_sync._map_status("some-unknown-status")["docstatus"], 0)
+
+    def test_build_order_payload_pushes_preparing_for_in_progress(self):
+        payload = _build_payload_for_delivery_test(DummyInvoice(sales_invoice_state="In Progress"))
+
+        self.assertEqual(payload["status"], "preparing")
+
+    def test_build_order_payload_keeps_processing_for_recieved(self):
+        payload = _build_payload_for_delivery_test(DummyInvoice(sales_invoice_state="Recieved"))
+
+        self.assertEqual(payload["status"], "processing")
+
+    def test_build_order_payload_marks_a_paid_in_progress_order_paid_like_processing(self):
+        # Sales-partner and paid-online POS orders are created already In
+        # Progress, so the first thing the store sees is status=preparing. The
+        # paid handling must be identical to a processing order.
+        results = {}
+        for state in ("Recieved", "In Progress"):
+            invoice = DummyInvoice(sales_invoice_state=state)
+            invoice.outstanding_amount = 0
+            invoice.custom_payment_method = "Cash"
+            invoice.modified = "2026-05-03 12:34:56"
+            results[state] = _build_payload_for_delivery_test(invoice)
+
+        self.assertEqual(results["Recieved"]["status"], "processing")
+        self.assertEqual(results["In Progress"]["status"], "preparing")
+        for payload in results.values():
+            self.assertTrue(payload["set_paid"])
+        metadata = {entry["key"]: entry["value"] for entry in results["In Progress"]["meta_data"]}
+        self.assertEqual(metadata["_date_paid"], "2026-05-03T12:34:56")
+        self.assertEqual(metadata["_date_paid_gmt"], "2026-05-03T12:34:56")
+
+    def _create_in_progress_order(self, *, store_status):
+        invoice = DummyInvoice(sales_invoice_state="In Progress", woo_order_id=None)
+        invoice.grand_total = 280
+        client = DummyResponseClient(response={
+            "id": 16700,
+            "number": "16700",
+            "status": store_status,
+            "payment_method": "cod",
+            "line_items": [],
+        })
+        mock_set_value = unittest.mock.MagicMock()
+        inserted_maps = []
+
+        def fake_get_doc(doctype_or_dict, name=None):
+            if doctype_or_dict == "Sales Invoice":
+                return invoice
+            if doctype_or_dict == "Customer":
+                return SimpleNamespace(name=invoice.customer, woo_customer_id="88")
+            if isinstance(doctype_or_dict, dict) and doctype_or_dict.get("doctype") == "WooCommerce Order Map":
+                doc = unittest.mock.MagicMock()
+                doc.insert.side_effect = lambda ignore_permissions=True: inserted_maps.append(dict(doctype_or_dict)) or doc
+                return doc
+            raise AssertionError(f"Unexpected get_doc call: {doctype_or_dict!r}")
+
+        with unittest.mock.patch.object(outbound_sync, "_get_settings", return_value=(SimpleNamespace(), _outbound_cfg())), \
+             unittest.mock.patch.object(outbound_sync, "_build_client", return_value=client), \
+             unittest.mock.patch.object(outbound_sync, "_build_order_payload", return_value={"status": "preparing", "payment_method": "cod"}), \
+             unittest.mock.patch.object(outbound_sync, "now_datetime", return_value="2026-05-03 12:00:00"), \
+             unittest.mock.patch.object(outbound_sync.frappe, "get_doc", side_effect=fake_get_doc), \
+             unittest.mock.patch.object(outbound_sync.frappe, "db", _db_stub(exists=False, set_value=mock_set_value, get_value=lambda *args, **kwargs: None)), \
+             unittest.mock.patch.object(outbound_sync.frappe, "flags", SimpleNamespace(ignore_woo_outbound=False)), \
+             unittest.mock.patch.object(order_sync, "_compute_order_hash", return_value="hash-16700"):
+            result = outbound_sync.sync_sales_invoice(invoice.name, reason="test")
+
+        return result, client, inserted_maps, mock_set_value
+
+    def test_sync_creating_an_order_in_preparing_is_not_a_status_mismatch(self):
+        result, client, inserted_maps, _set_value = self._create_in_progress_order(store_status="preparing")
+
+        self.assertEqual(result, {"status": "ok", "woo_order_id": 16700})
+        self.assertEqual(client.post_calls[0][1]["status"], "preparing")
+        self.assertEqual(len(inserted_maps), 1)
+        self.assertEqual(inserted_maps[0]["status"], "preparing")
+
+    def test_sync_flags_an_error_when_the_store_does_not_know_preparing(self):
+        # A store without the status silently answers "processing"; that must
+        # surface as an Error (so the reconcile sweep retries), not a false Synced.
+        result, _client, inserted_maps, _set_value = self._create_in_progress_order(store_status="processing")
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["detail"], "status_mismatch:processing")
+        # The order map is written first and records what the store really holds.
+        self.assertEqual([entry["status"] for entry in inserted_maps], ["processing"])
 
     def test_build_order_payload_adds_and_removes_line_items_when_existing_do_not_match(self):
         invoice = DummyInvoice(sales_invoice_state="Delivered")

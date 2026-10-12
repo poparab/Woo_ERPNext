@@ -138,13 +138,28 @@ class TestFulfilmentStatusMapping(unittest.TestCase):
             "cancelled",
         )
 
-    def test_earlier_pipeline_states_map_to_processing(self):
-        for state in ("Recieved", "In Progress", "Ready"):
+    def test_recieved_maps_to_processing(self):
+        # "Recieved" is the store's spelling of the first kanban column.
+        self.assertEqual(
+            outbound_sync._determine_status(FakeInvoice(state="Recieved")),
+            "processing",
+        )
+
+    def test_in_progress_maps_to_preparing(self):
+        # The kitchen has started: the customer-visible store status moves on.
+        for state in ("In Progress", "in progress", "In_Progress"):
             with self.subTest(state=state):
                 self.assertEqual(
                     outbound_sync._determine_status(FakeInvoice(state=state)),
-                    "processing",
+                    "preparing",
                 )
+
+    def test_legacy_ready_state_maps_to_preparing(self):
+        # The Ready column is gone, but an invoice left in it is past In Progress.
+        self.assertEqual(
+            outbound_sync._determine_status(FakeInvoice(state="Ready")),
+            "preparing",
+        )
 
 
 class TestFailedAttemptIsNotTerminal(unittest.TestCase):

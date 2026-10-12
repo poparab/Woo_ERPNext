@@ -40,15 +40,24 @@ DEFAULT_CANCELLED_BOOTSTRAP_LOOKBACK_MINUTES = 1440
 
 DEFAULT_RECONCILE_LOOKBACK_MINUTES = 1440
 DEFAULT_RECONCILE_MAX_PAGES = 20
+#: ``preparing`` is the custom store status the POS pushes for ``In Progress``
+#: (see ``outbound_sync.WOO_STATUS_PREPARING``). Inbound must treat it exactly
+#: like ``processing``: it is a live, paid-or-payable order, and the hourly
+#: reconcile has to keep listing it or a customer edit/cancel made while the
+#: kitchen is working would never be seen.
 PROCESSING_EQUIVALENT_WOO_STATUSES = (
     "processing",
+    "preparing",
     "pre-nasrcity",
     "pre-ismailia",
     "pre-hadayk",
-    "pre-dokki",
 )
 LEGACY_WOO_STATUS_ALIASES = {
     "pre-hadayek": "pre-hadayk",
+    # The store's "preparing" status was labelled "Pre-Dokki" for a while, and
+    # that label (not a slug) is what leaked into this list. No such slug exists
+    # on the store; kept only so a stray value still normalises.
+    "pre-dokki": "preparing",
 }
 RECONCILE_TARGET_WOO_STATUSES = PROCESSING_EQUIVALENT_WOO_STATUSES + (
     "completed", "cancelled", "refunded", "failed"
@@ -5962,7 +5971,7 @@ def _process_order_phase1(order: dict, settings, allow_update: bool = True, is_h
                         "invoice": inv.name,
                     }
 
-                amendment_statuses = {"processing", "on-hold"}
+                amendment_statuses = {"processing", "preparing", "on-hold"}
                 can_auto_amend = (
                     hash_changed
                     and item_lines_changed
