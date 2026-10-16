@@ -17,7 +17,8 @@ Our side                         What DropPin does with it
 board state -> Out for Delivery   customer reads *Out for delivery*; no map
 leg started                       map opens **for this order only**, driver shown
 courier position                  the marker moves
-leg ended                         map closes; order status untouched
+arrived (leg still open)          arrival recorded; map stays open until handover
+leg ended (skip/failed attempt)   map closes; order status untouched
 board state -> Delivered          *Delivered*, map closes, Woo order -> Completed
 board state -> Cancelled          *Cancelled*, leg closes automatically
 ===============================  ==================================================
@@ -111,8 +112,16 @@ _STATE_FIELD_ALIASES = (
     "state",
 )
 
+#: Statuses that close the leg on DropPin's side by themselves (spec §4.3c,
+#: "automatic safety net"). Only these may stand in for an explicit
+#: ``leg: ended`` — ``out_for_delivery`` does not close anything.
+_LEG_CLOSING_STATUSES = frozenset({STATUS_DELIVERED, STATUS_CANCELLED})
+
 LEG_STARTED_FIELD = "custom_leg_started_at"
 LEG_ENDED_FIELD = "custom_leg_ended_at"
+#: Written by ``jarz_pos`` when the courier taps Arrived. A sub-step of the
+#: leg, not a close: DropPin keeps the map open until the handover.
+ARRIVED_FIELD = "custom_arrived_at"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -411,6 +420,44 @@ def _leg_is_open(row: Dict[str, Any]) -> bool:
         return False
 
 
+def _arrived_on_open_leg(row: Dict[str, Any]) -> bool:
+    """True when the arrival stamp belongs to the leg that is open now.
+
+    An arrival left over from an earlier attempt (failed yesterday, reopened
+    today) predates the new leg's start and must not be replayed as "your
+    driver is downstairs" the moment the courier sets off again.
+    """
+    arrived = row.get(ARRIVED_FIELD)
+    started = row.get(LEG_STARTED_FIELD)
+    if not (arrived and started):
+        return False
+    try:
+        return get_datetime(arrived) >= get_datetime(started)
+    except Exception:
+        return False
+
+
+def _e164(phone: str) -> str:
+    """Egyptian numbers as E.164, which DropPin prefers; anything else as given.
+
+    HR stores ``cell_number`` the way staff type it — ``01012345678``,
+    ``201012345678``, ``00201012345678``. Only the unambiguous Egyptian mobile
+    shapes are rewritten; a number we do not recognise is passed through rather
+    than guessed at.
+    """
+    raw = str(phone or "").strip()
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if raw.startswith("+"):
+        return "+" + digits
+    if digits.startswith("0020") and len(digits) == 14:
+        return "+" + digits[2:]
+    if digits.startswith("20") and len(digits) == 12:
+        return "+" + digits
+    if digits.startswith("01") and len(digits) == 11:
+        return "+2" + digits
+    return raw
+
+
 def _driver_block(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Name and phone for the customer's driver card, or ``None``.
 
@@ -445,7 +492,7 @@ def _driver_block(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
     block: Dict[str, Any] = {"name": first_name}
-    phone = str(phone or "").strip()
+    phone = _e164(phone)
     if phone:
         # DropPin masks it on the page unless the shop says otherwise, so the
         # real number is what it wants; the display decision is theirs.
@@ -517,6 +564,7 @@ _INVOICE_FIELDS = (
     "pos_profile",
     LEG_STARTED_FIELD,
     LEG_ENDED_FIELD,
+    ARRIVED_FIELD,
 ) + _STATE_FIELD_ALIASES
 
 
@@ -610,10 +658,23 @@ def push_invoice_state(invoice_name: str, *, settings: Any = None) -> Dict[str, 
                 settings=settings,
             )
         )
-    elif row.get(LEG_ENDED_FIELD) and not status:
-        # Only when no status went out. `delivered` and `cancelled` close the leg
-        # on DropPin's side by themselves, so sending both would be a redundant
-        # request per delivery for the whole fleet.
+        if _arrived_on_open_leg(row):
+            # Optional in DropPin 1.4: records the arrival and fires their
+            # "driver is downstairs" hook, but leaves the map open.
+            results.append(
+                send_update(
+                    wc_order_id,
+                    event_id=leg_event_id(wc_order_id, "arrived", row.get(ARRIVED_FIELD)),
+                    leg="arrived",
+                    settings=settings,
+                )
+            )
+    elif row.get(LEG_ENDED_FIELD) and status not in _LEG_CLOSING_STATUSES:
+        # Skipped stop or failed attempt: the board still reads Out for
+        # Delivery, and `out_for_delivery` closes nothing on DropPin's side, so
+        # without this the customer keeps a live map of a courier who has
+        # driven off. Skipped only after `delivered` / `cancelled`, which close
+        # the leg by themselves.
         results.append(
             send_update(
                 wc_order_id,

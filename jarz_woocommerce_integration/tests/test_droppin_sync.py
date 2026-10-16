@@ -408,5 +408,118 @@ class StatusMappingTests(unittest.TestCase):
         self.assertEqual(droppin_sync._board_state(row), "out_for_delivery")
 
 
+class PushInvoiceStateTests(unittest.TestCase):
+    """Which requests one invoice save turns into, and in what order."""
+
+    BASE = {
+        "name": "ACC-SINV-2026-00001",
+        "docstatus": 1,
+        "woo_order_id": 1042,
+        "custom_courier_party_type": "Employee",
+        "custom_courier_party": "HR-EMP-0001",
+    }
+
+    def _push(self, **row):
+        sent = []
+
+        def fake_send(wc_order_id, **kwargs):
+            sent.append(kwargs)
+            return {"sent": True}
+
+        with patch.object(droppin_sync, "dispatch_enabled", return_value=True), patch.object(
+            droppin_sync, "_invoice_row", return_value=dict(self.BASE, **row)
+        ), patch.object(droppin_sync, "send_update", side_effect=fake_send), patch.object(
+            droppin_sync, "_driver_block", return_value={"name": "Ahmed"}
+        ):
+            droppin_sync.push_invoice_state("ACC-SINV-2026-00001", settings=MagicMock())
+        return [(k.get("status"), k.get("leg")) for k in sent]
+
+    def test_dispatch_sends_status_only(self):
+        self.assertEqual(
+            self._push(custom_sales_invoice_state="Out for Delivery"),
+            [("out_for_delivery", None)],
+        )
+
+    def test_start_sends_status_then_the_leg(self):
+        self.assertEqual(
+            self._push(
+                custom_sales_invoice_state="Out for Delivery",
+                custom_leg_started_at="2026-10-16 18:04:00",
+            ),
+            [("out_for_delivery", None), (None, "started")],
+        )
+
+    def test_arrival_on_the_open_leg_is_sent_and_keeps_the_leg(self):
+        self.assertEqual(
+            self._push(
+                custom_sales_invoice_state="Out for Delivery",
+                custom_leg_started_at="2026-10-16 18:04:00",
+                custom_arrived_at="2026-10-16 18:19:00",
+            ),
+            [("out_for_delivery", None), (None, "started"), (None, "arrived")],
+        )
+
+    def test_an_arrival_from_an_earlier_attempt_is_not_replayed(self):
+        self.assertEqual(
+            self._push(
+                custom_sales_invoice_state="Out for Delivery",
+                custom_leg_started_at="2026-10-17 12:00:00",
+                custom_leg_ended_at="2026-10-16 18:30:00",
+                custom_arrived_at="2026-10-16 18:19:00",
+            ),
+            [("out_for_delivery", None), (None, "started")],
+        )
+
+    def test_a_skipped_or_failed_stop_closes_the_map(self):
+        """The regression: the board still reads Out for Delivery after a skip
+        or a failed attempt, and `out_for_delivery` closes nothing on DropPin's
+        side. Suppressing `leg: ended` because a status went out left the
+        customer watching a courier who had driven away."""
+        self.assertEqual(
+            self._push(
+                custom_sales_invoice_state="Out for Delivery",
+                custom_leg_started_at="2026-10-16 18:04:00",
+                custom_leg_ended_at="2026-10-16 18:12:00",
+            ),
+            [("out_for_delivery", None), (None, "ended")],
+        )
+
+    def test_delivered_closes_the_leg_by_itself(self):
+        self.assertEqual(
+            self._push(
+                custom_sales_invoice_state="Delivered",
+                custom_leg_started_at="2026-10-16 18:04:00",
+                custom_leg_ended_at="2026-10-16 18:20:00",
+            ),
+            [("delivered", None)],
+        )
+
+    def test_cancelled_closes_the_leg_by_itself(self):
+        self.assertEqual(
+            self._push(
+                custom_sales_invoice_state="Cancelled",
+                custom_leg_started_at="2026-10-16 18:04:00",
+                custom_leg_ended_at="2026-10-16 18:10:00",
+            ),
+            [("cancelled", None)],
+        )
+
+    def test_a_pos_native_order_sends_nothing(self):
+        self.assertEqual(
+            self._push(woo_order_id=0, custom_sales_invoice_state="Delivered"), []
+        )
+
+
+class PhoneTests(unittest.TestCase):
+    def test_egyptian_shapes_become_e164(self):
+        for raw in ("01012345678", "201012345678", "00201012345678", "+20 101 234 5678"):
+            with self.subTest(raw=raw):
+                self.assertEqual(droppin_sync._e164(raw), "+201012345678")
+
+    def test_an_unrecognised_number_is_passed_through(self):
+        self.assertEqual(droppin_sync._e164("12345"), "12345")
+        self.assertEqual(droppin_sync._e164(""), "")
+
+
 if __name__ == "__main__":
     unittest.main()

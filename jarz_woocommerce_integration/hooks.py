@@ -225,7 +225,9 @@ scheduler_events = {
 			# fixes faster than we forward them. One request per OPEN LEG,
 			# not per fix -- with one open leg per courier by construction,
 			# that is one request per active courier per minute, far inside
-			# DropPin's 300/min store-wide budget.
+			# DropPin's 60/min-per-order and 1200/min store-wide budgets. A
+			# fix forwarded each minute is at most ~85 s old on their side,
+			# under the 120 s after which they dim the marker.
 			"jarz_woocommerce_integration.services.droppin_sync.push_open_leg_positions",
 		],
 		"*/15 * * * *": [
