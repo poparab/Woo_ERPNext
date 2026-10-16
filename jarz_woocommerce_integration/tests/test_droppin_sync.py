@@ -321,6 +321,14 @@ class SendGuardTests(unittest.TestCase):
             "https://demo.orderjarz.com" + droppin_sync.ENDPOINT_PATH,
         )
 
+    def test_a_bare_host_gets_https(self):
+        """Typed into Desk as ``demo.orderjarz.com`` on staging, 2026-10-16."""
+        settings = self._settings(droppin_base_url=" demo.orderjarz.com/ ")
+        self.assertEqual(
+            droppin_sync._endpoint(settings),
+            "https://demo.orderjarz.com" + droppin_sync.ENDPOINT_PATH,
+        )
+
 
 class PositionReadTests(unittest.TestCase):
     ROW = {

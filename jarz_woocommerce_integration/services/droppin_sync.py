@@ -179,6 +179,11 @@ def _endpoint(settings: Any) -> str:
     base = str(
         getattr(settings, "droppin_base_url", "") or getattr(settings, "base_url", "") or ""
     ).strip().rstrip("/")
+    if base and "://" not in base:
+        # Typed into Desk as a bare host ("demo.orderjarz.com"). Without a
+        # scheme every POST dies in requests with MissingSchema and nothing is
+        # ever sent, so assume the only scheme DropPin serves.
+        base = f"https://{base}"
     return f"{base}{ENDPOINT_PATH}" if base else ""
 
 
