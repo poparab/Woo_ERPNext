@@ -17,7 +17,10 @@ from jarz_woocommerce_integration.services.geo_passthrough import (
     GeoPin,
     apply_geo_pin as _apply_geo_pin,
     extract_address_pin as _extract_address_geo_pin,
+    last_received_delivery_pin as _last_received_delivery_pin,
+    pin_matches_coordinates as _pin_matches_coordinates,
     resolve_order_pins as _resolve_order_geo_pins,
+    resolve_order_pins_ex as _resolve_order_geo_pins_ex,
 )
 from jarz_woocommerce_integration.utils.customer_woo_id import (
     customer_holds_woo_id_as_alias,
@@ -1223,7 +1226,13 @@ def _set_address_as_default(address_name: str, customer: str, address_type: str)
         frappe.logger().warning(f"Failed to set address {address_name} as default: {e}")
 
 
-def _apply_customer_pin(address_name: Optional[str], pin: Optional[GeoPin]) -> bool:
+def _apply_customer_pin(
+    address_name: Optional[str],
+    pin: Optional[GeoPin],
+    *,
+    last_received: Optional[tuple] = None,
+    fill_only: bool = False,
+) -> bool:
     """Stamp a customer-supplied map pin on an Address (courier lane O1).
 
     Writes ``custom_*`` geo fields only -- never ``address_line1``,
@@ -1242,15 +1251,29 @@ def _apply_customer_pin(address_name: Optional[str], pin: Optional[GeoPin]) -> b
     Never raises -- a pin is a nice-to-have, an order is not.  The failure is
     logged rather than swallowed silently: a geo write that quietly stops
     happening looks exactly like "no customer ever sent a pin".
+
+    ``last_received`` is the ``(lat, lng)`` this order's customer pin had at its
+    previous sync (the invoice snapshot). When the incoming pin sits on those
+    same coordinates the sync carries no news, so a staff correction stored as
+    ``pos_link`` must survive it: ``customer_pin`` outranks ``pos_link``, and
+    without this guard every routine re-sync of a changed order would silently
+    undo the correction. A genuinely new pin does not match and applies as ever.
+    ``fill_only`` is for a shipping pin borrowed from the billing block.
     """
     if not address_name or pin is None:
         return False
     try:
+        extra = {}
+        if _pin_matches_coordinates(pin, last_received):
+            extra["protect_pos_link"] = True
+        if fill_only:
+            extra["fill_only"] = True
         return _apply_geo_pin(
             address_name,
             pin.latitude,
             pin.longitude,
             GEO_SOURCE_CUSTOMER_PIN,
+            **extra,
         )
     except Exception as exc:  # noqa: BLE001
         frappe.logger("woo").warning(
@@ -1658,7 +1681,12 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
     # Courier lane O1 — customer-supplied map pin. Resolved once, up front, so
     # both address branches below stamp the same values. See
     # geo_passthrough.resolve_order_pins for the billing/shipping routing rule.
-    billing_pin, shipping_pin = _resolve_order_geo_pins(order)
+    billing_pin, shipping_pin, shipping_pin_from_billing = _resolve_order_geo_pins_ex(order)
+    # What this order's pin was the last time it synced; None for a new order.
+    try:
+        last_received_pin = _last_received_delivery_pin(order)
+    except Exception:  # noqa: BLE001
+        last_received_pin = None
 
     # Ensure billing address if present
     if _has_usable_source_address(billing):
@@ -1671,7 +1699,7 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
             # purpose: the expression short-circuits, so a create-only pin write
             # would silently never update a returning customer — which is most
             # customers.
-            _apply_customer_pin(billing_addr_name, billing_pin)
+            _apply_customer_pin(billing_addr_name, billing_pin, last_received=last_received_pin)
             # Cache newly created address too
             if address_cache is not None and not existing:
                 address_cache[(customer, _source_address_signature(billing))] = billing_addr_name
@@ -1682,7 +1710,7 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
         _set_address_as_default(billing_addr_name, customer, "Shipping")
         # Same record as billing: equal rank is accepted, so the order-level pin
         # applied here is the one that ends up stored.
-        _apply_customer_pin(shipping_addr_name, shipping_pin)
+        _apply_customer_pin(shipping_addr_name, shipping_pin, last_received=last_received_pin)
     elif _has_usable_source_address(shipping):
         # Different address — create/find shipping separately
         existing = _find_existing_address_for_customer(customer, "Shipping", shipping, address_cache=address_cache)
@@ -1690,8 +1718,14 @@ def ensure_customer_with_addresses(order: dict, settings, customer_cache: dict |
         # Set as default shipping address for this customer
         if shipping_addr_name:
             _set_address_as_default(shipping_addr_name, customer, "Shipping")
-            # Created *and* matched-existing both reach this line.
-            _apply_customer_pin(shipping_addr_name, shipping_pin)
+            # Created *and* matched-existing both reach this line. A pin borrowed
+            # from billing only fills an Address that has none.
+            _apply_customer_pin(
+                shipping_addr_name,
+                shipping_pin,
+                last_received=last_received_pin,
+                fill_only=shipping_pin_from_billing,
+            )
             # Cache newly created address too
             if address_cache is not None and not existing:
                 address_cache[(customer, _source_address_signature(shipping))] = shipping_addr_name

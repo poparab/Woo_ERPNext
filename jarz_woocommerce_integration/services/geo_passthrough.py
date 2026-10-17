@@ -70,9 +70,11 @@ signature *and* of the outbound push trigger set.
 from __future__ import annotations
 
 from functools import partial
+import hashlib
 import re
+import time
 from typing import Any, Callable, Iterator, NamedTuple, Optional
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin, urlparse
 
 import frappe
 
@@ -810,22 +812,59 @@ def resolve_order_pins(order: Any) -> tuple[Optional[GeoPin], Optional[GeoPin]]:
     resolves both to the same ``Address`` record. Both writes then land on that
     one record at equal rank, and the order-level pin -- applied second -- wins.
     """
+    billing_pin, shipping_pin, _from_billing = resolve_order_pins_ex(order)
+    return billing_pin, shipping_pin
+
+
+def resolve_order_pins_ex(
+    order: Any,
+) -> tuple[Optional[GeoPin], Optional[GeoPin], bool]:
+    """:func:`resolve_order_pins` plus a ``shipping_from_billing`` marker.
+
+    A checkout that puts the Maps link (or coordinates) in the BILLING block
+    while the shipping block carries only address text is common: the customer
+    pasted the link in the first address form they saw. The delivery
+    destination is then shipping, yet the only location the customer gave us is
+    billing's. When shipping has text but no location of its own and billing has
+    one, the shipping pin is that billing pin and the third element is ``True``.
+
+    Billing is strictly a fallback: any location shipping carries (order meta or
+    its own link/coordinates) is used as-is and billing is never consulted, so
+    billing can never override a shipping location that exists. Callers that
+    write Addresses use the marker to write the borrowed pin with
+    ``fill_only=True`` -- it must not replace a pin the shipping Address already
+    holds from some other order.
+    """
     if not isinstance(order, dict):
-        return None, None
+        return None, None, False
     billing = order.get("billing") or {}
     shipping = order.get("shipping") or {}
     order_pin = extract_order_pin(order)
     has_shipping = _woo_address_has_text(shipping)
     billing_pin = (None if has_shipping else order_pin) or extract_address_pin(billing)
     shipping_pin = (order_pin if has_shipping else None) or extract_address_pin(shipping)
-    return billing_pin, shipping_pin
+    shipping_from_billing = False
+    if has_shipping and shipping_pin is None and billing_pin is not None:
+        shipping_pin = billing_pin
+        shipping_from_billing = True
+    return billing_pin, shipping_pin, shipping_from_billing
 
 
 # Tokens written (sorted, comma-joined) to ``Sales Invoice.custom_delivery_pin_flag``.
 PIN_FLAG_OUTSIDE_AREA = "outside_area"
 PIN_FLAG_AREA_MISMATCH = "area_mismatch"
 PIN_FLAG_OUTSIDE_EGYPT = "outside_egypt"
-PIN_FLAGS: tuple[str, ...] = (PIN_FLAG_AREA_MISMATCH, PIN_FLAG_OUTSIDE_AREA, PIN_FLAG_OUTSIDE_EGYPT)
+# The customer REMOVED a pin they had supplied (the order now carries none). The
+# snapshot is then blank coordinates + exactly this flag, which tells jarz_pos
+# to show "no pin" instead of falling back to the shared Address pin. Never set
+# for an order that never had a pin; cleared as soon as a pin arrives again.
+PIN_FLAG_PIN_REMOVED = "pin_removed"
+PIN_FLAGS: tuple[str, ...] = (
+    PIN_FLAG_AREA_MISMATCH,
+    PIN_FLAG_OUTSIDE_AREA,
+    PIN_FLAG_OUTSIDE_EGYPT,
+    PIN_FLAG_PIN_REMOVED,
+)
 
 
 def _empty_delivery_pin() -> dict[str, Any]:
@@ -887,11 +926,21 @@ def resolve_delivery_pin(order: Any) -> dict[str, Any]:
         else:
             pin, source = None, ""
 
+        # Billing fallback: shipping is the destination but carries no usable
+        # location, while billing does. Consulted only when nothing above
+        # resolved, so billing can never override a shipping location.
+        billing_fallback = destination is not billing
+        if pin is None and billing_fallback:
+            pin, source = _address_pin_with_source(billing, egypt_only=True)
+
         # Detection only: a world-valid pin that the Egypt check discarded.
-        for raw_pin, _raw_source in (
+        detect = [
             _order_meta_pin(meta, egypt_only=False),
             _address_pin_with_source(destination, egypt_only=False),
-        ):
+        ]
+        if pin is None and billing_fallback:
+            detect.append(_address_pin_with_source(billing, egypt_only=False))
+        for raw_pin, _raw_source in detect:
             if raw_pin is not None and not pin_in_egypt(raw_pin):
                 flags.add(PIN_FLAG_OUTSIDE_EGYPT)
 
@@ -984,6 +1033,8 @@ def apply_geo_pin(
     source: str = GEO_SOURCE_CUSTOMER_PIN,
     *,
     accuracy_m: Any = None,
+    protect_pos_link: bool = False,
+    fill_only: bool = False,
 ) -> bool:
     """Write a pin onto an Address, honouring the confidence ladder.
 
@@ -1004,6 +1055,18 @@ def apply_geo_pin(
     ``False`` when there was nothing usable to write, the write was outranked or
     over the cap, or the write failed. Never raises -- this runs inside order
     sync.
+
+    Two opt-in guards, both off by default so every existing caller is unchanged:
+
+    * ``protect_pos_link`` -- skip the write when the stored source is
+      ``pos_link`` (a pin staff corrected in the POS). Callers pass it when the
+      incoming coordinates are not news: a routine re-sync of an order whose
+      customer pin did not change must not overwrite a newer staff correction
+      (``customer_pin`` outranks ``pos_link``, so the ladder alone would).
+    * ``fill_only`` -- write only onto an Address that holds no real pin (empty
+      or ``territory_centroid``). Used for a pin borrowed from the BILLING block
+      for a shipping Address: weaker evidence must never replace a pin the
+      shipping Address already carries.
     """
     if not address_name:
         return False
@@ -1076,6 +1139,25 @@ def apply_geo_pin(
     if coordinates_match and source_matches and accuracy_m is None:
         return True
 
+    stored_source = str(row.get("custom_geo_source") or "").strip()
+    if protect_pos_link and stored_source == "pos_link":
+        LOGGER.info({
+            "event": "woo_geo_pin_ignored",
+            "reason": "staff_correction_protected",
+            "address": address_name,
+            "incoming_source": source_label,
+        })
+        return False
+    if fill_only and current_rank > CONFIDENCE_RANK["territory_centroid"]:
+        LOGGER.info({
+            "event": "woo_geo_pin_ignored",
+            "reason": "fill_only_address_has_pin",
+            "address": address_name,
+            "incoming_source": source_label,
+            "current_rank": current_rank,
+        })
+        return False
+
     updates: dict[str, Any] = {
         "custom_latitude": pin.latitude,
         "custom_longitude": pin.longitude,
@@ -1142,9 +1224,14 @@ def apply_order_pins(
     *,
     billing_address: Optional[str] = None,
     shipping_address: Optional[str] = None,
+    protect_pos_link: bool = False,
 ) -> dict[str, Any]:
-    """Apply a Woo order's pins to already-resolved Address names."""
-    billing_pin, shipping_pin = resolve_order_pins(order)
+    """Apply a Woo order's pins to already-resolved Address names.
+
+    A shipping pin borrowed from billing (see :func:`resolve_order_pins_ex`) is
+    written ``fill_only``; ``protect_pos_link`` is passed through to every write.
+    """
+    billing_pin, shipping_pin, shipping_from_billing = resolve_order_pins_ex(order)
     result: dict[str, Any] = {
         "billing_address": billing_address,
         "shipping_address": shipping_address,
@@ -1154,14 +1241,35 @@ def apply_order_pins(
         "shipping_applied": False,
     }
     if billing_address and billing_pin:
-        result["billing_applied"] = apply_geo_pin(
-            billing_address, billing_pin.latitude, billing_pin.longitude, GEO_SOURCE_CUSTOMER_PIN
+        result["billing_applied"] = _apply_pin_kwargs(
+            billing_address, billing_pin, protect_pos_link=protect_pos_link
         )
     if shipping_address and shipping_pin:
-        result["shipping_applied"] = apply_geo_pin(
-            shipping_address, shipping_pin.latitude, shipping_pin.longitude, GEO_SOURCE_CUSTOMER_PIN
+        result["shipping_applied"] = _apply_pin_kwargs(
+            shipping_address,
+            shipping_pin,
+            protect_pos_link=protect_pos_link,
+            fill_only=shipping_from_billing and shipping_address != billing_address,
         )
     return result
+
+
+def _apply_pin_kwargs(
+    address_name: str,
+    pin: GeoPin,
+    *,
+    protect_pos_link: bool = False,
+    fill_only: bool = False,
+) -> bool:
+    """``apply_geo_pin`` that only sends a guard kwarg when it is switched on."""
+    kwargs: dict[str, Any] = {}
+    if protect_pos_link:
+        kwargs["protect_pos_link"] = True
+    if fill_only:
+        kwargs["fill_only"] = True
+    return apply_geo_pin(
+        address_name, pin.latitude, pin.longitude, GEO_SOURCE_CUSTOMER_PIN, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1207,6 +1315,11 @@ _FLAG_MESSAGES: dict[str, str] = {
         "Customer pin is outside Egypt and was ignored - get the correct location "
         "from the customer / دبوس العميل خارج مصر وتم تجاهله - اطلب الموقع الصحيح "
         "من العميل"
+    ),
+    PIN_FLAG_PIN_REMOVED: (
+        "The customer removed the map pin from this order - confirm the location "
+        "with the customer before dispatch / قام العميل بإزالة دبوس الموقع من هذا "
+        "الطلب - تأكد من الموقع مع العميل قبل الإرسال"
     ),
 }
 
@@ -1261,6 +1374,65 @@ def _snapshots_equal(stored: Optional[dict[str, Any]], desired: dict[str, Any]) 
         and str(stored.get(SI_PIN_SOURCE_FIELD) or "").strip() == desired[SI_PIN_SOURCE_FIELD]
         and _normalize_flags(stored.get(SI_PIN_FLAG_FIELD)) == desired[SI_PIN_FLAG_FIELD]
     )
+
+
+def _has_pin_coordinates(values: Optional[dict[str, Any]]) -> bool:
+    values = values or {}
+    return (
+        abs(_stored_float(values.get(SI_PIN_LATITUDE_FIELD))) >= _COORD_EPSILON
+        or abs(_stored_float(values.get(SI_PIN_LONGITUDE_FIELD))) >= _COORD_EPSILON
+    )
+
+
+def _desired_snapshot(order: Any, stored: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """What the invoice snapshot should hold for this order, given what it holds.
+
+    Starts from :func:`resolve_delivery_pin`, then applies two rules that depend
+    on the stored row (which is why the poll pre-check and the writer must both
+    call this and never ``resolve_delivery_pin`` directly):
+
+    * **Pin removed.** The order now carries no pin and no review flag, but the
+      snapshot holds a pin (or is already ``pin_removed``): the customer took
+      the pin off the website. The snapshot becomes blank coordinates plus
+      exactly ``pin_removed`` instead of silently emptying -- an empty snapshot
+      is indistinguishable from "never had a pin" and lets jarz_pos fall back to
+      the shared Address pin, i.e. the pin the customer just withdrew. Never set
+      for an order whose stored snapshot never held a pin. When the order does
+      carry another flag (``outside_egypt`` ...), that flag already blanks the
+      card on the jarz_pos side, so ``pin_removed`` is not added. A new pin
+      arriving later yields coordinates and no ``pin_removed``, which clears it.
+    * **Pending short link.** The order still carries a short Maps link that a
+      background job already resolved into a stored ``maps_link`` pin. The raw
+      payload yields no coordinates, but that is not a removal: keep the stored
+      pin rather than blanking it on every poll.
+    """
+    desired = _snapshot_values(resolve_delivery_pin(order))
+    if _has_pin_coordinates(desired):
+        return desired
+    stored = stored or {}
+    stored_has_pin = _has_pin_coordinates(stored)
+    stored_flags = {
+        token for token in _normalize_flags(stored.get(SI_PIN_FLAG_FIELD)).split(",") if token
+    }
+    if find_short_link(order):
+        if (
+            stored_has_pin
+            and str(stored.get(SI_PIN_SOURCE_FIELD) or "").strip() == PIN_SOURCE_MAPS_LINK
+        ):
+            desired[SI_PIN_LATITUDE_FIELD] = _stored_float(stored.get(SI_PIN_LATITUDE_FIELD))
+            desired[SI_PIN_LONGITUDE_FIELD] = _stored_float(stored.get(SI_PIN_LONGITUDE_FIELD))
+            desired[SI_PIN_SOURCE_FIELD] = PIN_SOURCE_MAPS_LINK
+            return desired
+        if PIN_FLAG_OUTSIDE_EGYPT in stored_flags:
+            # The background job expanded the link to a point outside Egypt and
+            # flagged it; the raw payload alone cannot reproduce that flag.
+            desired[SI_PIN_FLAG_FIELD] = _normalize_flags(
+                set(filter(None, desired[SI_PIN_FLAG_FIELD].split(","))) | {PIN_FLAG_OUTSIDE_EGYPT}
+            )
+            return desired
+    if not desired[SI_PIN_FLAG_FIELD] and (stored_has_pin or PIN_FLAG_PIN_REMOVED in stored_flags):
+        desired[SI_PIN_FLAG_FIELD] = PIN_FLAG_PIN_REMOVED
+    return desired
 
 
 def _read_invoice_snapshot(invoice_name: str) -> Optional[dict[str, Any]]:
@@ -1319,12 +1491,16 @@ def _write_invoice_pin_snapshot(order: Any, invoice_name: Any) -> dict[str, Any]
     if not invoice_name or not invoice_pin_fields_available():
         return outcome
     try:
-        desired = _snapshot_values(resolve_delivery_pin(order))
-        outcome["current"] = desired
         stored = _read_invoice_snapshot(invoice_name)
+        desired = _desired_snapshot(order, stored)
+        outcome["current"] = desired
         if stored is None:
             return outcome
         outcome["previous"] = stored
+        # A link that needs a network round trip is resolved in the background,
+        # never here. Runs before the equality return: a first-time order with a
+        # short link has an empty snapshot that already "equals" the empty desire.
+        enqueue_short_link_expansion(order, invoice_name, desired, stored)
         if _snapshots_equal(stored, desired):
             return outcome
         frappe.db.set_value("Sales Invoice", invoice_name, dict(desired), update_modified=False)
@@ -1379,7 +1555,9 @@ def invoice_pin_snapshot_differs(order: Any, invoice_name: Any) -> bool:
         stored = _read_invoice_snapshot(invoice_name)
         if stored is None:
             return False
-        desired = _snapshot_values(resolve_delivery_pin(order))
+        # The SAME function the writer uses: if the poll pre-check and the
+        # writer disagreed about the target, the order would be requeued forever.
+        desired = _desired_snapshot(order, stored)
         return not _snapshots_equal(stored, desired)
     except Exception:  # noqa: BLE001
         return False
@@ -1579,3 +1757,489 @@ def resync_order_pins_job(woo_order_ids: list[Any]) -> dict[str, Any]:
         "errors": summary["errors"],
     })
     return {"success": True, **summary}
+
+
+# ---------------------------------------------------------------------------
+# Short Maps links -- expanded in the BACKGROUND only
+# ---------------------------------------------------------------------------
+#
+# ``parse_maps_link`` cannot read a ``maps.app.goo.gl`` link: the coordinates
+# live behind a redirect. Following it needs a network round trip, which must
+# never happen inside the order-sync request path (one slow shortener would stall
+# a worker per order). So the sync path only *notices* a short link and enqueues
+# ``expand_short_link_job`` on the short queue; the job expands it and applies the
+# result through the same code path an inline link takes.
+#
+# The expander is a deliberate copy of ``jarz_pos.utils.geo.expand_short_link``
+# (the two apps never import each other): redirects are followed one hop at a
+# time with urllib's own follower disabled, every hop is re-checked against a
+# host allowlist, https only, the body is never read, one overall deadline.
+
+SHORT_LINK_HOSTS = frozenset({"maps.app.goo.gl", "app.goo.gl", "goo.gl", "g.co", "share.google"})
+
+#: Hosts a redirect may legitimately land on. Anything else ends the chain.
+MAPS_LINK_HOSTS = frozenset(
+    {
+        "google.com",
+        "www.google.com",
+        "maps.google.com",
+        "google.com.eg",
+        "www.google.com.eg",
+        "maps.google.com.eg",
+        "consent.google.com",
+        "plus.codes",
+        "www.plus.codes",
+        "maps.apple.com",
+    }
+)
+
+SHORT_LINK_TIMEOUT_S = 5.0
+SHORT_LINK_MAX_HOPS = 5
+_SHORT_LINK_MISS_TTL_S = 6 * 3600
+_SHORT_LINK_JOB_TIMEOUT_S = 60
+
+_SHORT_LINK_RE = re.compile(
+    r"(?<![\w.@-])(?:https?://)?"
+    r"(?:(?:[a-z0-9-]+\.)?app\.goo\.gl|goo\.gl|g\.co|share\.google)"
+    r"/[^\s<>\"']+",
+    re.IGNORECASE,
+)
+
+_GEO_META_KEYS = frozenset(
+    _ORDER_LAT_META_KEYS
+    + _ORDER_LNG_META_KEYS
+    + _ORDER_COMBINED_META_KEYS
+    + _DPN_PIN_SOURCE_KEYS
+    + _DPN_AREA_STATUS_KEYS
+    + _DPN_AREA_MISMATCH_KEYS
+)
+_GEO_ADDRESS_KEYS = _WOO_ADDRESS_TEXT_KEYS + ("latitude", "longitude")
+
+#: Address sources that are staff / courier evidence, not the customer's own.
+_STAFF_PIN_SOURCES = frozenset({"pos_link", "courier_web", "courier_verified", "manual_override"})
+
+
+def is_short_link_host(host: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    return host in SHORT_LINK_HOSTS or host.endswith(".app.goo.gl")
+
+
+def _hop_is_permitted(url: str) -> bool:
+    """True when *url* is an HTTPS address on a host expansion may fetch."""
+    try:
+        parsed = urlparse(url)
+    except Exception:  # noqa: BLE001
+        return False
+    if (parsed.scheme or "").lower() != "https":
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    return is_short_link_host(host) or host in MAPS_LINK_HOSTS
+
+
+def _https_upgraded(url: str) -> str:
+    """Rewrite a plain-HTTP shortener to HTTPS. Never downgrades."""
+    if not url.lower().startswith("http://"):
+        return url
+    upgraded = "https://" + url[len("http://"):]
+    return upgraded if _hop_is_permitted(upgraded) else url
+
+
+def _redirect_status_and_headers(url: str, method: str, timeout: float):
+    """One request, redirects NOT followed, body never read."""
+    import urllib.error
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+            return None
+
+    request = urllib.request.Request(
+        url, method=method, headers={"User-Agent": "jarz-woo-geo/1.0"}
+    )
+    try:
+        response = urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout)
+        try:
+            return int(getattr(response, "status", 200)), response.headers
+        finally:
+            response.close()
+    except urllib.error.HTTPError as exc:
+        try:
+            return int(exc.code), dict(exc.headers or {})
+        finally:
+            exc.close()
+
+
+def _header_value(headers: Any, name: str) -> str:
+    """Case-insensitive header lookup over an HTTPMessage or a plain dict."""
+    if not headers:
+        return ""
+    try:
+        for key, value in dict(headers).items():
+            if str(key).lower() == name.lower():
+                return str(value or "").strip()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return str(headers.get(name) or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def expand_short_link(
+    url: Any,
+    *,
+    timeout: float = SHORT_LINK_TIMEOUT_S,
+    max_hops: int = SHORT_LINK_MAX_HOPS,
+) -> str:
+    """Follow a Maps shortener's redirect chain to the real URL.
+
+    **Background jobs only** -- it blocks on the network. Every hop is chosen by
+    a remote server, so each one is re-checked against the host allowlist before
+    it is fetched (otherwise "expand this short link" becomes a server-side
+    request forgery). One deadline covers the whole chain; at most ``max_hops``
+    redirects are followed; the body is never read.
+
+    Returns the expanded URL, or ``""`` on any failure or when the chain ends
+    back on a shortener. Never raises.
+    """
+    try:
+        current = _https_upgraded(str(url or "").strip())
+        if not _hop_is_permitted(current):
+            return ""
+        deadline = time.monotonic() + max(0.25, min(float(timeout), 8.0))
+        for _ in range(max(1, min(int(max_hops), 8)) + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            status, headers = _redirect_status_and_headers(current, "HEAD", remaining)
+            if status in (405, 501):
+                # Some shorteners refuse HEAD; the Location header is all we need.
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ""
+                status, headers = _redirect_status_and_headers(current, "GET", remaining)
+            if 300 <= status < 400:
+                location = _header_value(headers, "Location")
+                if not location:
+                    return ""
+                nxt = urljoin(current, location)
+                if not _hop_is_permitted(nxt):
+                    return ""
+                current = nxt
+                continue
+            if not (200 <= status < 300):
+                return ""
+            host = (urlparse(current).hostname or "").lower()
+            return "" if is_short_link_host(host) else current
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _short_link_in_text(value: Any) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    match = _SHORT_LINK_RE.search(value[:2000])
+    return match.group(0).rstrip(".,;:)]}") if match else ""
+
+
+def find_short_link(order: Any) -> str:
+    """The first short Maps link in the order's location-bearing fields, or "".
+
+    Looked at, in order: the order-meta location values, the delivery
+    destination's address lines, then billing's lines when shipping is the
+    destination (the same billing fallback :func:`resolve_delivery_pin` uses).
+    Pure string matching -- no I/O. The exact matched text is returned so a job
+    can substitute the expansion for it.
+    """
+    try:
+        if not isinstance(order, dict):
+            return ""
+        meta = _meta_value_map(order.get("meta_data"))
+        billing = order.get("billing") or {}
+        shipping = order.get("shipping") or {}
+        destination = shipping if _woo_address_has_text(shipping) else billing
+        candidates: list[Any] = [meta.get(key) for key in _ORDER_COMBINED_META_KEYS]
+        for block in (destination, billing):
+            if isinstance(block, dict):
+                candidates.extend(block.get(key) for key in _WOO_ADDRESS_TEXT_KEYS)
+        for candidate in candidates:
+            found = _short_link_in_text(candidate)
+            if found:
+                return found
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def _short_link_fetch_url(raw: str) -> str:
+    raw = (raw or "").strip()
+    return raw if raw.lower().startswith(("http://", "https://")) else "https://" + raw
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _geo_order_slice(order: Any) -> dict[str, Any]:
+    """The geo-relevant subset of an order payload, small enough for a job arg."""
+    order = order if isinstance(order, dict) else {}
+    meta = _meta_value_map(order.get("meta_data"))
+    result: dict[str, Any] = {
+        "id": _json_safe(order.get("id")),
+        "number": _json_safe(order.get("number")),
+        "meta_data": [
+            {"key": key, "value": _json_safe(value)}
+            for key, value in meta.items()
+            if key in _GEO_META_KEYS
+        ],
+    }
+    for block in ("billing", "shipping"):
+        data = order.get(block) if isinstance(order.get(block), dict) else {}
+        result[block] = {
+            key: _json_safe(data.get(key)) for key in _GEO_ADDRESS_KEYS if key in data
+        }
+    return result
+
+
+def _substitute_link(value: Any, raw: str, expanded: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(raw, expanded)
+    if isinstance(value, list):
+        return [_substitute_link(item, raw, expanded) for item in value]
+    if isinstance(value, dict):
+        return {key: _substitute_link(item, raw, expanded) for key, item in value.items()}
+    return value
+
+
+def _short_link_digest(link: str) -> str:
+    return hashlib.sha1((link or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _short_link_miss_key(invoice_name: Any, link: str) -> str:
+    return f"woo_geo_short_link_miss:{invoice_name}:{_short_link_digest(link)}"
+
+
+def _short_link_miss_cached(invoice_name: Any, link: str) -> bool:
+    try:
+        return bool(frappe.cache().get_value(_short_link_miss_key(invoice_name, link)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _remember_short_link_miss(invoice_name: Any, link: str) -> None:
+    """Remember an unresolvable link so every poll does not re-fetch it."""
+    try:
+        frappe.cache().set_value(
+            _short_link_miss_key(invoice_name, link), "1", expires_in_sec=_SHORT_LINK_MISS_TTL_S
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def enqueue_short_link_expansion(
+    order: Any,
+    invoice_name: Any,
+    desired: Optional[dict[str, Any]] = None,
+    stored: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Queue a background expansion when the order has only a short link.
+
+    Conditions: the order resolves to no coordinates (``desired``), the snapshot
+    holds none either, a short link is present, and that link has not already
+    failed to resolve recently. Does no network I/O. Returns True when a job was
+    queued. Never raises.
+    """
+    try:
+        if not invoice_name:
+            return False
+        if desired is None:
+            desired = _desired_snapshot(order, stored)
+        if _has_pin_coordinates(desired) or _has_pin_coordinates(stored):
+            return False
+        if PIN_FLAG_OUTSIDE_EGYPT in _normalize_flags((stored or {}).get(SI_PIN_FLAG_FIELD)):
+            return False  # already expanded (to a point outside Egypt) and flagged
+        link = find_short_link(order)
+        if not link or _short_link_miss_cached(invoice_name, link):
+            return False
+        frappe.enqueue(
+            "jarz_woocommerce_integration.services.geo_passthrough.expand_short_link_job",
+            queue="short",
+            timeout=_SHORT_LINK_JOB_TIMEOUT_S,
+            enqueue_after_commit=True,
+            job_id=f"woo_geo_expand_{invoice_name}_{_short_link_digest(link)}",
+            deduplicate=True,
+            invoice_name=str(invoice_name),
+            link=link,
+            order_slice=_geo_order_slice(order),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_geo_short_link_enqueue_failed",
+            "invoice": str(invoice_name),
+            "error": str(exc),
+        })
+        return False
+
+
+def _address_holds_staff_pin(address_name: Optional[str]) -> bool:
+    if not address_name:
+        return False
+    try:
+        row = frappe.db.get_value(
+            "Address", address_name, list(_ADDRESS_READ_FIELDS), as_dict=True
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(row, dict):
+        return False
+    source = str(row.get("custom_geo_source") or "").strip()
+    has_coordinates = (
+        _to_float(row.get("custom_latitude")) is not None
+        and _to_float(row.get("custom_longitude")) is not None
+        and (_stored_float(row.get("custom_latitude")) or _stored_float(row.get("custom_longitude")))
+    )
+    return bool(has_coordinates and source in _STAFF_PIN_SOURCES)
+
+
+def expand_short_link_job(
+    invoice_name: str, link: str, order_slice: Optional[dict[str, Any]] = None
+) -> dict[str, Any]:
+    """Background body: expand one short link and apply the pin it resolves to.
+
+    The expanded URL replaces the short link inside the order slice and the
+    result runs through the NORMAL pipeline -- :func:`resolve_delivery_pin` (so
+    the outside-Egypt flag and source labels are identical to an inline link),
+    :func:`_write_invoice_pin_snapshot`, then :func:`apply_order_pins`, whose
+    writes are capped at ``customer_pin`` like any other Woo pin.
+
+    Applied only when nothing better arrived meanwhile: skipped when the
+    snapshot already holds coordinates, or when a linked Address holds a staff
+    pin (``pos_link`` or higher) -- staff evidence outranks a customer's old
+    link. A link that expands to no coordinates (a shared PLACE link
+    ``?q=<name>&ftid=...``) stays unresolved: logged at debug level, remembered
+    for a few hours, no Error Log row. Never raises.
+    """
+    result: dict[str, Any] = {"applied": False, "reason": ""}
+    try:
+        if not invoice_name or not link or not invoice_pin_fields_available():
+            result["reason"] = "unavailable"
+            return result
+        stored = _read_invoice_snapshot(invoice_name)
+        if stored is None or _has_pin_coordinates(stored):
+            result["reason"] = "pin_already_present"
+            return result
+
+        expanded = expand_short_link(_short_link_fetch_url(link))
+        patched = _substitute_link(order_slice or {}, link, expanded) if expanded else None
+        delivery = resolve_delivery_pin(patched) if patched else None
+        resolved = bool(delivery) and (
+            _has_pin_coordinates(_snapshot_values(delivery))
+            or PIN_FLAG_OUTSIDE_EGYPT in _normalize_flags(delivery.get("flags"))
+        )
+        if not resolved:
+            _remember_short_link_miss(invoice_name, link)
+            LOGGER.debug({
+                "event": "woo_geo_short_link_unresolved",
+                "invoice": invoice_name,
+                "expanded": bool(expanded),
+            })
+            result["reason"] = "unresolved"
+            return result
+
+        row = frappe.db.get_value(
+            "Sales Invoice", invoice_name, ["customer_address", "shipping_address_name"], as_dict=True
+        ) or {}
+        billing_address = row.get("customer_address")
+        shipping_address = row.get("shipping_address_name")
+        if _address_holds_staff_pin(billing_address) or _address_holds_staff_pin(shipping_address):
+            _remember_short_link_miss(invoice_name, link)
+            LOGGER.info({
+                "event": "woo_geo_short_link_skipped",
+                "invoice": invoice_name,
+                "reason": "address_has_staff_pin",
+            })
+            result["reason"] = "address_has_staff_pin"
+            return result
+
+        outcome = _write_invoice_pin_snapshot(patched, invoice_name)
+        applied = apply_order_pins(
+            patched,
+            billing_address=billing_address,
+            shipping_address=shipping_address,
+            protect_pos_link=True,
+        )
+        result.update({
+            "applied": True,
+            "reason": "expanded",
+            "snapshot_written": bool(outcome.get("written")),
+            "billing_applied": applied.get("billing_applied"),
+            "shipping_applied": applied.get("shipping_applied"),
+        })
+        LOGGER.info({
+            "event": "woo_geo_short_link_resolved",
+            "invoice": invoice_name,
+            "snapshot_written": result["snapshot_written"],
+        })
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_geo_short_link_job_failed",
+            "invoice": str(invoice_name),
+            "error": str(exc),
+        })
+        result["reason"] = "error"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Last pin received from Woo for an order (the invoice snapshot)
+# ---------------------------------------------------------------------------
+
+
+def last_received_delivery_pin(order: Any) -> Optional[tuple[float, float]]:
+    """``(lat, lng)`` this order's customer pin had the LAST time it synced.
+
+    The invoice snapshot is exactly that: only this module writes it, from the
+    Woo payload. ``None`` when the order has never synced, has no snapshot, or
+    its snapshot holds no coordinates (an order that is new to us, or one whose
+    pin was removed). Used by ``customer_sync`` to tell "same coordinates again"
+    from "the customer sent a new pin". Never raises.
+    """
+    try:
+        if not isinstance(order, dict) or not order.get("id"):
+            return None
+        if not invoice_pin_fields_available():
+            return None
+        link_field = _order_map_link_field()
+        map_row = frappe.db.get_value(
+            "WooCommerce Order Map", {"woo_order_id": order.get("id")}, [link_field, "status"], as_dict=True
+        )
+        if not isinstance(map_row, dict) or is_retired_duplicate_row(map_row):
+            return None
+        invoice = map_row.get(link_field)
+        if not invoice or not isinstance(invoice, str):
+            return None
+        stored = _read_invoice_snapshot(invoice)
+        if not isinstance(stored, dict) or not _has_pin_coordinates(stored):
+            return None
+        return (
+            _stored_float(stored.get(SI_PIN_LATITUDE_FIELD)),
+            _stored_float(stored.get(SI_PIN_LONGITUDE_FIELD)),
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def pin_matches_coordinates(pin: Optional[GeoPin], coordinates: Optional[tuple[float, float]]) -> bool:
+    """True when *pin* sits on *coordinates* (the snapshot's resolution)."""
+    if pin is None or coordinates is None:
+        return False
+    return (
+        abs(pin.latitude - coordinates[0]) < _COORD_EPSILON
+        and abs(pin.longitude - coordinates[1]) < _COORD_EPSILON
+    )
