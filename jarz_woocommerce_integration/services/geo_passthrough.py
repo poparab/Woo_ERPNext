@@ -69,8 +69,10 @@ signature *and* of the outbound push trigger set.
 
 from __future__ import annotations
 
+from functools import partial
 import re
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, Iterator, NamedTuple, Optional
+from urllib.parse import unquote
 
 import frappe
 
@@ -196,20 +198,127 @@ EGYPT_LAT_MAX = 32.0
 EGYPT_LNG_MIN = 24.5
 EGYPT_LNG_MAX = 37.0
 
-_MAPS_COORD_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # ?q=30.0444,31.2357 / ?query= / &ll= / &destination= / q=loc:30.04,31.23
-    re.compile(
-        r"[?&](?:q|query|ll|sll|center|destination|daddr|saddr)="
-        r"(?:loc:)?\s*(-?\d{1,3}\.\d+)\s*(?:,|%2C)\s*(-?\d{1,3}\.\d+)",
-        re.IGNORECASE,
-    ),
-    # Google place payload: ...!3d30.0444!4d31.2357
-    re.compile(r"!3d(-?\d{1,3}\.\d+)!4d(-?\d{1,3}\.\d+)"),
-    # /maps/@30.0444,31.2357,17z  (the @ pair is lat,lng -- same order as ?q=)
-    re.compile(r"@(-?\d{1,3}\.\d+),\s*(-?\d{1,3}\.\d+)"),
-    # Bare "30.0444, 31.2357" pasted without a URL. Three decimals minimum, so
-    # prices, postcodes and phone numbers cannot match.
-    re.compile(r"(?<![\d.\-])(-?\d{1,3}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})(?![\d.])"),
+# ---------------------------------------------------------------------------
+# Map-link / coordinate-text patterns (used by ``parse_maps_link``)
+# ---------------------------------------------------------------------------
+#
+# Two classes of input, with different strictness:
+#
+# * URL coordinate *slots* (``?q=``, ``@``, ``/place/``, ``cp=``, ``mlat=`` ...).
+#   The slot itself says "this is a coordinate", so integer pairs are allowed
+#   there (``@30,31,17z``, ``?q=30,31``) -- with a guard each, see the
+#   ``_integer_*`` helpers.
+# * Bare text. A pair of numbers in prose is only a coordinate when it carries
+#   markers (degree sign, hemisphere letter, DMS) or, unmarked, at least three
+#   decimals on both halves -- so "Building 30, 31 street", street numbers,
+#   "Villa 12.500", postcodes and phone numbers never match.
+
+# Arabic-Indic (U+0660-0669) and Persian (U+06F0-06F9) digits, the Arabic
+# decimal separator (U+066B), Arabic comma (U+060C) and Arabic semicolon
+# (U+061B), folded to ASCII before any pattern runs. An Arabic phone keyboard
+# types these by default.
+_DIGIT_FOLD: dict[int, str] = {
+    **{0x0660 + offset: str(offset) for offset in range(10)},
+    **{0x06F0 + offset: str(offset) for offset in range(10)},
+    0x066B: ".",
+    0x060C: ",",
+    0x061B: ";",
+}
+
+# ``https%3A%2F%2Fmaps...`` arrives when a link was copied out of another URL
+# (a share sheet, a redirect, a WhatsApp preview). Twice-encoded happens too.
+_MAX_PERCENT_DECODE_PASSES = 2
+
+# A number in a URL slot: integer or decimal, optional sign.
+_NUM = r"[-+]?\d{1,3}(?:\.\d+)?"
+# Separator inside a URL slot: "," or "%2C", optionally followed by the space
+# Google inserts when it builds a search URL ("30.0444,+31.2357").
+_URL_SEP = r"\s*(?:,|%2C)(?:\s|\+|%20)*"
+_END = r"(?![\d.])"
+
+# Google place payload: ...!3d30.0444!4d31.2357 -- the dropped pin itself.
+_PLACE_PIN_RE = re.compile(r"!3d(" + _NUM + r")!4d(" + _NUM + r")" + _END)
+# ?q= / ?query= / &ll= / &destination= / q=loc:lat,lng / Apple ?coordinate=
+_QUERY_SLOT_RE = re.compile(
+    r"[?&;](?:q|query|ll|sll|center|destination|daddr|saddr|coordinate)="
+    r"(?:loc:)?\s*(" + _NUM + r")" + _URL_SEP + r"(" + _NUM + r")" + _END,
+    re.IGNORECASE,
+)
+# Bing: ?cp=30.0444~31.2357
+_BING_CP_RE = re.compile(
+    r"[?&;]cp=(" + _NUM + r")(?:~|%7E)(" + _NUM + r")" + _END, re.IGNORECASE
+)
+# OpenStreetMap marker: ?mlat=30.0444&mlon=31.2357 (either order)
+_OSM_MLAT_RE = re.compile(r"[?&;]mlat=(" + _NUM + r")" + _END, re.IGNORECASE)
+_OSM_MLON_RE = re.compile(r"[?&;]mlon=(" + _NUM + r")" + _END, re.IGNORECASE)
+# Google path slot: /maps/place/lat,lng  /maps/search/lat,+lng  /maps/dir//lat,lng
+_PATH_SLOT_RE = re.compile(
+    r"/(?:place|search|dir)/+(" + _NUM + r")" + _URL_SEP + r"(" + _NUM + r")" + _END,
+    re.IGNORECASE,
+)
+# /maps/@30.0444,31.2357,17z  (the @ pair is lat,lng -- same order as ?q=).
+# The viewport centre, so it ranks below every explicit pin slot.
+_AT_VIEWPORT_RE = re.compile(r"@(" + _NUM + r"),\s*(" + _NUM + r")" + _END)
+# OpenStreetMap viewport: #map=17/30.0444/31.2357
+_OSM_MAP_HASH_RE = re.compile(
+    r"[#&]map=\d{1,2}(?:\.\d+)?/(" + _NUM + r")/(" + _NUM + r")" + _END, re.IGNORECASE
+)
+# RFC 5870 geo URI (Android share sheet): geo:30.0444,31.2357
+_GEO_URI_RE = re.compile(
+    r"(?<![A-Za-z])geo:(" + _NUM + r")" + _URL_SEP + r"(" + _NUM + r")" + _END,
+    re.IGNORECASE,
+)
+
+# An integer pair in a URL slot followed by a word is an address search
+# ("?q=30,+31+street"), not a coordinate.
+_WORD_TAIL_RE = re.compile(r"(?:\s|\+|%20)*[^\W\d_]")
+# An integer @ pair is only trusted when Google's zoom suffix follows (",17z").
+_ZOOM_TAIL_RE = re.compile(r",\s*\d+(?:\.\d+)?[a-z]", re.IGNORECASE)
+
+# Open Location Code (Plus Codes). Full codes only: 8 digits, "+", 2-7 digits.
+# Short codes ("26VP+Q7 Cairo") need a reference location and are rejected;
+# padded codes ("8G2H0000+") contain "0", which is not in the alphabet.
+_OLC_ALPHABET = "23456789CFGHJMPQRVWX"
+_OLC_PAIR_LENGTH = 10
+_OLC_MAX_LENGTH = 15
+_OLC_GRID_COLUMNS = 4
+_OLC_GRID_ROWS = 5
+_PLUS_CODE_RE = re.compile(
+    r"(?<![0-9A-Za-z])([" + _OLC_ALPHABET + r"]{8})\+([" + _OLC_ALPHABET + r"]{2,7})"
+    r"(?![0-9A-Za-z])",
+    re.IGNORECASE,
+)
+
+_DEGREE = "[°º˚]"
+_MINUTE_MARK = "['′’]"
+_SECOND_MARK = "(?:\"|''|″|”)"
+
+# DMS as Google copies it: 30°02'39.8"N 31°14'08.6"E (seconds optional).
+_DMS_TOKEN = (
+    r"(\d{1,3})\s*" + _DEGREE + r"\s*(\d{1,2}(?:\.\d+)?)\s*" + _MINUTE_MARK + r"\s*"
+    r"(?:(\d{1,2}(?:\.\d+)?)\s*" + _SECOND_MARK + r"\s*)?([NSEW])(?![A-Za-z])"
+)
+_DMS_PAIR_RE = re.compile(
+    r"(?<![\w.])" + _DMS_TOKEN + r"[\s,;+]*" + _DMS_TOKEN, re.IGNORECASE
+)
+
+# Decimal degrees with markers: "30.0444° N, 31.2357° E", "30.0444N 31.2357E".
+# Each half must carry a degree sign, a hemisphere letter, or both; an unmarked
+# pair is left to the stricter bare-pair rule. Groups per half: number, degree
+# sign, letter after the degree sign, letter with no degree sign.
+_HEMI_TOKEN = (
+    r"(-?\d{1,3}\.\d+)(?!\d)\s*"
+    r"(?:(" + _DEGREE + r")\s*([NSEW])?|([NSEW]))(?![A-Za-z])"
+)
+_HEMI_PAIR_RE = re.compile(
+    r"(?<![\w.\-])" + _HEMI_TOKEN + r"[\s,;+]*" + _HEMI_TOKEN, re.IGNORECASE
+)
+
+# Bare "30.0444, 31.2357" pasted without a URL (comma, semicolon or space
+# separated). Three decimals minimum, so prices, postcodes and phone numbers
+# cannot match.
+_BARE_PAIR_RE = re.compile(
+    r"(?<![\d.\-])(-?\d{1,3}\.\d{3,})(?:\s*[,;]\s*|\s+)(-?\d{1,3}\.\d{3,})(?![\d.])"
 )
 
 
@@ -302,14 +411,233 @@ def _same_coordinate(left: Any, right: Optional[float]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _candidate_forms(raw: str) -> list[str]:
+    """``raw`` plus up to two percent-decoded forms, digits folded to ASCII.
+
+    Order is raw first, then each decode pass; duplicates are dropped.
+    """
+    forms = [raw]
+    current = raw
+    for _ in range(_MAX_PERCENT_DECODE_PASSES):
+        if "%" not in current:
+            break
+        try:
+            decoded = unquote(current)
+        except Exception:  # noqa: BLE001
+            break
+        if decoded == current:
+            break
+        forms.append(decoded)
+        current = decoded
+    folded: list[str] = []
+    for form in forms:
+        normalized = form.translate(_DIGIT_FOLD)
+        if normalized not in folded:
+            folded.append(normalized)
+    return folded
+
+
+def _integer_pair_always_ok(_form: str, _end: int) -> bool:
+    return True
+
+
+def _integer_pair_not_followed_by_word(form: str, end: int) -> bool:
+    """``?q=30,31`` is a pin; ``?q=30,+31+street`` is an address search."""
+    return _WORD_TAIL_RE.match(form, end) is None
+
+
+def _integer_pair_followed_by_zoom(form: str, end: int) -> bool:
+    """``@30,31,17z`` is a Google viewport; a bare ``@30,31`` is not trusted."""
+    return _ZOOM_TAIL_RE.match(form, end) is not None
+
+
+def _slot_pairs(
+    pattern: re.Pattern[str],
+    integer_ok: Callable[[str, int], bool],
+    form: str,
+) -> Iterator[tuple[Any, Any]]:
+    """Every ``(lat, lng)`` the two-group ``pattern`` finds in ``form``.
+
+    A pair where *both* halves are integers is yielded only when
+    ``integer_ok(form, match_end)`` agrees.
+    """
+    for match in pattern.finditer(form):
+        latitude, longitude = match.group(1), match.group(2)
+        if "." not in latitude and "." not in longitude and not integer_ok(form, match.end()):
+            continue
+        yield latitude, longitude
+
+
+def _osm_marker_pairs(form: str) -> Iterator[tuple[Any, Any]]:
+    lat_match = _OSM_MLAT_RE.search(form)
+    lng_match = _OSM_MLON_RE.search(form)
+    if lat_match and lng_match:
+        yield lat_match.group(1), lng_match.group(1)
+
+
+def _decode_plus_code(code: str) -> Optional[tuple[float, float]]:
+    """Centre of a *full* Open Location Code, or ``None``.
+
+    Standard OLC decoding: five lat/lng digit pairs at resolutions 20, 1, 0.05,
+    0.0025, 0.000125 degrees, then up to five 4x5 grid refinement digits.
+    """
+    digits = str(code or "").upper().replace("+", "")
+    if not (_OLC_PAIR_LENGTH <= len(digits) <= _OLC_MAX_LENGTH):
+        return None
+    if any(ch not in _OLC_ALPHABET for ch in digits):
+        return None
+    values = [_OLC_ALPHABET.index(ch) for ch in digits]
+    # First latitude digit spans 0-180 in 20-degree steps (max index 8); first
+    # longitude digit spans 0-360 (max index 17).
+    if values[0] > 8 or values[1] > 17:
+        return None
+    latitude = -90.0
+    longitude = -180.0
+    lat_size = lng_size = 20.0
+    for index in range(0, _OLC_PAIR_LENGTH, 2):
+        if index:
+            lat_size /= 20.0
+            lng_size /= 20.0
+        latitude += values[index] * lat_size
+        longitude += values[index + 1] * lng_size
+    for value in values[_OLC_PAIR_LENGTH:]:
+        lat_size /= _OLC_GRID_ROWS
+        lng_size /= _OLC_GRID_COLUMNS
+        row, column = divmod(value, _OLC_GRID_COLUMNS)
+        latitude += row * lat_size
+        longitude += column * lng_size
+    centre_lat = min(latitude + lat_size / 2.0, 90.0)
+    centre_lng = longitude + lng_size / 2.0
+    if centre_lng > 180.0:
+        centre_lng -= 360.0
+    return centre_lat, centre_lng
+
+
+def _plus_code_pairs(form: str) -> Iterator[tuple[Any, Any]]:
+    for match in _PLUS_CODE_RE.finditer(form):
+        decoded = _decode_plus_code(f"{match.group(1)}+{match.group(2)}")
+        if decoded is not None:
+            yield decoded
+
+
+def _orient_pair(
+    first: float, first_hemisphere: str, second: float, second_hemisphere: str
+) -> Optional[tuple[float, float]]:
+    """Apply hemisphere letters and return ``(lat, lng)``.
+
+    A letter decides its half's axis and sign (S/W negative). With no letters
+    the order is lat, lng. Two letters on the same axis are rejected.
+    """
+    first_hemisphere = (first_hemisphere or "").upper()
+    second_hemisphere = (second_hemisphere or "").upper()
+
+    def _axis(letter: str) -> str:
+        if letter in ("N", "S"):
+            return "lat"
+        if letter in ("E", "W"):
+            return "lng"
+        return ""
+
+    first_axis = _axis(first_hemisphere)
+    second_axis = _axis(second_hemisphere)
+    if not first_axis and not second_axis:
+        first_axis, second_axis = "lat", "lng"
+    elif not first_axis:
+        first_axis = "lng" if second_axis == "lat" else "lat"
+    elif not second_axis:
+        second_axis = "lng" if first_axis == "lat" else "lat"
+    if first_axis == second_axis:
+        return None
+
+    def _signed(value: float, letter: str) -> float:
+        if letter in ("S", "W"):
+            return -abs(value)
+        if letter in ("N", "E"):
+            return abs(value)
+        return value
+
+    first = _signed(first, first_hemisphere)
+    second = _signed(second, second_hemisphere)
+    return (first, second) if first_axis == "lat" else (second, first)
+
+
+def _dms_to_degrees(degrees: str, minutes: str, seconds: Optional[str]) -> Optional[float]:
+    deg = _to_float(degrees)
+    mins = _to_float(minutes)
+    secs = _to_float(seconds) if seconds else 0.0
+    if deg is None or mins is None or secs is None:
+        return None
+    if mins >= 60 or secs >= 60:
+        return None
+    return deg + mins / 60.0 + secs / 3600.0
+
+
+def _dms_pairs(form: str) -> Iterator[tuple[Any, Any]]:
+    for match in _DMS_PAIR_RE.finditer(form):
+        d1, m1, s1, h1, d2, m2, s2, h2 = match.groups()
+        first = _dms_to_degrees(d1, m1, s1)
+        second = _dms_to_degrees(d2, m2, s2)
+        if first is None or second is None:
+            continue
+        oriented = _orient_pair(first, h1, second, h2)
+        if oriented is not None:
+            yield oriented
+
+
+def _hemisphere_pairs(form: str) -> Iterator[tuple[Any, Any]]:
+    for match in _HEMI_PAIR_RE.finditer(form):
+        n1, _deg1, h1_after_deg, h1_only, n2, _deg2, h2_after_deg, h2_only = match.groups()
+        # The regex already demands a marker on both halves.
+        h1 = h1_after_deg or h1_only or ""
+        h2 = h2_after_deg or h2_only or ""
+        first = _to_float(n1)
+        second = _to_float(n2)
+        if first is None or second is None:
+            continue
+        oriented = _orient_pair(first, h1, second, h2)
+        if oriented is not None:
+            yield oriented
+
+
+# Precedence, highest first. The ``!3d!4d`` dropped pin outranks everything;
+# explicit pin slots outrank viewport centres (``@``, ``#map=``); URL forms
+# outrank free-text forms. Each extractor is tried on every candidate form
+# (raw, then percent-decoded) before the next extractor runs, so decoding never
+# lets a weaker format jump the queue.
+_COORD_EXTRACTORS: tuple[Callable[[str], Iterator[tuple[Any, Any]]], ...] = (
+    partial(_slot_pairs, _PLACE_PIN_RE, _integer_pair_always_ok),
+    partial(_slot_pairs, _QUERY_SLOT_RE, _integer_pair_not_followed_by_word),
+    partial(_slot_pairs, _BING_CP_RE, _integer_pair_not_followed_by_word),
+    _osm_marker_pairs,
+    partial(_slot_pairs, _PATH_SLOT_RE, _integer_pair_not_followed_by_word),
+    partial(_slot_pairs, _AT_VIEWPORT_RE, _integer_pair_followed_by_zoom),
+    partial(_slot_pairs, _OSM_MAP_HASH_RE, _integer_pair_always_ok),
+    partial(_slot_pairs, _GEO_URI_RE, _integer_pair_not_followed_by_word),
+    _plus_code_pairs,
+    _dms_pairs,
+    _hemisphere_pairs,
+    partial(_slot_pairs, _BARE_PAIR_RE, _integer_pair_always_ok),
+)
+
+
 def parse_maps_link(text: Any, *, egypt_only: bool = True) -> Optional[GeoPin]:
-    """Pull a coordinate pair out of a Google Maps link (or bare "lat,lng").
+    """Pull a coordinate pair out of a map link or a pasted location string.
+
+    Accepted: Google (``!3d!4d``, ``?q=``/``q=loc:``, ``/place/``, ``/search/``,
+    ``@lat,lng,zoom``), Apple ``?ll=``/``?coordinate=``, OpenStreetMap
+    ``?mlat=&mlon=`` and ``#map=z/lat/lng``, Bing ``cp=lat~lng``, ``geo:`` URIs,
+    full Plus Codes, DMS, decimal degrees with ° / N-S-E-W markers, and bare
+    "lat, lng" / "lat; lng" / "lat lng" pairs with at least three decimals.
+    Percent-encoded input is decoded (up to two passes) and Arabic-Indic /
+    Persian digits and Arabic separators are folded to ASCII first.
 
     Short ``maps.app.goo.gl`` links carry no coordinates and resolving them needs
     a network round trip, so they return ``None`` rather than being followed.
 
     ``egypt_only=False`` is for detection only (the ``outside_egypt`` flag); the
     default keeps every caller that writes coordinates inside Egypt.
+
+    Never raises.
     """
     if not text:
         return None
@@ -317,13 +645,17 @@ def parse_maps_link(text: Any, *, egypt_only: bool = True) -> Optional[GeoPin]:
     raw = str(text)
     if len(raw) > 2000:
         raw = raw[:2000]
-    for pattern in _MAPS_COORD_PATTERNS:
-        match = pattern.search(raw)
-        if not match:
-            continue
-        pin = factory(match.group(1), match.group(2))
-        if pin:
-            return pin
+    try:
+        forms = _candidate_forms(raw)
+        for extractor in _COORD_EXTRACTORS:
+            for form in forms:
+                for latitude, longitude in extractor(form):
+                    pin = factory(latitude, longitude)
+                    if pin:
+                        return pin
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({"event": "woo_maps_link_parse_failed", "error": str(exc)})
+        return None
     return None
 
 

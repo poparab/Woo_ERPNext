@@ -354,6 +354,163 @@ class TestPinExtraction(unittest.TestCase):
         }))
 
 
+class TestMapsLinkFormats(unittest.TestCase):
+    """Location formats found giving no pin in the 2026-10-17 staging test.
+
+    Every accepted case lands on a Cairo point; the rejection cases guard the
+    rules that keep street numbers and foreign pins out.
+    """
+
+    PARIS = (48.8566, 2.3522)
+
+    def _assert_pin(self, text, expected=CAIRO, *, places=None, egypt_only=True):
+        pin = geo_passthrough.parse_maps_link(text, egypt_only=egypt_only)
+        self.assertIsNotNone(pin, text)
+        if places is None:
+            self.assertEqual((pin.latitude, pin.longitude), tuple(expected), text)
+        else:
+            self.assertAlmostEqual(pin.latitude, expected[0], places=places, msg=text)
+            self.assertAlmostEqual(pin.longitude, expected[1], places=places, msg=text)
+
+    # ── accepted ──────────────────────────────────────────────────────────
+
+    def test_percent_encoded_url_is_decoded(self):
+        self._assert_pin(
+            "https%3A%2F%2Fmaps.google.com%2F%3Fq%3D30.1016%2C31.2977", (30.1016, 31.2977)
+        )
+
+    def test_twice_percent_encoded_url_is_decoded(self):
+        self._assert_pin(
+            "https%253A%252F%252Fmaps.google.com%252F%253Fq%253D30.1016%252C31.2977",
+            (30.1016, 31.2977),
+        )
+
+    def test_plus_codes_url_is_decoded_to_the_cell_centre(self):
+        self._assert_pin("https://plus.codes/8G2H26VP+Q7", places=4)
+
+    def test_bare_full_plus_code_is_decoded(self):
+        self._assert_pin("8G2H26VP+Q7", places=4)
+        self._assert_pin("Location: 8g2h26vp+q7 Cairo", places=4)
+
+    def test_percent_encoded_plus_code_in_a_search_url_is_decoded(self):
+        self._assert_pin(
+            "https://www.google.com/maps/search/?api=1&query=8G2H26VP%2BQ7", places=4
+        )
+
+    def test_integer_pair_in_the_at_slot_is_accepted(self):
+        self._assert_pin("https://www.google.com/maps/@30,31,17z", (30.0, 31.0))
+
+    def test_integer_pair_in_the_q_slot_is_accepted(self):
+        self._assert_pin("https://maps.google.com/?q=30,31", (30.0, 31.0))
+
+    def test_arabic_indic_digits_and_separators_are_folded(self):
+        self._assert_pin("٣٠٫٠٤٤٤، ٣١٫٢٣٥٧")
+
+    def test_persian_digits_are_folded(self):
+        self._assert_pin("۳۰٫۰۴۴۴، ۳۱٫۲۳۵۷")
+
+    def test_q_loc_slot_is_parsed(self):
+        self._assert_pin("https://maps.google.com/maps?q=loc:30.0444,31.2357")
+
+    def test_maps_place_path_pair_is_parsed(self):
+        self._assert_pin("https://www.google.com/maps/place/30.0444,31.2357")
+
+    def test_maps_search_path_pair_with_plus_is_parsed(self):
+        self._assert_pin("https://www.google.com/maps/search/30.0444,+31.2357")
+
+    def test_apple_coordinate_param_is_parsed(self):
+        self._assert_pin("https://maps.apple.com/?coordinate=30.0444,31.2357")
+
+    def test_osm_marker_params_are_parsed(self):
+        self._assert_pin("https://www.openstreetmap.org/?mlat=30.0444&mlon=31.2357")
+        self._assert_pin("https://www.openstreetmap.org/?mlon=31.2357&mlat=30.0444")
+
+    def test_osm_map_hash_is_parsed(self):
+        self._assert_pin("https://www.openstreetmap.org/#map=17/30.0444/31.2357")
+
+    def test_bing_cp_param_is_parsed(self):
+        self._assert_pin("https://www.bing.com/maps?cp=30.0444~31.2357&lvl=17")
+
+    def test_q_slot_with_plus_after_the_comma_is_parsed(self):
+        self._assert_pin("https://www.google.com/maps?q=30.0444,+31.2357")
+
+    def test_geo_uri_is_parsed(self):
+        self._assert_pin("geo:30.0444,31.2357?z=17")
+
+    def test_degree_and_hemisphere_pair_is_parsed(self):
+        self._assert_pin("30.0444° N, 31.2357° E")
+
+    def test_hemisphere_letters_without_degree_signs_are_parsed(self):
+        self._assert_pin("30.0444N 31.2357E")
+
+    def test_hemisphere_letters_set_the_sign_and_axis(self):
+        self._assert_pin("33.8688° S, 151.2093° E", (-33.8688, 151.2093), egypt_only=False)
+        self._assert_pin("31.2357E 30.0444N")
+
+    def test_dms_as_google_copies_it_is_parsed(self):
+        self._assert_pin("30°02'39.8\"N 31°14'08.6\"E", places=4)
+
+    def test_semicolon_separated_bare_pair_is_parsed(self):
+        self._assert_pin("30.0444; 31.2357")
+
+    def test_space_separated_bare_pair_is_parsed(self):
+        self._assert_pin("30.0444 31.2357")
+
+    def test_dropped_pin_outranks_the_viewport(self):
+        self._assert_pin(
+            "https://www.google.com/maps/place/Jarz/@30.0500,31.2400,17z/"
+            "data=!3m1!4b1!3d30.0444!4d31.2357"
+        )
+
+    def test_place_path_pin_outranks_the_viewport(self):
+        self._assert_pin(
+            "https://www.google.com/maps/place/30.0444,31.2357/@30.0500,31.2400,17z"
+        )
+
+    # ── rejected ──────────────────────────────────────────────────────────
+
+    def test_short_plus_code_is_rejected(self):
+        for text in ("26VP+Q7 Cairo", "https://plus.codes/26VP+Q7", "26VP+Q7"):
+            with self.subTest(text=text):
+                self.assertIsNone(geo_passthrough.parse_maps_link(text))
+                self.assertIsNone(geo_passthrough.parse_maps_link(text, egypt_only=False))
+
+    def test_padded_plus_code_is_rejected(self):
+        for text in ("8G2H0000+", "8G2H2600+", "8G2H26VP+"):
+            with self.subTest(text=text):
+                self.assertIsNone(geo_passthrough.parse_maps_link(text, egypt_only=False))
+
+    def test_integer_pair_in_prose_is_rejected(self):
+        for text in ("Building 30, 31 street", "Villa 30 31", "Block 30; 31"):
+            with self.subTest(text=text):
+                self.assertIsNone(geo_passthrough.parse_maps_link(text))
+                self.assertIsNone(geo_passthrough.parse_maps_link(text, egypt_only=False))
+
+    def test_integer_q_slot_followed_by_words_is_an_address_search(self):
+        self.assertIsNone(
+            geo_passthrough.parse_maps_link("https://www.google.com/maps?q=30,+31+street")
+        )
+
+    def test_integer_at_pair_without_a_zoom_is_rejected(self):
+        self.assertIsNone(geo_passthrough.parse_maps_link("Flat @30,31"))
+
+    def test_short_decimals_in_prose_are_still_rejected(self):
+        for text in ("Villa 12.500", "Villa 30.5, 31.2", "Floor 30.12 31.45"):
+            with self.subTest(text=text):
+                self.assertIsNone(geo_passthrough.parse_maps_link(text))
+
+    def test_paris_link_is_rejected_with_egypt_only(self):
+        link = "https://www.google.com/maps/@48.8566,2.3522,15z"
+        self.assertIsNone(geo_passthrough.parse_maps_link(link))
+        raw = geo_passthrough.parse_maps_link(link, egypt_only=False)
+        self.assertEqual((raw.latitude, raw.longitude), self.PARIS)
+
+    def test_short_maps_app_link_is_still_unresolved(self):
+        self.assertIsNone(
+            geo_passthrough.parse_maps_link("https://maps.app.goo.gl/Xb8kq2Ld3sYp9", egypt_only=False)
+        )
+
+
 class TestPinRouting(unittest.TestCase):
     def test_order_pin_goes_to_billing_when_there_is_no_shipping_address(self):
         billing_pin, shipping_pin = geo_passthrough.resolve_order_pins(
