@@ -203,6 +203,17 @@ doc_events = {
 	"Jarz Invoice Note": {
 		"after_insert": "jarz_woocommerce_integration.services.outbound_sync.enqueue_invoice_note_sync",
 	},
+	# Owned by jarz_pos; by name only. Mirrors sync_to_woo promo codes as Woo
+	# coupons (services/coupon_sync.py), gated by enable_outbound_coupons.
+	"Jarz Promo Code": {
+		"after_insert": "jarz_woocommerce_integration.services.coupon_sync.enqueue_coupon_sync",
+		"on_update": "jarz_woocommerce_integration.services.coupon_sync.enqueue_coupon_sync",
+		"on_trash": "jarz_woocommerce_integration.services.coupon_sync.enqueue_coupon_delete",
+	},
+	"Jarz Promo Redemption": {
+		"after_insert": "jarz_woocommerce_integration.services.coupon_sync.enqueue_coupon_sync_for_redemption",
+		"on_update": "jarz_woocommerce_integration.services.coupon_sync.enqueue_coupon_sync_for_redemption",
+	},
 }
 
 # Scheduled Tasks
