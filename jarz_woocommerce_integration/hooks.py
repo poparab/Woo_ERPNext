@@ -219,7 +219,6 @@ doc_events = {
 # Scheduled Tasks
 # ---------------
 
-# Customer incremental sync every 15 minutes
 scheduler_events = {
 	"cron": {
 		# WARNING: this key must stay unique within this dict. A duplicate
@@ -227,8 +226,11 @@ scheduler_events = {
 		# Python keeps only the last value for a repeated dict key, so the
 		# retry-queue cron silently vanished at import with no error anywhere.
 		# Any new every-minute job must be appended to this same list.
+		#
+		# Every scheduled run costs 20-30 s of worker time once production has
+		# used up its Lightsail CPU burst credits (2026-10-28), so only work that
+		# genuinely needs a one-minute tick stays here.
 		"* * * * *": [
-			"jarz_woocommerce_integration.services.sync_events.process_due_sync_events",
 			# Courier positions for orders with an open trip leg. Cron is the
 			# finest granularity Frappe's scheduler offers, and DropPin asks
 			# for 20-30 s while a courier is driving, so this fires every
@@ -241,15 +243,25 @@ scheduler_events = {
 			# under the 120 s after which they dim the marker.
 			"jarz_woocommerce_integration.services.droppin_sync.push_open_leg_positions",
 		],
-		"*/15 * * * *": [
+		# Sync-event ledger sweep. New events are enqueued straight to a worker
+		# (enqueue_sync_event); this sweep drains retries and deferred rows, so a
+		# two-minute tick adds at most one minute to a retry.
+		"*/2 * * * *": [
+			"jarz_woocommerce_integration.services.sync_events.process_due_sync_events"
+		],
+		# Customer catch-up sync hourly. The customer webhook delivers changes
+		# live; this poll only backfills what a webhook missed.
+		"23 * * * *": [
 			"jarz_woocommerce_integration.services.customer_sync.sync_customers_cron"
 		],
 		# Territory sync every 6 hours (at minute 0)
 		"0 */6 * * *": [
 			"jarz_woocommerce_integration.services.territory_sync.sync_territories_cron"
 		],
-		# Live order sync every 2 minutes (creates unpaid submitted invoices, skips pending payment)
-		"*/2 * * * *": [
+		# Live order sync every 5 minutes (creates unpaid submitted invoices, skips
+		# pending payment). The order.created / order.updated webhooks deliver
+		# orders immediately; this cursor poll is the safety net behind them.
+		"*/5 * * * *": [
 			"jarz_woocommerce_integration.services.order_sync.sync_orders_cron_phase1"
 		],
 		# Cancelled/refunded catch-up sync every 15 minutes (by modified timestamp)
