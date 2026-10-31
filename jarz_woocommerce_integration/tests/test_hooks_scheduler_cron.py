@@ -17,20 +17,32 @@ HOOKS_PATH = Path(hooks.__file__)
 
 
 class TestSchedulerCronDedup(unittest.TestCase):
-    def test_every_minute_key_contains_both_jobs(self):
-        """Both jobs that must run every minute are present under the single
-        "* * * * *" key — proves the key is not being silently overwritten."""
+    def test_every_minute_key_holds_only_the_courier_positions(self):
+        """Only the courier-position push needs a one-minute tick (the sync-event
+        sweep moved to every two minutes for CPU, 2026-10-28)."""
         every_minute = hooks.scheduler_events["cron"]["* * * * *"]
 
+        self.assertEqual(
+            every_minute,
+            ["jarz_woocommerce_integration.services.droppin_sync.push_open_leg_positions"],
+        )
+
+    def test_sync_event_sweep_is_still_scheduled(self):
+        """The retry-queue sweep is the job the duplicate key once dropped; it
+        must still be scheduled somewhere, now on its two-minute tick."""
+        scheduled = [
+            method
+            for methods in hooks.scheduler_events["cron"].values()
+            for method in methods
+        ]
+        self.assertEqual(
+            scheduled.count("jarz_woocommerce_integration.services.sync_events.process_due_sync_events"),
+            1,
+        )
         self.assertIn(
             "jarz_woocommerce_integration.services.sync_events.process_due_sync_events",
-            every_minute,
+            hooks.scheduler_events["cron"]["*/2 * * * *"],
         )
-        self.assertIn(
-            "jarz_woocommerce_integration.services.droppin_sync.push_open_leg_positions",
-            every_minute,
-        )
-        self.assertEqual(len(every_minute), 2)
 
     def test_no_duplicate_keys_in_any_dict_literal_in_hooks_file(self):
         """Parse hooks.py's AST and fail if any dict literal repeats a key —
