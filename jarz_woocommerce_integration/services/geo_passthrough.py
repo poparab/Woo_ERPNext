@@ -755,12 +755,154 @@ def _order_meta_pin(
 
 
 def extract_order_pin(order: Any) -> Optional[GeoPin]:
-    """Return the explicit ``_jarz_lat``/``_jarz_lng`` pin from an order payload."""
+    """Return the explicit ``_jarz_lat``/``_jarz_lng`` pin from an order payload.
+
+    A pin ERPNext itself pushed (see :func:`build_outbound_pin_meta`) is not
+    returned: it is already on the Address, at its real provenance, and reading
+    it back would stamp a staff pin as ``customer_pin`` (invariant 4).
+    """
     if not isinstance(order, dict):
         return None
     meta = _meta_value_map(order.get("meta_data"))
     pin, _source = _order_meta_pin(meta, egypt_only=True)
+    if pin is not None and is_pushed_pin_echo(meta, pin):
+        return None
     return pin
+
+
+# ---------------------------------------------------------------------------
+# Outbound: the POS pin, written the way DropPin writes a checkout pin
+# ---------------------------------------------------------------------------
+#
+# A website order carries its pin as DropPin order meta, which is what the
+# store's order screen, the navigation link and the tracking map all read. A
+# POS order reached the store with the pin only in ERPNext, so on the store it
+# had no location at all (droppin.has_pin false). These are the keys DropPin
+# writes itself (POS-DATA-REFERENCE.md section 1b), with DropPin's own source
+# vocabulary.
+#
+# DropPin's coverage verdict (_dpn_area_status / _area_mismatch /
+# _suggested_area) is NOT written: DropPin computes it at checkout and does not
+# recompute it for a REST meta write (checked on the demo store 2026-10-31), and
+# a guessed verdict would raise false outside_area / area_mismatch flags on the
+# order card. When an existing pin is moved, its old verdict is cleared, because
+# it describes the old point.
+
+#: Our own marker: the exact point ERPNext pushed. Lets the inbound sync tell
+#: its own echo from a pin someone set on the store afterwards.
+PUSHED_PIN_META_KEY = "_jarz_pin_pushed"
+
+DPN_SOURCE_STAFF_MANUAL = "staff_manual"
+#: DropPin's word for a pin carried over from a saved address, which is exactly
+#: what an Address ``customer_pin`` from an earlier website order is here.
+DPN_SOURCE_PREFILL = "prefill"
+
+_DPN_VERDICT_KEYS = (
+    "_dpn_area_status",
+    "_dpn_area_mismatch",
+    "_dpn_suggested_area",
+    "_dpn_outside_coverage",
+)
+# Address sources that are not a delivery point at all.
+_NOT_A_PIN_SOURCES = frozenset({"territory_centroid"})
+
+
+def _format_coordinate(value: float) -> str:
+    return f"{value:.7f}".rstrip("0").rstrip(".")
+
+
+def is_pushed_pin_echo(meta: dict[str, Any], pin: Optional[GeoPin]) -> bool:
+    """True when ``pin`` is the point ERPNext pushed onto this order."""
+    if pin is None or not meta:
+        return False
+    marker = str(meta.get(PUSHED_PIN_META_KEY) or "").strip()
+    if "," not in marker:
+        return False
+    lat_text, lng_text = marker.split(",", 1)
+    pushed = _make_world_pin(lat_text, lng_text)
+    return pushed is not None and pushed == pin
+
+
+def _to_timestamp(value: Any) -> Optional[int]:
+    number = _to_float(value)
+    if number is None or number <= 0:
+        return None
+    return int(number)
+
+
+def build_outbound_pin_meta(
+    address_row: Optional[dict[str, Any]],
+    existing_meta: Optional[dict[str, Any]],
+    *,
+    address_updated_ts: Optional[int] = None,
+    invoice_created_ts: Optional[int] = None,
+    pin_flag: Any = "",
+    now_ts: Optional[int] = None,
+) -> list[dict[str, str]]:
+    """DropPin pin meta for an outbound order, or ``[]`` when there is nothing to send.
+
+    ``address_row`` holds the delivery Address geo fields; ``existing_meta`` is
+    :func:`_meta_value_map` of the order already on the store (``None`` on a
+    create). Pure and never raises.
+
+    * No usable pin on the Address (none, outside Egypt, a territory centroid),
+      or the customer removed their pin on the store (``pin_removed``) -> ``[]``.
+    * The store already holds this point -> ``[]``, so a routine status push
+      sends nothing extra and the in-sync check stays quiet.
+    * The store holds a different pin -> replaced only by a pin staff set in
+      ERPNext for THIS order: a non-``customer_pin`` source written after the
+      invoice was created and after the store's pin. A customer's later re-pin
+      on the website, or an old shared Address pin, never overwrites it.
+    """
+    try:
+        row = address_row or {}
+        pin = make_pin(row.get("custom_latitude"), row.get("custom_longitude"))
+        if pin is None:
+            return []
+        source = str(row.get("custom_geo_source") or "").strip().lower()
+        if source in _NOT_A_PIN_SOURCES:
+            return []
+        flags = str(pin_flag or "").lower()
+        if PIN_FLAG_PIN_REMOVED in {token.strip() for token in flags.split(",")}:
+            return []
+
+        meta = existing_meta or {}
+        existing_pin, _existing_source = _order_meta_pin(meta, egypt_only=False)
+        if existing_pin is not None:
+            if existing_pin == pin:
+                return []
+            if source == GEO_SOURCE_CUSTOMER_PIN or not address_updated_ts:
+                return []
+            if invoice_created_ts and address_updated_ts <= invoice_created_ts:
+                return []
+            store_set_at = _to_timestamp(_first_present(meta, ("_dpn_pin_set_at",)))
+            if store_set_at and address_updated_ts <= store_set_at:
+                return []
+
+        lat_text = _format_coordinate(pin.latitude)
+        lng_text = _format_coordinate(pin.longitude)
+        set_at = address_updated_ts or now_ts or int(time.time())
+        accuracy = _to_float(row.get(GEO_ACCURACY_FIELD))
+        entries = [
+            {"key": "_dpn_lat", "value": lat_text},
+            {"key": "_dpn_lng", "value": lng_text},
+            {
+                "key": "_dpn_pin_source",
+                "value": DPN_SOURCE_PREFILL if source == GEO_SOURCE_CUSTOMER_PIN else DPN_SOURCE_STAFF_MANUAL,
+            },
+            {"key": "_dpn_pin_set_at", "value": str(int(set_at))},
+            # A WordPress user id; ERPNext staff have none, and 0 is what
+            # DropPin itself writes when no store user set the pin.
+            {"key": "_dpn_pin_set_by", "value": "0"},
+            {"key": "_dpn_accuracy", "value": str(int(round(accuracy))) if accuracy and accuracy > 0 else ""},
+            {"key": PUSHED_PIN_META_KEY, "value": f"{lat_text},{lng_text}"},
+        ]
+        if existing_pin is not None:
+            entries.extend({"key": key, "value": ""} for key in _DPN_VERDICT_KEYS if key in meta)
+        return entries
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({"event": "woo_outbound_pin_meta_failed", "error": str(exc)})
+        return []
 
 
 def _address_pin_with_source(

@@ -97,6 +97,11 @@ _ORDER_SYNC_META_KEYS_TO_COMPARE = frozenset({
     # *payload* carries them, and it only carries them for invoices that
     # actually have a token, so nothing old is marked dirty.
     *tracking_link.TRACKING_META_KEYS,
+    # The delivery pin. The payload carries these only when the store's pin
+    # differs from ERPNext's (geo_passthrough.build_outbound_pin_meta), so they
+    # mark an order dirty exactly when a pin needs to reach the store.
+    "_dpn_lat",
+    "_dpn_lng",
 })
 
 _OUTBOUND_RELEVANT_UPDATE_FIELDS = frozenset({
@@ -2112,6 +2117,65 @@ def enqueue_linked_invoice_sync_for_address(
         # PUT it would guard against is already suppressed by
         # `_order_payload_requires_update` once the store holds the new address.
         enqueue_invoice_sync(invoice_name, reason=reason)
+
+
+#: Invoice states whose Woo order is over: a pin set now is for a later order.
+_PIN_FANOUT_CLOSED_STATES = frozenset({"delivered", "completed", "cancelled", "canceled", "returned", "refunded"})
+_PIN_FANOUT_DAYS = 7
+
+
+def enqueue_order_sync_for_address_pin(address: str | None = None, **_kwargs: Any) -> None:
+    """``jarz_address_pin_changed`` hook: push the open orders that ship to *address*.
+
+    jarz_pos writes a pin with ``db.set_value``, which fires no document event,
+    so a pin staff set or corrected after the order reached the store never
+    followed it there. Only open orders from the last week are pushed: the
+    Address pin is shared by every order to that door, and a finished order
+    keeps the pin it was delivered to. Whether the store's pin is actually
+    replaced is decided per order by ``_build_pin_metadata``. Never raises.
+    """
+    try:
+        settings, cfg = _get_settings()
+        if not cfg.enable_order_push:
+            _note_outbound_disabled("enable_outbound_orders")
+            return
+        address_name = str(address or "").strip()
+        if not address_name:
+            return
+        state_field = None
+        meta = frappe.get_meta("Sales Invoice")
+        for candidate in ("custom_sales_invoice_state", "sales_invoice_state"):
+            if meta.get_field(candidate):
+                state_field = candidate
+                break
+        since = _frappe_utils.add_days(_frappe_utils.nowdate(), -_PIN_FANOUT_DAYS)
+        invoice_names: list[str] = []
+        for fieldname in ("shipping_address_name", "customer_address"):
+            rows = frappe.get_all(
+                "Sales Invoice",
+                filters={
+                    fieldname: address_name,
+                    "docstatus": 1,
+                    "is_return": 0,
+                    "posting_date": (">=", since),
+                    "woo_order_id": ("not in", ("", None, 0)),
+                },
+                fields=["name"] + ([state_field] if state_field else []),
+                limit=_ADDRESS_INVOICE_FANOUT_LIMIT,
+            )
+            for row in rows or []:
+                name = _get_doc_value(row, "name")
+                state = _normalize_invoice_state(_get_doc_value(row, state_field)) if state_field else ""
+                if name and name not in invoice_names and state not in _PIN_FANOUT_CLOSED_STATES:
+                    invoice_names.append(name)
+        for invoice_name in invoice_names[:_ADDRESS_INVOICE_FANOUT_LIMIT]:
+            enqueue_invoice_sync(invoice_name, reason="address_pin")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error({
+            "event": "woo_outbound_address_pin_fanout_failed",
+            "address": address,
+            "error": str(exc),
+        })
 
 
 def _mark_invoice_status(invoice_name: str, *, status: str, error: str | None = None) -> None:
@@ -5051,6 +5115,9 @@ def _build_order_payload(
     # extra HTTP call and no second queue to forget about. WooCommerce only ever
     # *stores* these two keys -- all live tracking happens browser -> ERPNext.
     payload["meta_data"].extend(_build_tracking_metadata(invoice))
+    # The delivery pin, as DropPin order meta: the same keys a website checkout
+    # writes, so the store shows a POS order's location like any other.
+    payload["meta_data"].extend(_build_pin_metadata(invoice, existing_order))
 
     woo_customer_id = _order_woo_customer_id(invoice, customer_doc, existing_order)
     if woo_customer_id:
@@ -5433,6 +5500,69 @@ def _build_delivery_metadata(invoice: frappe.model.document.Document) -> list[di
         ])
 
     return metadata
+
+
+_PIN_ADDRESS_FIELDS = (
+    "custom_latitude",
+    "custom_longitude",
+    "custom_geo_source",
+    "custom_geo_accuracy_m",
+    "custom_geo_updated_on",
+)
+
+
+def _local_timestamp(value: Any) -> int | None:
+    """Unix seconds for a site-local naive datetime, or ``None``."""
+    if not value:
+        return None
+    try:
+        local_dt = value if isinstance(value, datetime) else get_datetime(value)
+    except Exception:  # noqa: BLE001
+        return None
+    utc_dt = _to_utc_naive(local_dt) if local_dt else None
+    if not utc_dt:
+        return None
+    return calendar.timegm(utc_dt.timetuple())
+
+
+def _build_pin_metadata(
+    invoice: frappe.model.document.Document,
+    existing_order: Optional[dict] = None,
+) -> list[dict[str, str]]:
+    """DropPin pin meta for the order's delivery Address; see
+    ``geo_passthrough.build_outbound_pin_meta`` for the rules. Never raises."""
+    from jarz_woocommerce_integration.services import geo_passthrough
+
+    address_name = _get_doc_value(invoice, "shipping_address_name") or _get_doc_value(invoice, "customer_address")
+    if not address_name:
+        return []
+    try:
+        meta = frappe.get_meta("Address")
+        fields = [field for field in _PIN_ADDRESS_FIELDS if meta.has_field(field)]
+        if "custom_latitude" not in fields or "custom_longitude" not in fields:
+            return []
+        row = frappe.db.get_value("Address", address_name, fields, as_dict=True)
+        if not row:
+            return []
+        existing_meta = (
+            geo_passthrough._meta_value_map(existing_order.get("meta_data"))
+            if existing_order
+            else None
+        )
+        return geo_passthrough.build_outbound_pin_meta(
+            dict(row),
+            existing_meta,
+            address_updated_ts=_local_timestamp(row.get("custom_geo_updated_on")),
+            invoice_created_ts=_local_timestamp(_get_doc_value(invoice, "creation")),
+            pin_flag=_get_doc_value(invoice, "custom_delivery_pin_flag", ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_outbound_pin_metadata_failed",
+            "invoice": getattr(invoice, "name", None),
+            "error": str(exc),
+        })
+        return []
 
 
 def _build_tracking_metadata(invoice: frappe.model.document.Document) -> list[dict[str, str]]:

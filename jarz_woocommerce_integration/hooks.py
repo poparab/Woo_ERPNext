@@ -143,6 +143,12 @@ doctype_list_js = {
 # 	"ToDo": "custom_app.overrides.CustomToDo"
 # }
 
+# Fired by jarz_pos when an Address pin moves (geo writes fire no doc event):
+# pushes that address's open orders so the store gets the pin as DropPin meta.
+jarz_address_pin_changed = [
+	"jarz_woocommerce_integration.services.outbound_sync.enqueue_order_sync_for_address_pin",
+]
+
 # Document Events
 # ---------------
 # Hook on document methods and events
