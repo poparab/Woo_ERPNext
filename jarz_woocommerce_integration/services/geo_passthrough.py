@@ -805,6 +805,11 @@ _DPN_VERDICT_KEYS = (
 )
 # Address sources that are not a delivery point at all.
 _NOT_A_PIN_SOURCES = frozenset({"territory_centroid"})
+# The only sources that may REPLACE a pin already on the store: a person in the
+# POS deliberately setting this order's location. A courier fix is stamped on
+# every accepted write (even an unchanged point, from another order's delivery
+# to the same door), so it must never overwrite a customer's website pin.
+_STORE_PIN_REPLACING_SOURCES = frozenset({"pos_link", "manual_override"})
 
 
 def _format_coordinate(value: float) -> str:
@@ -850,9 +855,10 @@ def build_outbound_pin_meta(
     * The store already holds this point -> ``[]``, so a routine status push
       sends nothing extra and the in-sync check stays quiet.
     * The store holds a different pin -> replaced only by a pin staff set in
-      ERPNext for THIS order: a non-``customer_pin`` source written after the
-      invoice was created and after the store's pin. A customer's later re-pin
-      on the website, or an old shared Address pin, never overwrites it.
+      ERPNext for THIS order: a ``pos_link`` / ``manual_override`` source
+      written after the invoice was created and after the store's pin. A
+      customer's later re-pin on the website, a courier fix, or an old shared
+      Address pin never overwrites it.
     """
     try:
         row = address_row or {}
@@ -871,7 +877,7 @@ def build_outbound_pin_meta(
         if existing_pin is not None:
             if existing_pin == pin:
                 return []
-            if source == GEO_SOURCE_CUSTOMER_PIN or not address_updated_ts:
+            if source not in _STORE_PIN_REPLACING_SOURCES or not address_updated_ts:
                 return []
             if invoice_created_ts and address_updated_ts <= invoice_created_ts:
                 return []

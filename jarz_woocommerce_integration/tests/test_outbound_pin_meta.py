@@ -131,6 +131,15 @@ class OutboundPinMetaReplaceTests(unittest.TestCase):
     def test_undated_address_pin_never_replaces(self):
         self.assertEqual(_build(_address(), dict(self.STORE), updated=None), [])
 
+    def test_courier_fix_never_replaces_a_store_pin(self):
+        for source in ("courier_verified", "courier_web"):
+            with self.subTest(source=source):
+                self.assertEqual(_build(_address(source=source), dict(self.STORE), updated=LATER_TS), [])
+
+    def test_manual_override_replaces(self):
+        meta = _meta_map(_build(_address(source="manual_override"), dict(self.STORE), updated=LATER_TS))
+        self.assertEqual(meta["_dpn_pin_source"], "staff_manual")
+
 
 class PushedPinEchoTests(unittest.TestCase):
     def _order(self, meta):
@@ -161,6 +170,36 @@ class PushedPinEchoTests(unittest.TestCase):
         pin = geo_passthrough.extract_order_pin(self._order(meta))
         self.assertIsNotNone(pin)
         self.assertAlmostEqual(pin.latitude, 30.060449)
+
+
+class AddressPinFanoutTests(unittest.TestCase):
+    def test_fanout_waits_for_the_pin_to_commit(self):
+        from unittest.mock import MagicMock, patch
+
+        cfg = MagicMock(enable_order_push=True)
+        fake = MagicMock()
+        fake.get_all.side_effect = [[{"name": "SINV-1", "custom_sales_invoice_state": "Out for delivery"}], []]
+        with (
+            patch.object(outbound_sync, "_get_settings", return_value=(MagicMock(), cfg)),
+            patch.object(outbound_sync, "frappe", fake),
+            patch.object(outbound_sync, "enqueue_invoice_sync") as enqueue,
+        ):
+            outbound_sync.enqueue_order_sync_for_address_pin(address="ADDR-1")
+        enqueue.assert_called_once_with("SINV-1", reason="address_pin", after_commit=True)
+
+    def test_closed_orders_are_not_pushed(self):
+        from unittest.mock import MagicMock, patch
+
+        cfg = MagicMock(enable_order_push=True)
+        fake = MagicMock()
+        fake.get_all.side_effect = [[{"name": "SINV-1", "custom_sales_invoice_state": "Delivered"}], []]
+        with (
+            patch.object(outbound_sync, "_get_settings", return_value=(MagicMock(), cfg)),
+            patch.object(outbound_sync, "frappe", fake),
+            patch.object(outbound_sync, "enqueue_invoice_sync") as enqueue,
+        ):
+            outbound_sync.enqueue_order_sync_for_address_pin(address="ADDR-1")
+        enqueue.assert_not_called()
 
 
 class InSyncComparisonTests(unittest.TestCase):

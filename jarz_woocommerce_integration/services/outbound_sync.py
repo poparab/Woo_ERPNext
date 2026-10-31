@@ -1473,7 +1473,7 @@ def sync_customer(
 # Sales Invoice outbound sync
 # ---------------------------------------------------------------------------
 
-def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: str | None = None, *, reason: str = "event", force: bool = False, cancel: bool = False) -> None:
+def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: str | None = None, *, reason: str = "event", force: bool = False, cancel: bool = False, after_commit: bool = False) -> None:
     settings, cfg = _get_settings()
     if not cfg.enable_order_push and not force:
         _note_outbound_disabled("enable_outbound_orders")
@@ -1528,6 +1528,9 @@ def enqueue_invoice_sync(invoice: frappe.model.document.Document | str, method: 
         queue="short",
         timeout=600,
         now=force,
+        # A caller whose change is still uncommitted (a pin written by
+        # db.set_value) needs the worker to see it, not the old row.
+        enqueue_after_commit=after_commit and not force,
         invoice_name=invoice_name,
         reason=reason,
         cancel=cancel,
@@ -2169,7 +2172,10 @@ def enqueue_order_sync_for_address_pin(address: str | None = None, **_kwargs: An
                 if name and name not in invoice_names and state not in _PIN_FANOUT_CLOSED_STATES:
                     invoice_names.append(name)
         for invoice_name in invoice_names[:_ADDRESS_INVOICE_FANOUT_LIMIT]:
-            enqueue_invoice_sync(invoice_name, reason="address_pin")
+            # The hook runs inside the request that wrote the pin, before it
+            # commits: a job started now could read the old Address and find
+            # nothing to push.
+            enqueue_invoice_sync(invoice_name, reason="address_pin", after_commit=True)
     except Exception as exc:  # noqa: BLE001
         LOGGER.error({
             "event": "woo_outbound_address_pin_fanout_failed",
