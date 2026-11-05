@@ -22,6 +22,8 @@ from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClien
 
 PROMO_DOCTYPE = "Jarz Promo Code"
 REDEMPTION_DOCTYPE = "Jarz Promo Redemption"
+BUNDLE_DOCTYPE = "Jarz Bundle"
+BUNDLE_ROW_DOCTYPE = "Jarz Bundle Item Group"
 SWITCH = "enable_outbound_coupons"
 ERROR_TITLE = "woo coupon sync failed"
 
@@ -61,14 +63,68 @@ def _woo_id_for_item(item: dict) -> int | None:
     return None
 
 
+def single_scope_bundle_ids(groups: list[str]) -> list[int]:
+    """Woo parent ids of enabled Jarz Bundles made only of the given item groups.
+
+    Inside a WooSB bundle the jar lines are priced 0 and the parent line carries
+    the whole price, so a coupon that names only the jar variations takes nothing
+    off a bundle order (or is refused), while ERPNext - whose bundle children
+    carry the bundle price spread at one uniform discount - accepts it. Naming
+    the parent puts the discount where Woo has the money.
+
+    Only bundles whose every row is in scope qualify: their children sum to the
+    bundle price, so "pct of the parent, capped" on Woo equals "pct of the
+    in-scope children, capped" in ERPNext. A mixed bundle (e.g. 6 Large + 2
+    Medium) would be discounted on its full price by Woo but only on its
+    in-scope share by ERPNext, so it is left out and stays refused on Woo.
+    """
+    wanted = {g for g in groups if g}
+    if not wanted:
+        return []
+    try:
+        bundles = frappe.get_all(
+            BUNDLE_DOCTYPE, filters={"disabled": 0}, fields=["name", "woo_bundle_id"]
+        )
+        bundles = [b for b in bundles if str(b.get("woo_bundle_id") or "").strip()]
+        if not bundles:
+            return []
+        rows = frappe.get_all(
+            BUNDLE_ROW_DOCTYPE,
+            filters={"parenttype": BUNDLE_DOCTYPE, "parent": ["in", [b["name"] for b in bundles]]},
+            fields=["parent", "item_group"],
+        )
+    except Exception:  # noqa: BLE001 - no bundle DocType here: nothing to add
+        return []
+    groups_by_bundle: dict[str, set] = {}
+    for row in rows:
+        groups_by_bundle.setdefault(row.get("parent"), set()).add(row.get("item_group"))
+    ids: list[int] = []
+    for bundle in bundles:
+        bundle_groups = groups_by_bundle.get(bundle["name"])
+        if not bundle_groups or not bundle_groups <= wanted:
+            continue
+        try:
+            woo_id = int(str(bundle["woo_bundle_id"]).strip())
+        except (TypeError, ValueError):
+            continue
+        if woo_id not in ids:
+            ids.append(woo_id)
+    return ids
+
+
 def resolve_product_ids(doc: Any) -> list[int] | None:
-    """Woo product ids for a scoped code; ``None`` means whole order (no scope)."""
+    """Woo product ids for a scoped code; ``None`` means whole order (no scope).
+
+    An ``Item Groups`` code also names the bundles built only from those
+    groups (see ``single_scope_bundle_ids``).
+    """
     applies_to = doc.get("applies_to") or "Whole Order"
     if applies_to == "Whole Order":
         return None
     rows = doc.get("item_scope") or []
     fields = ["name", "woo_variation_id", "woo_product_id"]
     items: list[dict] = []
+    groups: list[str] = []
     if applies_to == "Specific Items":
         codes = [r.get("item_code") for r in rows if r.get("item_code")]
         if codes:
@@ -83,6 +139,9 @@ def resolve_product_ids(doc: Any) -> list[int] | None:
     for item in items:
         woo_id = _woo_id_for_item(item)
         if woo_id is not None and woo_id not in ids:
+            ids.append(woo_id)
+    for woo_id in single_scope_bundle_ids(groups):
+        if woo_id not in ids:
             ids.append(woo_id)
     return ids
 
@@ -272,6 +331,24 @@ def sync_promo_coupon(code: str) -> dict:
     """Run the sync synchronously (System Manager only). For tests/ops."""
     frappe.only_for("System Manager")
     return _sync(code)
+
+
+@frappe.whitelist()
+def resync_item_group_coupons() -> dict:
+    """Queue a re-push of every live ``Item Groups`` code (System Manager only).
+
+    For ops after the scope rule changes (e.g. bundles added to the product ids):
+    a coupon is otherwise re-pushed only when its code or a redemption changes.
+    """
+    frappe.only_for("System Manager")
+    codes = frappe.get_all(
+        PROMO_DOCTYPE,
+        filters={"sync_to_woo": 1, "enabled": 1, "applies_to": "Item Groups"},
+        pluck="name",
+    )
+    for code in codes:
+        _enqueue(str(code))
+    return {"enqueued": codes}
 
 
 def _suppressed(doc) -> bool:

@@ -96,7 +96,109 @@ class TestScope(unittest.TestCase):
         with mock.patch.object(cs.frappe, "get_all", return_value=[]) as ga:
             ids = cs.resolve_product_ids(D(applies_to="Item Groups", item_scope=[{"item_group": "G"}]))
         self.assertEqual(ids, [])
-        self.assertEqual(ga.call_args.kwargs["filters"]["item_group"], ["in", ["G"]])
+        self.assertEqual(ga.call_args_list[0].kwargs["filters"]["item_group"], ["in", ["G"]])
+
+
+# Live shapes on production, 2026-11-05: every enabled bundle is one size.
+BUNDLES = [
+    {"name": "b-trio", "woo_bundle_id": "12441"},     # Large x3
+    {"name": "b-grand", "woo_bundle_id": "12479"},    # Large x6 + Large x2
+    {"name": "b-feast", "woo_bundle_id": "12485"},    # Medium x8 + Medium x2
+    {"name": "b-mixed", "woo_bundle_id": "10025"},    # Large x6 + Medium x2
+    {"name": "b-noid", "woo_bundle_id": ""},          # never mirrored to Woo
+    {"name": "b-junk", "woo_bundle_id": " 12479 "},   # duplicate id, stray spaces
+]
+BUNDLE_ROWS = [
+    {"parent": "b-trio", "item_group": "Large"},
+    {"parent": "b-grand", "item_group": "Large"},
+    {"parent": "b-grand", "item_group": "Large"},
+    {"parent": "b-feast", "item_group": "Medium"},
+    {"parent": "b-feast", "item_group": "Medium"},
+    {"parent": "b-mixed", "item_group": "Large"},
+    {"parent": "b-mixed", "item_group": "Medium"},
+    {"parent": "b-noid", "item_group": "Large"},
+    {"parent": "b-junk", "item_group": "Large"},
+]
+LARGE_ITEMS = [
+    {"name": "Lotus Large", "woo_variation_id": "13766", "woo_product_id": "217"},
+    {"name": "Carrot cake Large", "woo_variation_id": None, "woo_product_id": "11031"},
+]
+
+
+def _fake_get_all(items=LARGE_ITEMS, bundles=BUNDLES, rows=BUNDLE_ROWS):
+    def get_all(doctype, filters=None, fields=None, **kw):
+        if doctype == "Item":
+            return list(items)
+        if doctype == cs.BUNDLE_DOCTYPE:
+            assert filters == {"disabled": 0}
+            return list(bundles)
+        if doctype == cs.BUNDLE_ROW_DOCTYPE:
+            wanted = set(filters["parent"][1])
+            return [r for r in rows if r["parent"] in wanted]
+        raise AssertionError(doctype)
+
+    return get_all
+
+
+class TestBundleScope(unittest.TestCase):
+    """A free-Large-jar code must reach the Large bundles' parent lines on Woo."""
+
+    def test_large_code_names_large_only_bundles(self):
+        with mock.patch.object(cs.frappe, "get_all", side_effect=_fake_get_all()):
+            ids = cs.resolve_product_ids(D(applies_to="Item Groups", item_scope=[{"item_group": "Large"}]))
+        # loose jars first, then Trio and Grand Eight; not Royal Feast (Medium),
+        # not the mixed 6L+2M, not the unmirrored bundle, no duplicate.
+        self.assertEqual(ids, [13766, 11031, 12441, 12479])
+
+    def test_two_groups_admit_the_mixed_bundle(self):
+        with mock.patch.object(cs.frappe, "get_all", side_effect=_fake_get_all()):
+            ids = cs.resolve_product_ids(D(
+                applies_to="Item Groups", item_scope=[{"item_group": "Large"}, {"item_group": "Medium"}],
+            ))
+        self.assertEqual(ids[2:], [12441, 12479, 12485, 10025])
+
+    def test_bundles_alone_still_sync(self):
+        with mock.patch.object(cs.frappe, "get_all", side_effect=_fake_get_all(items=[])):
+            ids = cs.resolve_product_ids(D(applies_to="Item Groups", item_scope=[{"item_group": "Medium"}]))
+        self.assertEqual(ids, [12485])
+
+    def test_specific_items_and_whole_order_skip_bundles(self):
+        with mock.patch.object(cs.frappe, "get_all", side_effect=_fake_get_all()) as ga:
+            ids = cs.resolve_product_ids(D(applies_to="Specific Items", item_scope=[{"item_code": "Lotus Large"}]))
+        self.assertEqual(ids, [13766, 11031])
+        self.assertEqual([c.args[0] for c in ga.call_args_list], ["Item"])
+        self.assertIsNone(cs.resolve_product_ids(D(applies_to="Whole Order")))
+
+    def test_missing_bundle_doctype_is_harmless(self):
+        def get_all(doctype, **kw):
+            if doctype == "Item":
+                return list(LARGE_ITEMS)
+            raise Exception("Table 'tabJarz Bundle' doesn't exist")
+
+        with mock.patch.object(cs.frappe, "get_all", side_effect=get_all):
+            ids = cs.resolve_product_ids(D(applies_to="Item Groups", item_scope=[{"item_group": "Large"}]))
+        self.assertEqual(ids, [13766, 11031])
+
+    def test_payload_carries_bundle_ids_and_cap(self):
+        with mock.patch.object(cs.frappe, "get_all", side_effect=_fake_get_all()):
+            doc = D(name="BACKYVQM2K", discount_value=100, applies_to="Item Groups",
+                    item_scope=[{"item_group": "Large"}], max_discount_amount=160, stackable=0)
+            p = cs.build_payload(doc, cs.resolve_product_ids(doc))
+        self.assertIn(12479, p["product_ids"])
+        self.assertEqual((p["discount_type"], p["amount"]), ("percent", "100"))
+        self.assertIn({"key": "_jarz_max_discount", "value": "160"}, p["meta_data"])
+
+
+class TestResync(unittest.TestCase):
+    def test_enqueues_every_live_item_group_code(self):
+        with mock.patch.object(cs.frappe, "only_for"), \
+                mock.patch.object(cs.frappe, "get_all", return_value=["BACKA", "BACKB"]) as ga, \
+                mock.patch.object(cs, "_enqueue") as enq:
+            r = cs.resync_item_group_coupons()
+        self.assertEqual(r, {"enqueued": ["BACKA", "BACKB"]})
+        self.assertEqual(ga.call_args.kwargs["filters"],
+                         {"sync_to_woo": 1, "enabled": 1, "applies_to": "Item Groups"})
+        self.assertEqual([c.args[0] for c in enq.call_args_list], ["BACKA", "BACKB"])
 
 
 class TestSync(unittest.TestCase):
