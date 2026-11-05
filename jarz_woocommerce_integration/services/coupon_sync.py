@@ -22,8 +22,8 @@ from jarz_woocommerce_integration.utils.http_client import WooAPIError, WooClien
 
 PROMO_DOCTYPE = "Jarz Promo Code"
 REDEMPTION_DOCTYPE = "Jarz Promo Redemption"
-BUNDLE_DOCTYPE = "Jarz Bundle"
-BUNDLE_ROW_DOCTYPE = "Jarz Bundle Item Group"
+BUNDLE_DOCTYPE = "Woo Jarz Bundle"
+BUNDLE_ROW_DOCTYPE = "Woo Jarz Bundle Item Group"
 SWITCH = "enable_outbound_coupons"
 ERROR_TITLE = "woo coupon sync failed"
 
@@ -64,37 +64,37 @@ def _woo_id_for_item(item: dict) -> int | None:
 
 
 def single_scope_bundle_ids(groups: list[str]) -> list[int]:
-    """Woo parent ids of enabled Jarz Bundles made only of the given item groups.
+    """Woo parent ids of the Woo Jarz Bundles made only of the given item groups.
 
     Inside a WooSB bundle the jar lines are priced 0 and the parent line carries
     the whole price, so a coupon that names only the jar variations takes nothing
-    off a bundle order (or is refused), while ERPNext - whose bundle children
-    carry the bundle price spread at one uniform discount - accepts it. Naming
-    the parent puts the discount where Woo has the money.
+    off a bundle order, while ERPNext - whose bundle children carry the bundle
+    price spread at one uniform discount - accepts it. Naming the parent puts
+    the discount where Woo has the money.
+
+    ``Woo Jarz Bundle`` is read, not the POS app's ``Jarz Bundle``: it is what
+    order_sync expands a Woo bundle line with, so it decides which child lines
+    ERPNext's promo engine sees. It has no disabled flag; ids of bundles since
+    deleted from the store are harmless here (they can never be in a cart).
 
     Only bundles whose every row is in scope qualify: their children sum to the
     bundle price, so "pct of the parent, capped" on Woo equals "pct of the
     in-scope children, capped" in ERPNext. A mixed bundle (e.g. 6 Large + 2
     Medium) would be discounted on its full price by Woo but only on its
-    in-scope share by ERPNext, so it is left out and stays refused on Woo.
+    in-scope share by ERPNext, so it is left out.
     """
     wanted = {g for g in groups if g}
     if not wanted:
         return []
-    try:
-        bundles = frappe.get_all(
-            BUNDLE_DOCTYPE, filters={"disabled": 0}, fields=["name", "woo_bundle_id"]
-        )
-        bundles = [b for b in bundles if str(b.get("woo_bundle_id") or "").strip()]
-        if not bundles:
-            return []
-        rows = frappe.get_all(
-            BUNDLE_ROW_DOCTYPE,
-            filters={"parenttype": BUNDLE_DOCTYPE, "parent": ["in", [b["name"] for b in bundles]]},
-            fields=["parent", "item_group"],
-        )
-    except Exception:  # noqa: BLE001 - no bundle DocType here: nothing to add
+    bundles = frappe.get_all(BUNDLE_DOCTYPE, fields=["name", "woo_bundle_id"])
+    bundles = [b for b in bundles if str(b.get("woo_bundle_id") or "").strip()]
+    if not bundles:
         return []
+    rows = frappe.get_all(
+        BUNDLE_ROW_DOCTYPE,
+        filters={"parenttype": BUNDLE_DOCTYPE, "parent": ["in", [b["name"] for b in bundles]]},
+        fields=["parent", "item_group"],
+    )
     groups_by_bundle: dict[str, set] = {}
     for row in rows:
         groups_by_bundle.setdefault(row.get("parent"), set()).add(row.get("item_group"))
@@ -172,12 +172,14 @@ def build_payload(doc: Any, product_ids: list[int] | None) -> dict:
         payload["minimum_amount"] = str(doc.get("min_order_amount"))
     if product_ids is not None:
         payload["product_ids"] = list(product_ids)
-    meta = []
-    if float(doc.get("max_discount_amount") or 0) > 0:
-        meta.append({"key": "_jarz_max_discount", "value": str(doc.get("max_discount_amount"))})
-    if doc.get("customer_phone"):
-        meta.append({"key": "_jarz_phone", "value": str(doc.get("customer_phone"))})
-    payload["meta_data"] = meta
+    # Both keys are always sent: Woo REST upserts meta and never drops a key
+    # that is left out, so a cap or phone lock cleared in ERPNext would live on
+    # in Woo. The coupon-cap plugin reads "" as no cap / no lock.
+    cap = doc.get("max_discount_amount")
+    payload["meta_data"] = [
+        {"key": "_jarz_max_discount", "value": str(cap) if float(cap or 0) > 0 else ""},
+        {"key": "_jarz_phone", "value": str(doc.get("customer_phone") or "")},
+    ]
     payload["description"] = f"ERPNext Jarz Promo Code {code}"
     return payload
 

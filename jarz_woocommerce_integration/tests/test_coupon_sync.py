@@ -76,7 +76,10 @@ class TestPayload(unittest.TestCase):
         self.assertEqual((d["discount_type"], d["amount"], d["free_shipping"]), ("fixed_cart", "0", True))
         self.assertIsNone(d["usage_limit"])
         self.assertIsNone(d["date_expires"])
-        self.assertEqual(d["meta_data"], [])
+        self.assertEqual(d["meta_data"], [
+            {"key": "_jarz_max_discount", "value": ""},
+            {"key": "_jarz_phone", "value": ""},
+        ])
         self.assertNotIn("minimum_amount", d)
 
 
@@ -99,7 +102,7 @@ class TestScope(unittest.TestCase):
         self.assertEqual(ga.call_args_list[0].kwargs["filters"]["item_group"], ["in", ["G"]])
 
 
-# Live shapes on production, 2026-11-05: every enabled bundle is one size.
+# Woo Jarz Bundle shapes as on production, 2026-11-05 (the six live store bundles are one size).
 BUNDLES = [
     {"name": "b-trio", "woo_bundle_id": "12441"},     # Large x3
     {"name": "b-grand", "woo_bundle_id": "12479"},    # Large x6 + Large x2
@@ -130,7 +133,7 @@ def _fake_get_all(items=LARGE_ITEMS, bundles=BUNDLES, rows=BUNDLE_ROWS):
         if doctype == "Item":
             return list(items)
         if doctype == cs.BUNDLE_DOCTYPE:
-            assert filters == {"disabled": 0}
+            assert not filters  # Woo Jarz Bundle has no disabled flag
             return list(bundles)
         if doctype == cs.BUNDLE_ROW_DOCTYPE:
             wanted = set(filters["parent"][1])
@@ -169,15 +172,26 @@ class TestBundleScope(unittest.TestCase):
         self.assertEqual([c.args[0] for c in ga.call_args_list], ["Item"])
         self.assertIsNone(cs.resolve_product_ids(D(applies_to="Whole Order")))
 
-    def test_missing_bundle_doctype_is_harmless(self):
+    def test_reads_the_woo_apps_own_bundle_table(self):
+        self.assertEqual((cs.BUNDLE_DOCTYPE, cs.BUNDLE_ROW_DOCTYPE),
+                         ("Woo Jarz Bundle", "Woo Jarz Bundle Item Group"))
+
+    def test_bundle_query_failure_is_not_swallowed(self):
+        # A silent [] would push the coupon with jar ids only: the old bug, unlogged.
         def get_all(doctype, **kw):
             if doctype == "Item":
                 return list(LARGE_ITEMS)
-            raise Exception("Table 'tabJarz Bundle' doesn't exist")
+            raise RuntimeError("Unknown column 'woo_bundle_id'")
 
-        with mock.patch.object(cs.frappe, "get_all", side_effect=get_all):
-            ids = cs.resolve_product_ids(D(applies_to="Item Groups", item_scope=[{"item_group": "Large"}]))
-        self.assertEqual(ids, [13766, 11031])
+        with mock.patch.object(cs.frappe, "get_all", side_effect=get_all),                 self.assertRaises(RuntimeError):
+            cs.resolve_product_ids(D(applies_to="Item Groups", item_scope=[{"item_group": "Large"}]))
+
+    def test_cleared_cap_and_phone_are_sent_empty(self):
+        p = cs.build_payload(D(max_discount_amount=0, customer_phone=None), None)
+        self.assertEqual(p["meta_data"], [
+            {"key": "_jarz_max_discount", "value": ""},
+            {"key": "_jarz_phone", "value": ""},
+        ])
 
     def test_payload_carries_bundle_ids_and_cap(self):
         with mock.patch.object(cs.frappe, "get_all", side_effect=_fake_get_all()):
