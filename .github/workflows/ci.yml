@@ -97,6 +97,10 @@ jobs:
 
       - name: Setup
         run: |
+          # The Ubuntu 26 runner's MariaDB client turns SSL on by default and the
+          # 10.6 service container has none: every CLI call (ours and bench's)
+          # died with "ERROR 2026 ... SSL is required" (run 42087113963).
+          printf '[client]\nskip-ssl\n' > ~/.my.cnf
           pip install frappe-bench
           bench init --skip-redis-config-generation --skip-assets --frappe-branch version-16 --python "$(which python)" ~/frappe-bench
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
