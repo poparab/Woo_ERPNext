@@ -216,5 +216,45 @@ class InSyncComparisonTests(unittest.TestCase):
         self.assertFalse(outbound_sync._order_payload_requires_update(existing, payload))
 
 
+class LatePinNoteTests(unittest.TestCase):
+    """A pin added or moved on an order already on the store leaves a private note."""
+
+    def test_added_pin_on_existing_order_gets_note(self):
+        entries = _build(_address(), {})
+        note = geo_passthrough.build_late_pin_note(entries, {})
+        self.assertIn("added by Jarz staff", note)
+        self.assertIn("30.094669,31.377227", note)
+        self.assertIn("https://www.google.com/maps?q=30.094669,31.377227", note)
+
+    def test_moved_pin_names_the_old_point(self):
+        existing = {"_dpn_lat": "30.05", "_dpn_lng": "31.2", "_dpn_pin_set_at": str(EARLIER_TS)}
+        entries = _build(_address(), existing)
+        note = geo_passthrough.build_late_pin_note(entries, existing)
+        self.assertIn("changed by Jarz staff", note)
+        self.assertIn("was 30.05,31.2", note)
+
+    def test_create_and_unchanged_pin_get_no_note(self):
+        self.assertEqual(geo_passthrough.build_late_pin_note(_build(_address(), None), None), "")
+        self.assertEqual(geo_passthrough.build_late_pin_note([], {}), "")
+
+    def test_same_point_gives_same_text(self):
+        first = geo_passthrough.build_late_pin_note(_build(_address(), {}), {})
+        second = geo_passthrough.build_late_pin_note(_build(_address(), {}), {})
+        self.assertEqual(first, second)
+
+    def test_poster_sends_note_only_when_pin_entries_present(self):
+        from unittest.mock import MagicMock, patch
+
+        payload = {"meta_data": [{"key": "_jarz_tracking_url", "value": "x"}, *_build(_address(), {})]}
+        with patch.object(outbound_sync, "_post_woo_order_note", return_value="posted") as post:
+            outbound_sync._post_late_pin_note(MagicMock(), 21761, "SINV-1", payload, {"meta_data": []})
+        post.assert_called_once()
+        self.assertIn("added by Jarz staff", post.call_args.args[2])
+
+        with patch.object(outbound_sync, "_post_woo_order_note") as post:
+            outbound_sync._post_late_pin_note(MagicMock(), 21761, "SINV-1", {"meta_data": []}, {"meta_data": []})
+        post.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

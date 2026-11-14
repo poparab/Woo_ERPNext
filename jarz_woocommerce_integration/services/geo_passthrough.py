@@ -911,6 +911,54 @@ def build_outbound_pin_meta(
         return []
 
 
+def build_late_pin_note(
+    pin_entries: list[dict[str, str]],
+    existing_meta: Optional[dict[str, Any]],
+) -> str:
+    """Private order note for a pin ERPNext adds to an order already on the store.
+
+    A customer who placed the order without a location is asked for it on
+    WhatsApp, and staff paste it into the POS. The pin then reaches the store
+    minutes or hours after the order, as a silent REST meta write: DropPin adds
+    no note and no pin history for it, so on the store the location simply
+    appeared or changed. This note says who set it and why.
+
+    ``pin_entries`` is what :func:`build_outbound_pin_meta` returned for this
+    push; ``existing_meta`` the store order's meta (``None`` on a create, where
+    the pin is part of the new order and needs no note). Returns ``""`` when
+    there is nothing to say. The text depends only on the point, so the
+    exact-body dedupe of the note poster keeps a retried push to one note.
+    Pure and never raises.
+    """
+    try:
+        if existing_meta is None or not pin_entries:
+            return ""
+        values = {entry.get("key"): entry.get("value") for entry in pin_entries}
+        marker = str(values.get(PUSHED_PIN_META_KEY) or "").strip()
+        if "," not in marker:
+            return ""
+        lat_text, lng_text = (part.strip() for part in marker.split(",", 1))
+        old_pin, _old_source = _order_meta_pin(existing_meta, egypt_only=False)
+        if old_pin is not None:
+            action = (
+                "Jarz POS: delivery location changed by Jarz staff after the order was placed "
+                f"(was {_format_coordinate(old_pin.latitude)},{_format_coordinate(old_pin.longitude)})."
+            )
+        else:
+            action = (
+                "Jarz POS: delivery location added by Jarz staff after the order was placed. "
+                "The order arrived without a location, so the customer was asked for it "
+                "(usually on WhatsApp) and staff entered it in the POS."
+            )
+        return (
+            f"{action} New pin: {lat_text},{lng_text} "
+            f"https://www.google.com/maps?q={lat_text},{lng_text}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({"event": "woo_late_pin_note_failed", "error": str(exc)})
+        return ""
+
+
 def _address_pin_with_source(
     address_data: Any, *, egypt_only: bool = True
 ) -> tuple[Optional[GeoPin], str]:

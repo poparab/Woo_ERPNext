@@ -1824,6 +1824,45 @@ def _post_woo_order_note(client: WooClient, woo_order_id: Any, body: str) -> str
     return "posted"
 
 
+def _post_late_pin_note(
+    client: WooClient,
+    woo_order_id: Any,
+    invoice_name: str,
+    payload: Dict[str, Any],
+    existing_order: Dict[str, Any],
+) -> None:
+    """Note on the store order when this PUT added or moved its delivery pin. Never raises."""
+    try:
+        from jarz_woocommerce_integration.services import geo_passthrough
+
+        pin_keys = {"_dpn_lat", "_dpn_lng", geo_passthrough.PUSHED_PIN_META_KEY}
+        pin_entries = [
+            entry for entry in payload.get("meta_data") or []
+            if isinstance(entry, dict) and entry.get("key") in pin_keys
+        ]
+        body = geo_passthrough.build_late_pin_note(
+            pin_entries,
+            geo_passthrough._meta_value_map(existing_order.get("meta_data")),
+        )
+        if not body:
+            return
+        outcome = _post_woo_order_note(client, woo_order_id, body)
+        if outcome not in ("posted", "already_posted"):
+            LOGGER.warning({
+                "event": "woo_late_pin_note_failed",
+                "invoice": invoice_name,
+                "woo_order_id": woo_order_id,
+                "outcome": outcome,
+            })
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({
+            "event": "woo_late_pin_note_failed",
+            "invoice": invoice_name,
+            "woo_order_id": woo_order_id,
+            "error": str(exc),
+        })
+
+
 def _report_unpayable_transition(client: WooClient, woo_order_id: Any, invoice_name: str) -> None:
     """Record the one-way ``set_paid`` limitation on the order itself.
 
@@ -6478,6 +6517,12 @@ def _sync_sales_invoice(
                 "woo_order_id": woo_id or woo_order_id,
                 "outcome": outcome,
             })
+
+    # A pin staff set after the order reached the store (the customer sent the
+    # location on WhatsApp) lands as a silent meta write; DropPin adds no note.
+    # Say who moved it, so the store's maintainers can see why it changed.
+    if not created and existing_order:
+        _post_late_pin_note(client, woo_id or woo_order_id, invoice_name, payload, existing_order)
 
     # --- Verify WooCommerce accepted the desired status ------------------
     # Some WordPress plugins (e.g. delivery management) silently override the
