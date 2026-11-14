@@ -219,19 +219,22 @@ class InSyncComparisonTests(unittest.TestCase):
 class LatePinNoteTests(unittest.TestCase):
     """A pin added or moved on an order already on the store leaves a private note."""
 
-    def test_added_pin_on_existing_order_gets_note(self):
+    def test_added_pin_matches_droppin_note_shape(self):
         entries = _build(_address(), {})
         note = geo_passthrough.build_late_pin_note(entries, {})
-        self.assertIn("added by Jarz staff", note)
-        self.assertIn("30.094669,31.377227", note)
-        self.assertIn("https://www.google.com/maps?q=30.094669,31.377227", note)
+        # DropPin: "DropPin: location set by customer (customer link) — lat,lng — <maps url>"
+        self.assertEqual(
+            note,
+            "Jarz POS: location set by staff (staff manual) — 30.094669,31.377227 — "
+            "https://www.google.com/maps/search/?api=1&query=30.094669,31.377227",
+        )
 
     def test_moved_pin_names_the_old_point(self):
         existing = {"_dpn_lat": "30.05", "_dpn_lng": "31.2", "_dpn_pin_set_at": str(EARLIER_TS)}
         entries = _build(_address(), existing)
         note = geo_passthrough.build_late_pin_note(entries, existing)
-        self.assertIn("changed by Jarz staff", note)
-        self.assertIn("was 30.05,31.2", note)
+        self.assertTrue(note.startswith("Jarz POS: location set by staff (staff manual) — 30.094669,31.377227"))
+        self.assertTrue(note.endswith("— replaces 30.05,31.2"))
 
     def test_create_and_unchanged_pin_get_no_note(self):
         self.assertEqual(geo_passthrough.build_late_pin_note(_build(_address(), None), None), "")
@@ -249,11 +252,47 @@ class LatePinNoteTests(unittest.TestCase):
         with patch.object(outbound_sync, "_post_woo_order_note", return_value="posted") as post:
             outbound_sync._post_late_pin_note(MagicMock(), 21761, "SINV-1", payload, {"meta_data": []})
         post.assert_called_once()
-        self.assertIn("added by Jarz staff", post.call_args.args[2])
+        self.assertIn("location set by staff (staff manual)", post.call_args.args[2])
 
         with patch.object(outbound_sync, "_post_woo_order_note") as post:
             outbound_sync._post_late_pin_note(MagicMock(), 21761, "SINV-1", {"meta_data": []}, {"meta_data": []})
         post.assert_not_called()
+
+
+class AreaCodeMetaTests(unittest.TestCase):
+    def test_pos_order_gets_area_code(self):
+        self.assertEqual(
+            geo_passthrough.build_area_code_meta("EGHADAYEQOCT", None),
+            [{"key": "_dpn_area_code", "value": "EGHADAYEQOCT"}],
+        )
+
+    def test_store_already_holding_it_sends_nothing(self):
+        self.assertEqual(
+            geo_passthrough.build_area_code_meta("EGSHOBRAKH", {"_dpn_area_code": "EGSHOBRAKH"}), []
+        )
+
+    def test_checkout_area_code_is_never_overwritten(self):
+        self.assertEqual(
+            geo_passthrough.build_area_code_meta("EGNASRCITY", {"_dpn_area_code": "EGKATAMYA"}), []
+        )
+
+    def test_label_or_empty_code_sends_nothing(self):
+        self.assertEqual(geo_passthrough.build_area_code_meta("Shubra El Kheima", None), [])
+        self.assertEqual(geo_passthrough.build_area_code_meta("", None), [])
+        self.assertEqual(geo_passthrough.build_area_code_meta(None, None), [])
+
+
+class AddressAreaCodeTests(unittest.TestCase):
+    def test_code_or_label_in_city_resolves_without_territory(self):
+        from unittest.mock import patch
+
+        with (
+            patch.object(outbound_sync, "_resolve_leaf_territory", return_value=None),
+            patch("jarz_woocommerce_integration.services.territory_sync.CODE_TO_DISPLAY", {"EG6OCT": "6 October - 6 Oct"}),
+        ):
+            self.assertEqual(outbound_sync._address_area_code("EG6OCT"), "EG6OCT")
+            self.assertEqual(outbound_sync._address_area_code("6 October - 6 Oct"), "EG6OCT")
+            self.assertEqual(outbound_sync._address_area_code("Nowhere"), "")
 
 
 if __name__ == "__main__":

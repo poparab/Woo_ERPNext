@@ -495,6 +495,41 @@ def _territory_woo_zone_label(territory: str | None) -> str:
     return english or arabic or ""
 
 
+def _territory_woo_code(territory: str | None) -> str:
+    """The store's area code (``EGSHOBRAKH``) for a Territory, or ``""``."""
+    territory = str(territory or "").strip()
+    if not territory:
+        return ""
+    from jarz_woocommerce_integration.services.territory_sync import CODE_TO_DISPLAY
+
+    fields = [fieldname for fieldname in ("custom_woo_code", "woo_code") if _territory_has_column(fieldname)]
+    try:
+        row = (frappe.db.get_value("Territory", territory, fields, as_dict=True) or {}) if fields else {}
+    except Exception:
+        row = {}
+    for code in (row.get("custom_woo_code"), row.get("woo_code"), territory):
+        code = str(code or "").strip()
+        if code in CODE_TO_DISPLAY:
+            return code
+    return ""
+
+
+def _address_area_code(city: Any) -> str:
+    """The store's area code for an Address ``city`` (a Territory, a code or a zone label)."""
+    code = _territory_woo_code(_resolve_leaf_territory(city))
+    if code:
+        return code
+    from jarz_woocommerce_integration.services.territory_sync import CODE_TO_DISPLAY
+
+    text = str(city or "").strip()
+    if text in CODE_TO_DISPLAY:
+        return text
+    for candidate, display in CODE_TO_DISPLAY.items():
+        if text and str(display or "").strip() == text:
+            return candidate
+    return ""
+
+
 def _is_payload_dry_run() -> bool:
     """Whether payload building must not touch the database.
 
@@ -5163,6 +5198,16 @@ def _build_order_payload(
     # The delivery pin, as DropPin order meta: the same keys a website checkout
     # writes, so the store shows a POS order's location like any other.
     payload["meta_data"].extend(_build_pin_metadata(invoice, existing_order))
+    # The area code DropPin writes on every checkout order; POS orders lacked it.
+    try:
+        from jarz_woocommerce_integration.services import geo_passthrough as _geo
+
+        payload["meta_data"].extend(_geo.build_area_code_meta(
+            _address_area_code((payload.get("shipping") or {}).get("city")),
+            _geo._meta_value_map(existing_order.get("meta_data")) if existing_order else None,
+        ))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({"event": "woo_area_code_meta_failed", "invoice": getattr(invoice, "name", None), "error": str(exc)})
 
     woo_customer_id = _order_woo_customer_id(invoice, customer_doc, existing_order)
     if woo_customer_id:

@@ -938,25 +938,51 @@ def build_late_pin_note(
         if "," not in marker:
             return ""
         lat_text, lng_text = (part.strip() for part in marker.split(",", 1))
+        # DropPin's own wording for a customer pin, verbatim apart from the
+        # label and the source: "DropPin: location set by customer (customer
+        # link) — lat,lng — https://www.google.com/maps/search/?api=1&query=lat,lng"
+        body = (
+            f"Jarz POS: location set by staff (staff manual) {_NOTE_SEP} {lat_text},{lng_text} "
+            f"{_NOTE_SEP} https://www.google.com/maps/search/?api=1&query={lat_text},{lng_text}"
+        )
         old_pin, _old_source = _order_meta_pin(existing_meta, egypt_only=False)
         if old_pin is not None:
-            action = (
-                "Jarz POS: delivery location changed by Jarz staff after the order was placed "
-                f"(was {_format_coordinate(old_pin.latitude)},{_format_coordinate(old_pin.longitude)})."
+            body += (
+                f" {_NOTE_SEP} replaces "
+                f"{_format_coordinate(old_pin.latitude)},{_format_coordinate(old_pin.longitude)}"
             )
-        else:
-            action = (
-                "Jarz POS: delivery location added by Jarz staff after the order was placed. "
-                "The order arrived without a location, so the customer was asked for it "
-                "(usually on WhatsApp) and staff entered it in the POS."
-            )
-        return (
-            f"{action} New pin: {lat_text},{lng_text} "
-            f"https://www.google.com/maps?q={lat_text},{lng_text}"
-        )
+        return body
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning({"event": "woo_late_pin_note_failed", "error": str(exc)})
         return ""
+
+
+_NOTE_SEP = "—"
+_AREA_CODE_RE = re.compile(r"^EG[A-Z0-9]+$")
+
+
+def build_area_code_meta(
+    area_code: Any,
+    existing_meta: Optional[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """``_dpn_area_code`` for the order, as a website checkout writes it.
+
+    DropPin stores the delivery area code (``EGSHOBRAKH``) on every checkout
+    order; a POS order reached the store without it. ``area_code`` is the Woo
+    code of the delivery territory. Sent only when it is an area code and the
+    store does not already hold it. Pure and never raises.
+    """
+    try:
+        code = str(area_code or "").strip().upper()
+        if not _AREA_CODE_RE.match(code):
+            return []
+        # Fill a gap only: the checkout's own area code is DropPin's to keep.
+        if str((existing_meta or {}).get("_dpn_area_code") or "").strip():
+            return []
+        return [{"key": "_dpn_area_code", "value": code}]
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning({"event": "woo_area_code_meta_failed", "error": str(exc)})
+        return []
 
 
 def _address_pin_with_source(
