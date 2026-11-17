@@ -3974,6 +3974,19 @@ def _enqueue_delivery_charge_repost(inv) -> None:
     repost_doc.submit()
 
 
+def _is_fully_returned_in_erpnext(inv) -> bool:
+    """Whether the POS return workflow has already taken this whole order back.
+
+    Plain reads of the two flags the POS app writes on the original invoice,
+    so the two apps stay independent.
+    """
+    status = getattr(inv, "custom_return_status", None)
+    state = getattr(inv, "custom_sales_invoice_state", None)
+    return (isinstance(status, str) and status.strip() == "Fully Returned") or (
+        isinstance(state, str) and state.strip().lower() == "returned"
+    )
+
+
 def _handle_terminal_status_on_submitted_invoice(*, inv, woo_id: int, woo_status: str) -> dict:
     """Apply a Woo cancellation/refund to an already-submitted Sales Invoice.
 
@@ -3988,6 +4001,21 @@ def _handle_terminal_status_on_submitted_invoice(*, inv, woo_id: int, woo_status
     ``cancellation_reconcile`` counts a result without a truthy ``success`` as a
     failure, which is why these orders showed up as errors before.
     """
+    # A fully returned order is already closed out in ERPNext: the credit note,
+    # the return delivery note and the money entries ARE its cancellation, and
+    # our own outbound push is what turned the Woo order terminal. Without this
+    # guard that echo came straight back here, stamped "WooCommerce Refunded"
+    # over the return's own label and raised a needs-review flag on every
+    # returned order (all 16 on production by 2026-11-17).
+    if _is_fully_returned_in_erpnext(inv):
+        return {
+            "success": True,
+            "status": "skipped",
+            "reason": "already_fully_returned",
+            "woo_order_id": woo_id,
+            "invoice": getattr(inv, "name", None),
+        }
+
     cancellation_type = "WooCommerce Refunded" if woo_status == "refunded" else "WooCommerce Cancelled"
     cancellation_reason = f"Order {woo_status} on WooCommerce (Order #{woo_id})"
 
@@ -7538,6 +7566,8 @@ def reconcile_deleted_orders_cron():  # pragma: no cover - scheduler entry for d
             inv = frappe.get_doc("Sales Invoice", invoice_name)
             if inv.docstatus == 2:
                 continue  # already cancelled; nothing owed
+            if _is_fully_returned_in_erpnext(inv):
+                continue  # the return already reversed it; nothing owed
 
             if inv.docstatus == 0:
                 # A draft never hit the GL, so there is no phantom AR to undo.

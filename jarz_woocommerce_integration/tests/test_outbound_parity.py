@@ -11,7 +11,7 @@ website creates, measured against real production orders:
 * F-11  the legacy bundle-parent guess must not eat a genuine giveaway line
 * F-12  an Item mapped by ``woo_variation_id`` must resolve, and an unmappable
         line must not fail the whole order
-* F-15  a fully returned order is ``refunded``
+* F-15  a fully returned order is ``cancelled`` (was ``refunded`` until 2026-11-17)
 * F-18  the already-in-sync comparison only looks at meta keys we own
 * F-19  the store must date the order when the sale happened
 * F-25  the realtime event must go to a room somebody is in
@@ -876,12 +876,12 @@ class TestReturnStatus(unittest.TestCase):
         values.update(fields)
         return SimpleNamespace(**values)
 
-    def test_the_canonical_return_flag_maps_to_refunded(self):
+    def test_the_canonical_return_flag_maps_to_cancelled(self):
         """``custom_return_status`` is the purpose-built field; it wins."""
         invoice = self._invoice(custom_return_status="Fully Returned")
 
         with unittest.mock.patch.object(outbound_sync, "_returned_amount") as returned_amount:
-            self.assertEqual(outbound_sync._determine_status(invoice), "refunded")
+            self.assertEqual(outbound_sync._determine_status(invoice), "cancelled")
 
         # Authoritative enough that the accounting fallback is not even consulted.
         returned_amount.assert_not_called()
@@ -897,7 +897,7 @@ class TestReturnStatus(unittest.TestCase):
         invoice = self._invoice(custom_return_status="Partially Returned")
 
         with unittest.mock.patch.object(outbound_sync, "_returned_amount", return_value=500.0):
-            self.assertEqual(outbound_sync._determine_status(invoice), "refunded")
+            self.assertEqual(outbound_sync._determine_status(invoice), "cancelled")
 
     def test_a_missing_flag_falls_through_to_the_other_signals(self):
         invoice = self._invoice(custom_return_status="")
@@ -917,17 +917,17 @@ class TestReturnStatus(unittest.TestCase):
         )
         self.assertFalse(outbound_sync._return_is_full(None, returned_total=0, original_total=500))
 
-    def test_returned_state_maps_to_refunded(self):
+    def test_returned_state_maps_to_cancelled(self):
         invoice = self._invoice(custom_sales_invoice_state="Returned", sales_invoice_state="Returned")
 
         with unittest.mock.patch.object(outbound_sync, "_returned_amount", return_value=0.0):
-            self.assertEqual(outbound_sync._determine_status(invoice), "refunded")
+            self.assertEqual(outbound_sync._determine_status(invoice), "cancelled")
 
-    def test_a_full_credit_note_maps_to_refunded(self):
+    def test_a_full_credit_note_maps_to_cancelled(self):
         invoice = self._invoice()
 
         with unittest.mock.patch.object(outbound_sync, "_returned_amount", return_value=500.0):
-            self.assertEqual(outbound_sync._determine_status(invoice), "refunded")
+            self.assertEqual(outbound_sync._determine_status(invoice), "cancelled")
 
     def test_a_partial_credit_note_leaves_the_order_completed(self):
         invoice = self._invoice()

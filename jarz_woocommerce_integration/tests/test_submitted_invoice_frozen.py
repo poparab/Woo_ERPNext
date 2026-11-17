@@ -420,6 +420,39 @@ class TestSubmittedInvoiceFrozen(unittest.TestCase):
         assert result["cancellation_type"] == "WooCommerce Refunded"
         fake_inv.cancel.assert_called_once()
 
+    def test_our_own_echo_on_a_fully_returned_si_is_ignored(self):
+        """The return workflow pushes the Woo order terminal; that echo must not
+        come back as a "WooCommerce Refunded/Cancelled" label, a cancel attempt or
+        a needs-review flag. Seen on all 16 returned production orders 2026-11-17."""
+        for woo_status in ("refunded", "cancelled"):
+            for flags in (
+                {"custom_return_status": "Fully Returned"},
+                {"custom_sales_invoice_state": "Returned"},
+            ):
+                sync_log_calls, fake_inv = _setup_common_mocks(self.monkeypatch, si_docstatus=1)
+                for field, value in flags.items():
+                    setattr(fake_inv, field, value)
+                order = _make_woo_order(woo_id=14763, status=woo_status)
+
+                result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+                assert result["status"] == "skipped", (woo_status, flags, result)
+                assert result["reason"] == "already_fully_returned"
+                fake_inv.cancel.assert_not_called()
+                written = {call.args[0] for call in fake_inv.db_set.call_args_list}
+                assert "custom_cancellation_type" not in written
+
+    def test_a_partially_returned_si_still_gets_the_woo_cancel_path(self):
+        """Only a FULL return is our own echo; a partial one stays a human call."""
+        _, fake_inv = _setup_common_mocks(self.monkeypatch, si_docstatus=1)
+        fake_inv.custom_return_status = "Partially Returned"
+        order = _make_woo_order(woo_id=14763, status="cancelled")
+
+        result = order_sync.process_order_phase1(order, _make_settings(), allow_update=True)
+
+        assert result["reason"] == "woo_terminal_status"
+        fake_inv.cancel.assert_called_once()
+
     def test_woo_address_change_repoints_an_undispatched_submitted_si(self):
         """A corrected street address must reach the invoice the rider works from."""
         order = _make_woo_order(woo_id=14763, status="processing")

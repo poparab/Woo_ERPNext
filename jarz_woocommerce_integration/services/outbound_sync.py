@@ -1770,7 +1770,7 @@ def sync_invoice_return(credit_note_name: str, own_transaction: bool = False) ->
             "original_total": original_total,
             "detail": (
                 "custom_return_status still reads Partially Returned while the submitted "
-                "credit notes cover the whole invoice; the order was pushed as refunded."
+                "credit notes cover the whole invoice; the order was pushed as cancelled."
             ),
         })
 
@@ -1784,8 +1784,8 @@ def sync_invoice_return(credit_note_name: str, own_transaction: bool = False) ->
 
     # Always re-sync the original, not just on a full return. Crossing the
     # full/partial line in *either* direction changes the Woo status: a full
-    # return makes it `refunded`, and cancelling that credit note has to take it
-    # back off `refunded` again. `_order_payload_requires_update` drops the PUT
+    # return makes it `cancelled`, and cancelling that credit note has to take it
+    # back off `cancelled` again. `_order_payload_requires_update` drops the PUT
     # when nothing actually moved, so a partial return costs one GET.
     # Run inline: we are already in a background job and re-queueing adds a hop.
     result["order_sync"] = sync_sales_invoice(
@@ -3300,8 +3300,9 @@ WOO_STATUS_PREPARING = "preparing"
 WOO_STATUS_OUT_FOR_DELIVERY = "out-for-delivery"
 WOO_STATUS_COMPLETED = "completed"
 WOO_STATUS_CANCELLED = "cancelled"
-#: Core WooCommerce status. Emitted when the order has been fully returned in
-#: ERPNext — see ``_determine_status`` and ``sync_invoice_return``.
+#: Core WooCommerce status. No longer emitted for a full return (that pushes
+#: ``cancelled`` since 2026-11-17); kept terminal and approved so a store order
+#: already sitting at ``refunded`` is still recognised as closed.
 WOO_STATUS_REFUNDED = "refunded"
 
 #: Registered by the plugin so a human can set it in wp-admin, but **never
@@ -3472,9 +3473,10 @@ def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool =
     order (the contract has it cleared on success, but this does not depend on
     that).
 
-    A **fully returned** order maps to ``refunded`` (F-15), checked ahead of
-    ``Delivered`` because a return happens *after* delivery: leaving the order
-    at ``completed`` told the customer their returned order was still fulfilled.
+    A **fully returned** order maps to ``cancelled`` (F-15; ``refunded`` until
+    2026-11-17), checked ahead of ``Delivered`` because a return happens *after*
+    delivery: leaving the order at ``completed`` told the customer their
+    returned order was still fulfilled.
     A partial return deliberately does not change the status — the order really
     was delivered — and is reported as a Woo order note instead (F-16).
     """
@@ -3487,7 +3489,11 @@ def _determine_status(invoice: frappe.model.document.Document, *, cancel: bool =
     if any(state in {"cancelled", "canceled"} for state in states):
         return WOO_STATUS_CANCELLED
     if _is_fully_returned(invoice):
-        return WOO_STATUS_REFUNDED
+        # Owner decision 2026-11-17: a fully returned order is treated as a
+        # cancelled order everywhere, the store included. ``refunded`` also told
+        # the customer, by Woo's own email, that money came back to them when
+        # usually none moved (customer credit, or nothing was ever paid).
+        return WOO_STATUS_CANCELLED
     if any(state in {"delivered", "completed"} for state in states):
         return WOO_STATUS_COMPLETED
     if any(state == WOO_STATUS_OUT_FOR_DELIVERY for state in states):
