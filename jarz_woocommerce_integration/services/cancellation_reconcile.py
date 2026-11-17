@@ -126,6 +126,13 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
 
     placeholders = ", ".join(["%s"] * len(woo_order_ids))
     link_field = _resolve_order_map_link_field()
+    # The POS return workflow stamps this on the original. Probed: the column is
+    # a POS-app custom field, not ours.
+    try:
+        has_return_status = bool(frappe.db.has_column("Sales Invoice", "custom_return_status"))
+    except Exception:  # noqa: BLE001 - cannot tell: behave exactly as before the column existed
+        has_return_status = False
+    return_status = "IFNULL(si.custom_return_status, '')" if has_return_status else "''"
 
     # `IFNULL(si.is_return, 0) = 0` excludes credit notes. They inherit
     # `woo_order_id` from the invoice they reverse, so a returned order would
@@ -138,6 +145,7 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
                si.docstatus,
                IFNULL(si.custom_cancellation_type, '') AS cancellation_type,
                IFNULL(si.custom_cancellation_reason, '') AS cancellation_reason,
+               {return_status} AS return_status,
                si.modified
         FROM `tabSales Invoice` si
         WHERE si.woo_order_id IN ({placeholders})
@@ -153,6 +161,7 @@ def _load_invoice_matches(woo_order_ids: list[int]) -> dict[int, list[dict[str, 
                si.docstatus,
                IFNULL(si.custom_cancellation_type, '') AS cancellation_type,
                IFNULL(si.custom_cancellation_reason, '') AS cancellation_reason,
+               {return_status} AS return_status,
                si.modified
         FROM `tabWooCommerce Order Map` wm
         JOIN `tabSales Invoice` si ON si.name = wm.{link_field}
@@ -201,7 +210,17 @@ def _pull_succeeded(result: dict[str, Any] | None) -> bool:
 def _classify_order(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return "MISSING"
-    if any(int(row.get("docstatus") or 0) in (0, 1) for row in rows):
+    active = [row for row in rows if int(row.get("docstatus") or 0) in (0, 1)]
+    # A fully returned order is closed out by its credit note, and since
+    # 2026-11-17 outbound pushes it to Woo as ``cancelled`` itself. It is
+    # aligned, not a live order to re-pull on every run.
+    if active and all(
+        int(row.get("docstatus") or 0) == 1
+        and str(row.get("return_status") or "").strip() == "Fully Returned"
+        for row in active
+    ):
+        return "MATCH_RETURNED"
+    if active:
         return "MATCH_ACTIVE"
     if any(
         int(row.get("docstatus") or 0) == 2 and row.get("cancellation_type") in TARGET_CANCELLATION_TYPES
@@ -306,6 +325,7 @@ def diagnose_cancelled_orders(
             "MATCH_DATA_CORR": 0,
             "MATCH_OTHER_CANCELLED": 0,
             "MATCH_ACTIVE": 0,
+            "MATCH_RETURNED": 0,
             "MISSING": 0,
         }
         sample_ids = {key: [] for key in match_counts}
@@ -386,7 +406,7 @@ def reconcile_cancelled_orders(
             bucket = _classify_order(rows)
             stats["processed"] += 1
 
-            if bucket == "MATCH_CANCELLED":
+            if bucket in ("MATCH_CANCELLED", "MATCH_RETURNED"):
                 stats["already_aligned"] += 1
                 continue
 

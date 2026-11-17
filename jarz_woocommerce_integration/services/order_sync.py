@@ -3982,9 +3982,22 @@ def _is_fully_returned_in_erpnext(inv) -> bool:
     """
     status = getattr(inv, "custom_return_status", None)
     state = getattr(inv, "custom_sales_invoice_state", None)
-    return (isinstance(status, str) and status.strip() == "Fully Returned") or (
+    if (isinstance(status, str) and status.strip() == "Fully Returned") or (
         isinstance(state, str) and state.strip().lower() == "returned"
-    )
+    ):
+        return True
+    # Same test outbound used to decide it pushes ``cancelled``: credit notes
+    # covering the whole invoice count even without the flags (a credit note
+    # raised by hand in Desk). Inbound and outbound must agree, or that push
+    # echoes back here as a cancellation to apply.
+    if getattr(inv, "docstatus", None) != 1:
+        return False
+    try:
+        from jarz_woocommerce_integration.services.outbound_sync import _is_fully_returned
+
+        return bool(_is_fully_returned(inv))
+    except Exception:  # noqa: BLE001 - unknown means "not returned": a human reviews it
+        return False
 
 
 def _handle_terminal_status_on_submitted_invoice(*, inv, woo_id: int, woo_status: str) -> dict:
